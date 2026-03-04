@@ -1,7 +1,7 @@
-﻿using System.Text.Json;
+using System.Diagnostics;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using AudioRecorder.Services.Transcription;
-using SharpCompress.Archives.SevenZip;
-using SharpCompress.Common;
 
 namespace AudioRecorder.Services.Models;
 
@@ -19,6 +19,7 @@ public sealed class WhisperRuntimeInstallerService
 {
     private const string ReleasesApiUrl = "https://api.github.com/repos/Purfview/whisper-standalone-win/releases?per_page=20";
     private const string TargetTag = "Faster-Whisper-XXL";
+    private const string SevenZipDownloadUrl = "https://www.7-zip.org/a/7zr.exe";
 
     private readonly string _runtimeRoot;
     private readonly string _runtimeExePath;
@@ -49,6 +50,19 @@ public sealed class WhisperRuntimeInstallerService
                 return new RuntimeInstallResult(false, "Could not find a Windows faster-whisper-xxl asset in official releases.");
             }
 
+            var sevenZipExe = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Contora", "tools", "7zr.exe");
+
+            if (!File.Exists(sevenZipExe))
+            {
+                onProgress(new RuntimeInstallProgress("download-7zr", 3, "Downloading 7zr.exe (~1.3 MB)..."));
+                Directory.CreateDirectory(Path.GetDirectoryName(sevenZipExe)!);
+                await DownloadFileAsync(SevenZipDownloadUrl, sevenZipExe, _ => { }, ct);
+            }
+
+            onProgress(new RuntimeInstallProgress("download-7zr", 4, "7zr.exe ready."));
+
             var tempArchive = Path.Combine(Path.GetTempPath(), $"faster-whisper-xxl_{Guid.NewGuid():N}.7z");
             var tempExtractDir = Path.Combine(Path.GetTempPath(), $"faster-whisper-xxl_extract_{Guid.NewGuid():N}");
 
@@ -63,11 +77,11 @@ public sealed class WhisperRuntimeInstallerService
 
                 onProgress(new RuntimeInstallProgress("extract", 72, "Extracting runtime archive..."));
                 Directory.CreateDirectory(tempExtractDir);
-                ExtractArchive(tempArchive, tempExtractDir, p =>
+                await ExtractArchiveAsync(sevenZipExe, tempArchive, tempExtractDir, p =>
                 {
                     var mapped = 72 + (int)(p * 0.23); // 72..95
                     onProgress(new RuntimeInstallProgress("extract", mapped, $"Extracting runtime... {p}%"));
-                });
+                }, ct);
 
                 var extractedExe = FindWhisperExe(tempExtractDir);
                 if (extractedExe == null)
@@ -188,34 +202,86 @@ public sealed class WhisperRuntimeInstallerService
         }
     }
 
-    private static void ExtractArchive(string archivePath, string destinationDir, Action<int> onPercent)
+    private static async Task ExtractArchiveAsync(
+        string sevenZipExe,
+        string archivePath,
+        string destinationDir,
+        Action<int> onPercent,
+        CancellationToken ct)
     {
-        using var archive = SevenZipArchive.Open(archivePath);
-        var entries = archive.Entries.Where(e => !e.IsDirectory).ToList();
-        var total = Math.Max(entries.Count, 1);
-        var index = 0;
-
-        foreach (var entry in entries)
+        var psi = new ProcessStartInfo
         {
-            var relativePath = (entry.Key ?? string.Empty).Replace('/', Path.DirectorySeparatorChar);
-            var fullPath = Path.GetFullPath(Path.Combine(destinationDir, relativePath));
-            var destinationRoot = Path.GetFullPath(destinationDir);
+            FileName = sevenZipExe,
+            Arguments = $"x \"{archivePath}\" -o\"{destinationDir}\" -y -bsp1",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
 
-            if (!fullPath.StartsWith(destinationRoot, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("Archive path traversal detected.");
+        using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
+        var tcs = new TaskCompletionSource<int>();
 
-            var dir = Path.GetDirectoryName(fullPath);
-            if (!string.IsNullOrEmpty(dir))
-                Directory.CreateDirectory(dir);
+        process.Exited += (_, _) => tcs.TrySetResult(process.ExitCode);
 
-            using var entryStream = entry.OpenEntryStream();
-            using var fileStream = new FileStream(fullPath, FileMode.Create, FileAccess.Write, FileShare.None);
-            entryStream.CopyTo(fileStream);
+        using var registration = ct.Register(() =>
+        {
+            try { process.Kill(); } catch { }
+            tcs.TrySetCanceled(ct);
+        });
 
-            index++;
-            var percent = (int)(index * 100.0 / total);
-            onPercent(percent);
-        }
+        process.Start();
+
+        // Parse stdout for percentage lines like " 42%" or "100%"
+        var percentRegex = new Regex(@"(\d+)%", RegexOptions.Compiled);
+        var lastPercent = 0;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var buffer = new char[256];
+                var lineBuffer = new System.Text.StringBuilder();
+
+                while (!process.StandardOutput.EndOfStream)
+                {
+                    var read = await process.StandardOutput.ReadAsync(buffer, 0, buffer.Length);
+                    if (read <= 0) break;
+
+                    lineBuffer.Append(buffer, 0, read);
+                    var text = lineBuffer.ToString();
+
+                    // 7zr uses \r for progress updates (no newline)
+                    var lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var line in lines)
+                    {
+                        var match = percentRegex.Match(line);
+                        if (match.Success && int.TryParse(match.Groups[1].Value, out var pct))
+                        {
+                            if (pct > lastPercent)
+                            {
+                                lastPercent = pct;
+                                onPercent(pct);
+                            }
+                        }
+                    }
+
+                    // Keep only the last incomplete segment
+                    var lastSep = text.LastIndexOfAny(new[] { '\r', '\n' });
+                    if (lastSep >= 0)
+                        lineBuffer.Clear().Append(text[(lastSep + 1)..]);
+                }
+            }
+            catch { }
+        }, ct);
+
+        // Drain stderr
+        _ = process.StandardError.ReadToEndAsync();
+
+        var exitCode = await tcs.Task;
+
+        if (exitCode != 0)
+            throw new InvalidOperationException($"7zr.exe exited with code {exitCode}.");
     }
 
     private void InstallExtractedRuntime(string extractedRoot)
@@ -259,5 +325,3 @@ public sealed class WhisperRuntimeInstallerService
         }
     }
 }
-
-

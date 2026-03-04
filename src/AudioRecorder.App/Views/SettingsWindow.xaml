@@ -1,0 +1,343 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Window
+    x:Class="AudioRecorder.Views.SettingsWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="Settings — Contora">
+    <Grid>
+        <NavigationView
+            x:Name="SettingsNavView"
+            IsBackButtonVisible="Collapsed"
+            IsSettingsVisible="False"
+            PaneDisplayMode="Left"
+            OpenPaneLength="180"
+            SelectionChanged="OnNavSelectionChanged">
+            <NavigationView.MenuItems>
+                <NavigationViewItem Content="Engines &amp; Runtime" Tag="engines">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE90F;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Models" Tag="models">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE8F1;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Storage" Tag="storage">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xEDA2;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="General" Tag="general">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE713;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.MenuItems>
+
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="24,16,24,24">
+                <Grid>
+                    <!-- Engines & Runtime -->
+                    <StackPanel x:Name="EnginesSection" Spacing="16" Visibility="Visible">
+                        <TextBlock Text="Engines &amp; Runtime" FontSize="24" FontWeight="SemiBold" />
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Faster Whisper XXL" FontSize="16" FontWeight="Medium" />
+
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Status:" Margin="0,0,12,4"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock x:Name="RuntimeStatusText" Grid.Row="0" Grid.Column="1" Text="Checking..." Margin="0,0,0,4" />
+
+                                    <TextBlock Grid.Row="1" Grid.Column="0" Text="Path:" Margin="0,0,12,4"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock x:Name="RuntimePathText" Grid.Row="1" Grid.Column="1" Text="—" Margin="0,0,0,4"
+                                               TextTrimming="CharacterEllipsis" />
+
+                                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Size:" Margin="0,0,12,0"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock x:Name="RuntimeSizeText" Grid.Row="2" Grid.Column="1" Text="—" />
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button
+                                        x:Name="DownloadRuntimeBtn"
+                                        Content="Download runtime"
+                                        Click="OnDownloadRuntimeClicked"
+                                        Style="{StaticResource AccentButtonStyle}" />
+                                    <Button
+                                        x:Name="CancelRuntimeBtn"
+                                        Content="Cancel"
+                                        Click="OnCancelRuntimeClicked"
+                                        Visibility="Collapsed" />
+                                    <Button
+                                        x:Name="DeleteRuntimeBtn"
+                                        Content="Delete"
+                                        Click="OnDeleteRuntimeClicked"
+                                        Visibility="Collapsed" />
+                                </StackPanel>
+
+                                <ProgressBar
+                                    x:Name="RuntimeProgressBar"
+                                    Minimum="0" Maximum="100" Height="4"
+                                    Visibility="Collapsed" />
+                                <TextBlock
+                                    x:Name="RuntimeProgressText"
+                                    FontSize="11"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap"
+                                    Visibility="Collapsed" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16"
+                            Opacity="0.6">
+                            <StackPanel Spacing="8">
+                                <TextBlock Text="More engines coming soon" FontSize="14" FontWeight="Medium"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                <TextBlock Text="Parakeet, Canary, and other STT engines are planned for future releases."
+                                           FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}" TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- Models -->
+                    <StackPanel x:Name="ModelsSection" Spacing="16" Visibility="Collapsed">
+                        <TextBlock Text="Models" FontSize="24" FontWeight="SemiBold" />
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Installed models" FontSize="14" FontWeight="Medium" />
+                                <StackPanel x:Name="InstalledModelsPanel" Spacing="8">
+                                    <TextBlock x:Name="NoModelsText" Text="No models installed yet."
+                                               FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Download model" FontSize="14" FontWeight="Medium" />
+
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <ComboBox x:Name="ModelSelectorCombo" Grid.Column="0" HorizontalAlignment="Stretch">
+                                        <ComboBoxItem Content="small (~500 MB)" Tag="small" />
+                                        <ComboBoxItem Content="medium (~1.5 GB)" Tag="medium" />
+                                        <ComboBoxItem Content="large-v2 (~3 GB)" Tag="large-v2" />
+                                    </ComboBox>
+                                    <Button
+                                        x:Name="DownloadModelBtn"
+                                        Grid.Column="1"
+                                        Content="Download"
+                                        Click="OnDownloadModelClicked"
+                                        Style="{StaticResource AccentButtonStyle}" />
+                                </Grid>
+
+                                <Button
+                                    x:Name="CancelModelBtn"
+                                    Content="Cancel download"
+                                    Click="OnCancelModelClicked"
+                                    Visibility="Collapsed" />
+
+                                <ProgressBar
+                                    x:Name="ModelProgressBar"
+                                    Minimum="0" Maximum="100" Height="4"
+                                    Visibility="Collapsed" />
+                                <TextBlock
+                                    x:Name="ModelProgressText"
+                                    FontSize="11"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap"
+                                    Visibility="Collapsed" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- Storage -->
+                    <StackPanel x:Name="StorageSection" Spacing="16" Visibility="Collapsed">
+                        <TextBlock Text="Storage" FontSize="24" FontWeight="SemiBold" />
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Models folder" FontSize="14" FontWeight="Medium" />
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="ModelsFolderText" Grid.Column="0"
+                                               VerticalAlignment="Center" FontSize="12"
+                                               TextTrimming="CharacterEllipsis"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <Button Grid.Column="1" Content="Change..." Click="OnChangeModelsFolderClicked" Padding="8,4" />
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Recordings folder" FontSize="14" FontWeight="Medium" />
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="RecordingsFolderText" Grid.Column="0"
+                                               VerticalAlignment="Center" FontSize="12"
+                                               TextTrimming="CharacterEllipsis"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <Button Grid.Column="1" Content="Change..." Click="OnChangeRecordingsFolderClicked" Padding="8,4" />
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="8">
+                                <TextBlock Text="Disk usage" FontSize="14" FontWeight="Medium" />
+
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Runtime:" Margin="0,0,12,4"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock x:Name="DiskRuntimeText" Grid.Row="0" Grid.Column="1" Text="—" Margin="0,0,0,4" />
+
+                                    <TextBlock Grid.Row="1" Grid.Column="0" Text="Models:" Margin="0,0,12,4"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock x:Name="DiskModelsText" Grid.Row="1" Grid.Column="1" Text="—" Margin="0,0,0,4" />
+
+                                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Total:" Margin="0,0,12,0"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock x:Name="DiskTotalText" Grid.Row="2" Grid.Column="1" Text="—"
+                                               FontWeight="SemiBold" />
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- General -->
+                    <StackPanel x:Name="GeneralSection" Spacing="16" Visibility="Collapsed">
+                        <TextBlock Text="General" FontSize="24" FontWeight="SemiBold" />
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Transcription mode" FontSize="14" FontWeight="Medium" />
+                                <ComboBox
+                                    x:Name="TranscriptionModeCombo"
+                                    SelectionChanged="OnTranscriptionModeChanged">
+                                    <ComboBoxItem Content="Quality (best accuracy)" Tag="quality" />
+                                    <ComboBoxItem Content="Light (faster)" Tag="light" />
+                                </ComboBox>
+                                <TextBlock Text="Quality mode includes speaker diarization. Light mode is faster but without speaker separation."
+                                           FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="FFmpeg" FontSize="14" FontWeight="Medium" />
+                                <TextBlock x:Name="FfmpegStatusText" Text="Checking..."
+                                           FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button
+                                        x:Name="DownloadFfmpegBtn"
+                                        Content="Download FFmpeg"
+                                        Click="OnDownloadFfmpegClicked"
+                                        Visibility="Collapsed" />
+                                    <Button
+                                        x:Name="CancelFfmpegBtn"
+                                        Content="Cancel"
+                                        Click="OnCancelFfmpegClicked"
+                                        Visibility="Collapsed" />
+                                </StackPanel>
+
+                                <ProgressBar
+                                    x:Name="FfmpegProgressBar"
+                                    Minimum="0" Maximum="100" Height="4"
+                                    Visibility="Collapsed" />
+                                <TextBlock
+                                    x:Name="FfmpegProgressText"
+                                    FontSize="11"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap"
+                                    Visibility="Collapsed" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </Grid>
+            </ScrollViewer>
+        </NavigationView>
+    </Grid>
+</Window>

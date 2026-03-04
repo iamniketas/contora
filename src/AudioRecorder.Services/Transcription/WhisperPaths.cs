@@ -168,6 +168,29 @@ public static class WhisperPaths
         if (!string.IsNullOrWhiteSpace(explicitShared))
             return explicitShared;
 
+        // Read from shared config if available
+        var configPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SharedWhisperModels", "config.json");
+        if (File.Exists(configPath))
+        {
+            try
+            {
+                var json = File.ReadAllText(configPath);
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("modelsRootPath", out var modelsRootEl))
+                {
+                    var modelsRoot = modelsRootEl.GetString();
+                    if (!string.IsNullOrWhiteSpace(modelsRoot) && Directory.Exists(modelsRoot))
+                        return modelsRoot;
+                }
+            }
+            catch
+            {
+                // Ignore config read errors
+            }
+        }
+
         var dictatorModelPath = Environment.GetEnvironmentVariable("DICTATOR_WHISPER_MODEL_PATH");
         if (!string.IsNullOrWhiteSpace(dictatorModelPath))
         {

@@ -19,7 +19,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <RootNamespace>AudioRecorder</RootNamespace>
         <AssemblyName>Contora</AssemblyName>
-        <Version>0.3.3</Version>
+        <Version>0.3.4</Version>
         <ApplicationIcon>Assets\Contora.ico</ApplicationIcon>
         <Product>Contora</Product>
         <FileDescription>Contora</FileDescription>
@@ -57,7 +57,7 @@
         <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.*" />
         <PackageReference Include="Microsoft.Web.WebView2" Version="1.*" />
         <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.*" />
-        <PackageReference Include="SharpCompress" Version="0.39.0" />
+
         <PackageReference Include="Velopack" Version="0.0.1298" />
 
         <Manifest Include="$(ApplicationManifest)" />

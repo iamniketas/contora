@@ -25,10 +25,24 @@
                 Padding="16">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel Spacing="16">
-                        <TextBlock
-                            FontSize="16"
-                            FontWeight="SemiBold"
-                            Text="Settings" />
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock
+                                Grid.Column="0"
+                                FontSize="16"
+                                FontWeight="SemiBold"
+                                Text="Settings" />
+                            <Button
+                                Grid.Column="1"
+                                Click="OnOpenSettingsWindowClicked"
+                                Padding="6,4"
+                                ToolTipService.ToolTip="Open settings window">
+                                <FontIcon Glyph="&#xE713;" FontSize="14" />
+                            </Button>
+                        </Grid>
 <StackPanel Spacing="4">
                             <TextBlock
                                 FontSize="12"

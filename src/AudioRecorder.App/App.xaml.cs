@@ -43,6 +43,11 @@ namespace AudioRecorder
         public static Window? MainWindow { get; private set; }
 
         /// <summary>
+        /// Settings window singleton (null when closed).
+        /// </summary>
+        public static Views.SettingsWindow? SettingsWindowInstance { get; set; }
+
+        /// <summary>
         /// Initializes the singleton application object.
         /// </summary>
         public App()

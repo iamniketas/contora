@@ -149,6 +149,7 @@ public sealed partial class MainPage : Page
     private readonly WhisperRuntimeInstallerService _runtimeInstallerService;
     private WhisperModelDownloadService _modelDownloadService;
     private readonly FfmpegInstallerService _ffmpegInstallerService;
+    private readonly SharedModelConfigService _sharedConfigService;
     private readonly DispatcherQueue _dispatcherQueue;
     private readonly DispatcherQueueTimer _updateTimer;
     private string? _lastRecordingPath;
@@ -195,6 +196,7 @@ public sealed partial class MainPage : Page
         _runtimeInstallerService = new WhisperRuntimeInstallerService();
         _modelDownloadService = new WhisperModelDownloadService(_whisperModel);
         _ffmpegInstallerService = new FfmpegInstallerService();
+        _sharedConfigService = new SharedModelConfigService();
 
         NotificationService.Initialize();
 
@@ -574,6 +576,35 @@ public sealed partial class MainPage : Page
     private void OnCancelFfmpegDownloadClicked(object sender, RoutedEventArgs e)
     {
         _ffmpegDownloadCts?.Cancel();
+    }
+
+    private void OnOpenSettingsWindowClicked(object sender, RoutedEventArgs e)
+    {
+        if (App.SettingsWindowInstance != null)
+        {
+            App.SettingsWindowInstance.Activate();
+            return;
+        }
+
+        var settingsWindow = new SettingsWindow(
+            _runtimeInstallerService,
+            _ffmpegInstallerService,
+            _sharedConfigService,
+            _settingsService,
+            onSettingsChanged: () =>
+            {
+                _dispatcherQueue.TryEnqueue(() =>
+                {
+                    // Reload transcription mode
+                    LoadTranscriptionModeSetting();
+                    LoadWhisperModelSetting();
+                    LoadOutputFolderSetting();
+                    UpdateTranscriptionAvailabilityUi();
+                });
+            });
+
+        App.SettingsWindowInstance = settingsWindow;
+        settingsWindow.Activate();
     }
 
     private async Task CheckForUpdatesAsync(bool userInitiated)
