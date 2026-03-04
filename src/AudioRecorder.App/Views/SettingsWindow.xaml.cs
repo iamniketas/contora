@@ -212,6 +212,7 @@ public sealed partial class SettingsWindow : Window
 
     private async Task LoadModelsDataAsync()
     {
+        await _sharedConfigService.RefreshFromDiskAsync();
         var config = await _sharedConfigService.LoadAsync();
         InstalledModelsPanel.Children.Clear();
 

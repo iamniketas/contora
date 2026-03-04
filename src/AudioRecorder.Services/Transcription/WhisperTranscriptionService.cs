@@ -271,13 +271,20 @@ public partial class WhisperTranscriptionService : ITranscriptionService
 
     private string BuildArguments(string audioPath, string outputDir)
     {
-        // faster-whisper-xxl -pp -o source --standard -f txt -m large-v2 --diarize pyannote_v3.1
         var sb = new StringBuilder();
         sb.Append("-pp ");                       // Explicit progress output.
         sb.Append($"-o \"{outputDir}\" ");
         sb.Append("--standard ");                 // Standard output format.
         sb.Append("-f txt ");
         sb.Append($"-m {_modelName} ");
+
+        // Point faster-whisper-xxl to the directory containing model folders.
+        var modelsRoot = WhisperPaths.GetModelsRoot(_whisperPath);
+        if (Directory.Exists(modelsRoot))
+        {
+            sb.Append($"--model_dir \"{modelsRoot}\" ");
+        }
+
         if (_enableDiarization)
         {
             sb.Append("--diarize pyannote_v3.1 ");

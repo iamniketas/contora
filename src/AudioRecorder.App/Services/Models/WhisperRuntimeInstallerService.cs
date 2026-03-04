@@ -37,6 +37,63 @@ public sealed class WhisperRuntimeInstallerService
 
     public string GetRuntimeExePath() => _runtimeExePath;
 
+    /// <summary>Minimum runtime version required for diarization support.</summary>
+    public static readonly Version MinimumRequiredVersion = new(245, 0);
+
+    /// <summary>
+    /// Runs faster-whisper-xxl.exe --version and parses the release number.
+    /// Returns null if the runtime is not installed or version cannot be determined.
+    /// Output format: "Standalone Faster-Whisper-XXL r245.4"
+    /// </summary>
+    public async Task<(Version? Version, string? VersionString)> GetInstalledVersionAsync()
+    {
+        if (!IsRuntimeInstalled())
+            return (null, null);
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = _runtimeExePath,
+                Arguments = "--version",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = new Process { StartInfo = psi };
+            process.Start();
+
+            var output = await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+
+            // Wait max 10 seconds
+            var exited = process.WaitForExit(10_000);
+            if (!exited)
+            {
+                try { process.Kill(); } catch { }
+                return (null, null);
+            }
+
+            var combined = $"{output} {stderr}";
+            // Match "rNNN.N.N" or "rNNN.N"
+            var match = Regex.Match(combined, @"r(\d+(?:\.\d+)*)");
+            if (match.Success)
+            {
+                var versionStr = match.Groups[1].Value;
+                var version = ParseLooseVersion(versionStr);
+                return (version, $"r{versionStr}");
+            }
+
+            return (null, null);
+        }
+        catch
+        {
+            return (null, null);
+        }
+    }
+
     public async Task<RuntimeInstallResult> InstallAsync(
         Action<RuntimeInstallProgress> onProgress,
         CancellationToken ct)
@@ -121,7 +178,7 @@ public sealed class WhisperRuntimeInstallerService
         using var doc = JsonDocument.Parse(json);
 
         string? bestUrl = null;
-        DateTimeOffset bestPublishedAt = DateTimeOffset.MinValue;
+        Version bestVersion = new(0, 0);
 
         foreach (var release in doc.RootElement.EnumerateArray())
         {
@@ -130,12 +187,6 @@ public sealed class WhisperRuntimeInstallerService
 
             var tag = tagElement.GetString();
             if (!string.Equals(tag, TargetTag, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            if (!release.TryGetProperty("published_at", out var publishedAtEl))
-                continue;
-
-            if (!DateTimeOffset.TryParse(publishedAtEl.GetString(), out var publishedAt))
                 continue;
 
             if (!release.TryGetProperty("assets", out var assetsEl))
@@ -157,15 +208,32 @@ public sealed class WhisperRuntimeInstallerService
                 if (string.IsNullOrWhiteSpace(url))
                     continue;
 
-                if (publishedAt > bestPublishedAt)
+                // Extract version from filename like "Faster-Whisper-XXL_r245.4_windows.7z"
+                var versionStr = name
+                    .Replace("Faster-Whisper-XXL_r", "", StringComparison.OrdinalIgnoreCase)
+                    .Replace("_windows.7z", "", StringComparison.OrdinalIgnoreCase);
+                var assetVersion = ParseLooseVersion(versionStr);
+
+                if (assetVersion > bestVersion)
                 {
-                    bestPublishedAt = publishedAt;
+                    bestVersion = assetVersion;
                     bestUrl = url;
                 }
             }
         }
 
         return bestUrl;
+    }
+
+    private static Version ParseLooseVersion(string versionStr)
+    {
+        // Handle versions like "245.4", "192.3.4" by padding to at least Major.Minor
+        var parts = versionStr.Split('.');
+        int major = 0, minor = 0, build = 0;
+        if (parts.Length >= 1) int.TryParse(parts[0], out major);
+        if (parts.Length >= 2) int.TryParse(parts[1], out minor);
+        if (parts.Length >= 3) int.TryParse(parts[2], out build);
+        return new Version(major, minor, build);
     }
 
     private static async Task DownloadFileAsync(

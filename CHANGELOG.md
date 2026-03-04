@@ -5,6 +5,21 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.5] - 2026-03-04
+
+### Fixed
+- Fixed model download file-locking bug: FileStream is now explicitly closed before File.Move to avoid "in use" errors.
+- Fixed transcription failing with "model not found": added `--model_dir` argument pointing to the correct models root directory.
+- Fixed runtime installer downloading oldest asset (r192) instead of newest: now picks the highest version number from GitHub releases.
+- Fixed downloaded models not appearing in Settings > Models: added `RefreshFromDiskAsync()` that re-scans filesystem on every Settings open.
+
+### Added
+- Runtime version detection: app runs `faster-whisper-xxl --version` on startup and shows a warning if the installed version is below r245 (required for diarization).
+- "Update runtime" button on MainPage that deletes the outdated runtime and downloads the latest version.
+
+### Changed
+- Settings nav label shortened from "Engines & Runtime" to "Engines" to fit the 180px nav column.
+
 ## [0.3.3] - 2026-02-28
 
 ### Added

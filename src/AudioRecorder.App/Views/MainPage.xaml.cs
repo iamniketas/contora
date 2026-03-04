@@ -237,6 +237,7 @@ public sealed partial class MainPage : Page
         _ = CheckForUpdatesAsync(userInitiated: false);
         UpdateTranscriptionAvailabilityUi();
         _ = TryAutoSetupWhisperAsync();
+        _ = CheckRuntimeVersionAsync();
     }
 
     private ITranscriptionService CreateTranscriptionService(string mode)
@@ -326,12 +327,92 @@ public sealed partial class MainPage : Page
         return Task.CompletedTask;
     }
 
+    private async Task CheckRuntimeVersionAsync()
+    {
+        if (!_runtimeInstallerService.IsRuntimeInstalled())
+            return;
+
+        try
+        {
+            var (version, versionStr) = await _runtimeInstallerService.GetInstalledVersionAsync();
+            if (version == null)
+                return;
+
+            // Store version in shared config
+            var config = await _sharedConfigService.LoadAsync();
+            var runtime = config.InstalledRuntimes.FirstOrDefault(r => r.Id == "faster-whisper-xxl");
+            if (runtime != null && runtime.Version != versionStr)
+            {
+                runtime.Version = versionStr;
+                await _sharedConfigService.SaveAsync(config);
+            }
+
+            if (version < WhisperRuntimeInstallerService.MinimumRequiredVersion)
+            {
+                _dispatcherQueue.TryEnqueue(() =>
+                {
+                    RuntimeOutdatedBar.Title = $"Whisper runtime outdated ({versionStr})";
+                    RuntimeOutdatedBar.Message = "Update required for diarization support. Current version does not support --diarize flag.";
+                    RuntimeOutdatedBar.IsOpen = true;
+                    UpdateRuntimeButton.Visibility = Visibility.Visible;
+                });
+            }
+        }
+        catch
+        {
+            // Version check is best-effort
+        }
+    }
+
+    private async void OnUpdateRuntimeClicked(object sender, RoutedEventArgs e)
+    {
+        RuntimeOutdatedBar.IsOpen = false;
+        UpdateRuntimeButton.Visibility = Visibility.Collapsed;
+
+        // Delete old runtime
+        var runtimeRoot = WhisperPaths.GetCanonicalRuntimeRoot();
+        if (Directory.Exists(runtimeRoot))
+        {
+            try
+            {
+                Directory.Delete(runtimeRoot, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                RuntimeDownloadStatusText.Visibility = Visibility.Visible;
+                RuntimeDownloadStatusText.Text = $"Failed to delete old runtime: {ex.Message}";
+                return;
+            }
+        }
+
+        await _sharedConfigService.UnregisterRuntimeAsync("faster-whisper-xxl");
+
+        // Download new runtime
+        await StartRuntimeDownloadAsync();
+
+        // Re-check version after install
+        if (_runtimeInstallerService.IsRuntimeInstalled())
+        {
+            var (version, versionStr) = await _runtimeInstallerService.GetInstalledVersionAsync();
+            if (version != null)
+            {
+                await _sharedConfigService.RegisterRuntimeAsync(
+                    "faster-whisper-xxl",
+                    "Faster Whisper XXL",
+                    _runtimeInstallerService.GetRuntimeExePath(),
+                    versionStr);
+            }
+        }
+    }
+
     private void UpdateTranscriptionAvailabilityUi()
     {
         var whisperAvailable = _transcriptionService.IsWhisperAvailable;
         var modelInstalled = _modelDownloadService.IsModelInstalled();
         var ffmpegInstalled = _ffmpegInstallerService.IsInstalled();
 
+        RuntimeOutdatedBar.IsOpen = false;
+        UpdateRuntimeButton.Visibility = Visibility.Collapsed;
         DownloadRuntimeButton.Visibility = Visibility.Collapsed;
         CancelRuntimeDownloadButton.Visibility = Visibility.Collapsed;
         RuntimeDownloadProgressBar.Visibility = Visibility.Collapsed;

@@ -102,26 +102,27 @@ public sealed class WhisperModelDownloadService
                 using var response = await http.GetAsync(fileUrl, HttpCompletionOption.ResponseHeadersRead, ct);
                 response.EnsureSuccessStatusCode();
 
-                await using var source = await response.Content.ReadAsStreamAsync(ct);
-                await using var destination = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
-
-                var buffer = new byte[1024 * 64];
-                while (true)
+                await using (var source = await response.Content.ReadAsStreamAsync(ct))
+                await using (var destination = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
                 {
-                    var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
-                    if (read == 0)
-                        break;
+                    var buffer = new byte[1024 * 64];
+                    while (true)
+                    {
+                        var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
+                        if (read == 0)
+                            break;
 
-                    await destination.WriteAsync(buffer.AsMemory(0, read), ct);
-                    downloadedBytes += read;
+                        await destination.WriteAsync(buffer.AsMemory(0, read), ct);
+                        downloadedBytes += read;
 
-                    var percent = totalBytes > 0
-                        ? (int)(downloadedBytes * 100 / totalBytes)
-                        : 0;
-                    onProgress(new ModelDownloadProgress(percent, downloadedBytes, totalBytes, fileName));
-                }
+                        var percent = totalBytes > 0
+                            ? (int)(downloadedBytes * 100 / totalBytes)
+                            : 0;
+                        onProgress(new ModelDownloadProgress(percent, downloadedBytes, totalBytes, fileName));
+                    }
 
-                await destination.FlushAsync(ct);
+                    await destination.FlushAsync(ct);
+                } // FileStream closed here before File.Move
 
                 if (File.Exists(targetPath))
                     File.Delete(targetPath);

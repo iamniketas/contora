@@ -346,6 +346,21 @@
                                 Click="OnTranscribeClicked"
                                 Content="Transcribe" />
 <InfoBar
+                                x:Name="RuntimeOutdatedBar"
+                                IsOpen="False"
+                                Severity="Warning"
+                                Title="Whisper runtime outdated"
+                                Message="Update required for diarization support." />
+
+                            <Button
+                                x:Name="UpdateRuntimeButton"
+                                HorizontalAlignment="Stretch"
+                                Click="OnUpdateRuntimeClicked"
+                                Content="Update runtime"
+                                Visibility="Collapsed"
+                                Style="{StaticResource AccentButtonStyle}" />
+
+                            <InfoBar
                                 x:Name="WhisperWarningBar"
                                 IsOpen="False"
                                 Severity="Warning"

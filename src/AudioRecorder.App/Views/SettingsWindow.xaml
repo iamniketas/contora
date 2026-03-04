@@ -16,7 +16,7 @@
             OpenPaneLength="180"
             SelectionChanged="OnNavSelectionChanged">
             <NavigationView.MenuItems>
-                <NavigationViewItem Content="Engines &amp; Runtime" Tag="engines">
+                <NavigationViewItem Content="Engines" Tag="engines">
                     <NavigationViewItem.Icon>
                         <FontIcon Glyph="&#xE90F;" />
                     </NavigationViewItem.Icon>
@@ -42,7 +42,7 @@
                 <Grid>
                     <!-- Engines & Runtime -->
                     <StackPanel x:Name="EnginesSection" Spacing="16" Visibility="Visible">
-                        <TextBlock Text="Engines &amp; Runtime" FontSize="24" FontWeight="SemiBold" />
+                        <TextBlock Text="Engines" FontSize="24" FontWeight="SemiBold" />
 
                         <Border
                             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"

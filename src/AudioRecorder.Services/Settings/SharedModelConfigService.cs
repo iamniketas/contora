@@ -150,6 +150,48 @@ public sealed class SharedModelConfigService
 
     public void InvalidateCache() => _cached = null;
 
+    /// <summary>
+    /// Re-scans filesystem for runtimes and models, merging newly found entries into existing config.
+    /// </summary>
+    public async Task RefreshFromDiskAsync()
+    {
+        var config = await LoadAsync();
+        var detected = AutoDetect();
+
+        bool changed = false;
+
+        // Merge runtimes
+        foreach (var runtime in detected.InstalledRuntimes)
+        {
+            if (!config.InstalledRuntimes.Any(r => r.Id == runtime.Id))
+            {
+                config.InstalledRuntimes.Add(runtime);
+                changed = true;
+            }
+        }
+
+        // Merge models
+        foreach (var model in detected.InstalledModels)
+        {
+            if (!config.InstalledModels.Any(m => m.Name == model.Name && m.RuntimeId == model.RuntimeId))
+            {
+                config.InstalledModels.Add(model);
+                changed = true;
+            }
+        }
+
+        // Remove models whose directories no longer exist
+        var removed = config.InstalledModels.RemoveAll(m => !Directory.Exists(m.DirectoryPath));
+        if (removed > 0) changed = true;
+
+        if (changed)
+        {
+            config.ActiveRuntimeId ??= config.InstalledRuntimes.FirstOrDefault()?.Id;
+            config.ActiveModelName ??= config.InstalledModels.FirstOrDefault()?.Name;
+            await SaveAsync(config);
+        }
+    }
+
     private static SharedModelConfig AutoDetect()
     {
         var config = new SharedModelConfig();
