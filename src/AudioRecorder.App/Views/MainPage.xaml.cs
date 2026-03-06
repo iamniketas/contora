@@ -1,6 +1,7 @@
 ﻿using AudioRecorder.Core.Models;
 using AudioRecorder.Core.Services;
 using AudioRecorder.Services.Audio;
+using AudioRecorder.Services.Hardware;
 using AudioRecorder.Services.Notifications;
 using AudioRecorder.Services.Pipeline;
 using AudioRecorder.Services.Models;
@@ -234,6 +235,10 @@ public sealed partial class MainPage : Page
         LoadWhisperModelSetting();
         UpdateDeviceInfoText();
 
+        // Run hardware diagnostics in background so "auto" mode resolves correctly.
+        // Once done, rebuild the transcription service with the right device.
+        _ = InitializeDiagnosticsAsync();
+
         if (_runtimeInstallerService.IsRuntimeInstalled())
         {
             WhisperPaths.RegisterEnvironmentVariables(_runtimeInstallerService.GetRuntimeExePath(), _whisperModel);
@@ -248,8 +253,23 @@ public sealed partial class MainPage : Page
     private ITranscriptionService CreateTranscriptionService(string mode)
     {
         bool enableDiarization = !string.Equals(mode, "light", StringComparison.OrdinalIgnoreCase);
-        var deviceMode = _settingsService.LoadDeviceMode();
-        return new WhisperTranscriptionService(modelName: _whisperModel, enableDiarization: enableDiarization, deviceMode: deviceMode);
+        var effectiveDevice = ResolveEffectiveDevice();
+        return new WhisperTranscriptionService(modelName: _whisperModel, enableDiarization: enableDiarization, deviceMode: effectiveDevice);
+    }
+
+    /// <summary>
+    /// Resolves the actual device to pass to faster-whisper.
+    /// If the user chose "auto", uses the hardware diagnostics recommendation
+    /// (e.g. "cpu" for GT 220, "cuda" for RTX 3090) so faster-whisper never
+    /// tries CUDA on incompatible hardware.
+    /// If diagnostics haven't run yet, defaults to "cpu" (safe fallback).
+    /// </summary>
+    private string ResolveEffectiveDevice()
+    {
+        if (_deviceMode != "auto")
+            return _deviceMode;
+
+        return HardwareDiagnosticsService.LastResult?.RecommendedDevice ?? "cpu";
     }
 
     private void ApplyTranscriptionMode(string mode, bool save)
@@ -297,17 +317,37 @@ public sealed partial class MainPage : Page
         };
     }
 
+    private async Task InitializeDiagnosticsAsync()
+    {
+        try
+        {
+            var diag = await HardwareDiagnosticsService.RunAsync();
+            _dispatcherQueue.TryEnqueue(() =>
+            {
+                // Rebuild service: "auto" now resolves to the correct device
+                _transcriptionService.ProgressChanged -= OnTranscriptionProgressChanged;
+                _transcriptionService = CreateTranscriptionService(_transcriptionMode);
+                _transcriptionService.ProgressChanged += OnTranscriptionProgressChanged;
+                UpdateDeviceInfoText();
+            });
+        }
+        catch { }
+    }
+
     private void UpdateDeviceInfoText()
     {
-        var mode = _settingsService.LoadDeviceMode();
-        var model = _whisperModel;
-        var deviceLabel = mode switch
+        var effective = ResolveEffectiveDevice();
+        var deviceLabel = effective switch
         {
-            "cpu"  => "CPU",
             "cuda" => "GPU (CUDA)",
-            _      => "Auto (GPU preferred)"
+            _      => "CPU"
         };
-        DeviceInfoText.Text = $"Device: {deviceLabel} · Model: {model}";
+
+        var modeLabel = _deviceMode == "auto"
+            ? $"Auto → {deviceLabel}"
+            : deviceLabel;
+
+        DeviceInfoText.Text = $"Device: {modeLabel} · Model: {_whisperModel}";
     }
 
     private void ApplyWhisperModel(string modelName, bool save)

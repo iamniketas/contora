@@ -5,6 +5,12 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.7] - 2026-03-06
+
+### Fixed
+- **Auto mode now actually works**: in "auto" device mode faster-whisper no longer attempts CUDA on incompatible GPUs. Hardware diagnostics run at startup and resolve "auto" to the correct device ("cpu" or "cuda") before any transcription starts. Users with old NVIDIA cards (GT 220, Fermi, etc.) or AMD GPUs will automatically use CPU mode — no manual setting required.
+- Device info row on main page now shows "Auto → CPU" or "Auto → GPU (CUDA)" so the user sees exactly what will be used.
+
 ## [0.3.6] - 2026-03-06
 
 ### Added

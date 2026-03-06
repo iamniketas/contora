@@ -25,6 +25,13 @@ public sealed record HardwareDiagnostics(
 
 public static class HardwareDiagnosticsService
 {
+    /// <summary>
+    /// Cached result of the last RunAsync call.
+    /// MainPage reads this in CreateTranscriptionService so "auto" mode
+    /// resolves to the hardware-recommended device without asking the user.
+    /// </summary>
+    public static HardwareDiagnostics? LastResult { get; private set; }
+
     public static async Task<HardwareDiagnostics> RunAsync(CancellationToken ct = default)
     {
         var (gpus, cpu, totalRamMb) = await QueryAllHardwareAsync(ct);
@@ -69,7 +76,9 @@ public static class HardwareDiagnosticsService
                 warning = $"Low RAM ({totalRamMb / 1024.0:F1} GB). Consider using model 'tiny'.";
         }
 
-        return new HardwareDiagnostics(primaryGpu, cpu, totalRamMb, device, model, warning);
+        var result = new HardwareDiagnostics(primaryGpu, cpu, totalRamMb, device, model, warning);
+        LastResult = result;
+        return result;
     }
 
     // ─── Single PowerShell script: GPU names, VRAM (64-bit registry), CPU, RAM ───
