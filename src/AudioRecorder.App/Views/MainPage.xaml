@@ -478,157 +478,261 @@
                 Grid.Column="3"
                 Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                BorderThickness="1,0,0,0"
-                Padding="16">
-                <Grid RowSpacing="12">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                    </Grid.RowDefinitions>
-<Grid Grid.Row="0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock
-                            Grid.Column="0"
-                            FontSize="16"
-                            FontWeight="SemiBold"
-                            Text="Transcript"
-                            VerticalAlignment="Center" />
-                        <Button
-                            x:Name="SaveTranscriptionButton"
-                            Grid.Column="1"
-                            Click="OnSaveTranscriptionClicked"
-                            Visibility="Collapsed"
-                            Padding="8,4"
-                            ToolTipService.ToolTip="Save changes">
-                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                <Ellipse
-                                    x:Name="SaveIndicator"
-                                    Width="8"
-                                    Height="8"
-                                    Fill="#4CAF50"
-                                    VerticalAlignment="Center" />
-                                <FontIcon
-                                    Glyph="&#xE74E;"
-                                    FontSize="14" />
-                            </StackPanel>
-                        </Button>
-                    </Grid>
-<StackPanel
-                        x:Name="SpeakersPanel"
-                        Grid.Row="1"
-                        Spacing="8"
-                        Visibility="Collapsed">
-                        <TextBlock
-                            FontSize="12"
-                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                            Text="Speakers (double-click to edit)" />
-                        <ItemsRepeater
-                            x:Name="SpeakersRepeater"
-                            ItemsSource="{x:Bind Speakers, Mode=OneWay}">
-                            <ItemsRepeater.Layout>
-                                <StackLayout Orientation="Horizontal" Spacing="8" />
-                            </ItemsRepeater.Layout>
-                            <ItemsRepeater.ItemTemplate>
-                                <DataTemplate x:DataType="views:SpeakerViewModel">
-                                    <Border
-                                        Background="{ThemeResource AccentFillColorDefaultBrush}"
-                                        CornerRadius="4"
-                                        Padding="8,4">
-                                        <TextBox
-                                            Text="{x:Bind Name, Mode=TwoWay}"
-                                            Background="Transparent"
-                                            BorderThickness="0"
-                                            Foreground="White"
-                                            FontSize="12"
-                                            MinWidth="80"
-                                            TextChanged="OnSpeakerNameChanged" />
-                                    </Border>
-                                </DataTemplate>
-                            </ItemsRepeater.ItemTemplate>
-                        </ItemsRepeater>
-                    </StackPanel>
-<ListView
-                        x:Name="TranscriptionListView"
-                        Grid.Row="2"
-                        ItemsSource="{x:Bind TranscriptionSegments, Mode=OneWay}"
-                        SelectionMode="None">
-                        <ListView.ItemContainerStyle>
-                            <Style TargetType="ListViewItem">
-                                <Setter Property="Padding" Value="0" />
-                                <Setter Property="Margin" Value="0,2" />
-                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                            </Style>
-                        </ListView.ItemContainerStyle>
-                        <ListView.ItemTemplate>
-                            <DataTemplate x:DataType="views:TranscriptionSegmentViewModel">
-                                <Grid ColumnSpacing="12" Padding="0,4">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto" MinWidth="60" />
-                                        <ColumnDefinition Width="Auto" MinWidth="60" MaxWidth="100" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-<Button
-                                        Grid.Column="0"
-                                        Content="{x:Bind TimestampDisplay}"
-                                        Click="OnTimestampClicked"
-                                        Tag="{x:Bind}"
-                                        Padding="6,3"
-                                        FontSize="11"
-                                        FontFamily="Consolas"
-                                        Background="{ThemeResource ControlFillColorDefaultBrush}"
-                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                                        BorderThickness="1"
-                                        CornerRadius="4"
-                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                        VerticalAlignment="Top"
-                                        HorizontalAlignment="Left"
-                                        ToolTipService.ToolTip="Play segment (click)" />
-<Border
-                                        Grid.Column="1"
-                                        Background="{ThemeResource AccentFillColorDefaultBrush}"
-                                        CornerRadius="4"
-                                        Padding="6,2"
-                                        VerticalAlignment="Top"
-                                        RightTapped="OnSpeakerRightTapped"
-                                        Tag="{x:Bind}">
-                                        <Border.ContextFlyout>
-                                            <MenuFlyout>
-                                                <MenuFlyoutItem
-                                                    Text="Rename speaker"
-                                                    Click="OnRenameSpeakerClicked"
-                                                    Tag="{x:Bind}" />
-                                            </MenuFlyout>
-                                        </Border.ContextFlyout>
-                                        <TextBlock
-                                            Text="{x:Bind SpeakerName, Mode=OneWay}"
-                                            FontSize="11"
-                                            FontWeight="SemiBold"
-                                            Foreground="White"
-                                            TextTrimming="CharacterEllipsis"
-                                            ToolTipService.ToolTip="Right-click to rename" />
-                                    </Border>
-<TextBox
-                                        Grid.Column="2"
-                                        Text="{x:Bind Text, Mode=TwoWay}"
-                                        TextWrapping="Wrap"
-                                        AcceptsReturn="False"
-                                        BorderThickness="0"
-                                        Background="Transparent"
-                                        FontSize="13"
-                                        VerticalAlignment="Top"
-                                        Padding="4,2"
-                                        TextChanged="OnSegmentTextChanged"
-                                        Tag="{x:Bind}" />
-                                </Grid>
-                            </DataTemplate>
-                        </ListView.ItemTemplate>
-                    </ListView>
+                BorderThickness="1,0,0,0">
+                <Pivot x:Name="RightPanelPivot" Padding="12,0,12,0">
 
-                </Grid>
+                    <!--  ── Transcript tab ───────────────────────────────────  -->
+                    <PivotItem Header="Transcript">
+                        <Grid RowSpacing="12" Margin="0,12,0,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <Grid Grid.Row="0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock
+                                    Grid.Column="0"
+                                    FontSize="14"
+                                    FontWeight="SemiBold"
+                                    Text="Current transcript"
+                                    VerticalAlignment="Center"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                <Button
+                                    x:Name="SaveTranscriptionButton"
+                                    Grid.Column="1"
+                                    Click="OnSaveTranscriptionClicked"
+                                    Visibility="Collapsed"
+                                    Padding="8,4"
+                                    ToolTipService.ToolTip="Save changes">
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <Ellipse
+                                            x:Name="SaveIndicator"
+                                            Width="8"
+                                            Height="8"
+                                            Fill="#4CAF50"
+                                            VerticalAlignment="Center" />
+                                        <FontIcon
+                                            Glyph="&#xE74E;"
+                                            FontSize="14" />
+                                    </StackPanel>
+                                </Button>
+                            </Grid>
+
+                            <StackPanel
+                                x:Name="SpeakersPanel"
+                                Grid.Row="1"
+                                Spacing="8"
+                                Visibility="Collapsed">
+                                <TextBlock
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Speakers (double-click to edit)" />
+                                <ItemsRepeater
+                                    x:Name="SpeakersRepeater"
+                                    ItemsSource="{x:Bind Speakers, Mode=OneWay}">
+                                    <ItemsRepeater.Layout>
+                                        <StackLayout Orientation="Horizontal" Spacing="8" />
+                                    </ItemsRepeater.Layout>
+                                    <ItemsRepeater.ItemTemplate>
+                                        <DataTemplate x:DataType="views:SpeakerViewModel">
+                                            <Border
+                                                Background="{ThemeResource AccentFillColorDefaultBrush}"
+                                                CornerRadius="4"
+                                                Padding="8,4">
+                                                <TextBox
+                                                    Text="{x:Bind Name, Mode=TwoWay}"
+                                                    Background="Transparent"
+                                                    BorderThickness="0"
+                                                    Foreground="White"
+                                                    FontSize="12"
+                                                    MinWidth="80"
+                                                    TextChanged="OnSpeakerNameChanged" />
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsRepeater.ItemTemplate>
+                                </ItemsRepeater>
+                            </StackPanel>
+
+                            <ListView
+                                x:Name="TranscriptionListView"
+                                Grid.Row="2"
+                                ItemsSource="{x:Bind TranscriptionSegments, Mode=OneWay}"
+                                SelectionMode="None">
+                                <ListView.ItemContainerStyle>
+                                    <Style TargetType="ListViewItem">
+                                        <Setter Property="Padding" Value="0" />
+                                        <Setter Property="Margin" Value="0,2" />
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                    </Style>
+                                </ListView.ItemContainerStyle>
+                                <ListView.ItemTemplate>
+                                    <DataTemplate x:DataType="views:TranscriptionSegmentViewModel">
+                                        <Grid ColumnSpacing="12" Padding="0,4">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" MinWidth="60" />
+                                                <ColumnDefinition Width="Auto" MinWidth="60" MaxWidth="100" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <Button
+                                                Grid.Column="0"
+                                                Content="{x:Bind TimestampDisplay}"
+                                                Click="OnTimestampClicked"
+                                                Tag="{x:Bind}"
+                                                Padding="6,3"
+                                                FontSize="11"
+                                                FontFamily="Consolas"
+                                                Background="{ThemeResource ControlFillColorDefaultBrush}"
+                                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                                BorderThickness="1"
+                                                CornerRadius="4"
+                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                VerticalAlignment="Top"
+                                                HorizontalAlignment="Left"
+                                                ToolTipService.ToolTip="Play segment (click)" />
+                                            <Border
+                                                Grid.Column="1"
+                                                Background="{ThemeResource AccentFillColorDefaultBrush}"
+                                                CornerRadius="4"
+                                                Padding="6,2"
+                                                VerticalAlignment="Top"
+                                                RightTapped="OnSpeakerRightTapped"
+                                                Tag="{x:Bind}">
+                                                <Border.ContextFlyout>
+                                                    <MenuFlyout>
+                                                        <MenuFlyoutItem
+                                                            Text="Rename speaker"
+                                                            Click="OnRenameSpeakerClicked"
+                                                            Tag="{x:Bind}" />
+                                                    </MenuFlyout>
+                                                </Border.ContextFlyout>
+                                                <TextBlock
+                                                    Text="{x:Bind SpeakerName, Mode=OneWay}"
+                                                    FontSize="11"
+                                                    FontWeight="SemiBold"
+                                                    Foreground="White"
+                                                    TextTrimming="CharacterEllipsis"
+                                                    ToolTipService.ToolTip="Right-click to rename" />
+                                            </Border>
+                                            <TextBox
+                                                Grid.Column="2"
+                                                Text="{x:Bind Text, Mode=TwoWay}"
+                                                TextWrapping="Wrap"
+                                                AcceptsReturn="False"
+                                                BorderThickness="0"
+                                                Background="Transparent"
+                                                FontSize="13"
+                                                VerticalAlignment="Top"
+                                                Padding="4,2"
+                                                TextChanged="OnSegmentTextChanged"
+                                                Tag="{x:Bind}" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                        </Grid>
+                    </PivotItem>
+
+                    <!--  ── Sessions tab ──────────────────────────────────────  -->
+                    <PivotItem Header="Sessions">
+                        <Grid RowSpacing="10" Margin="0,12,0,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <!--  Search box  -->
+                            <TextBox
+                                x:Name="SessionSearchBox"
+                                Grid.Row="0"
+                                PlaceholderText="Search sessions..."
+                                TextChanged="OnSessionSearchChanged" />
+
+                            <!--  Sessions list  -->
+                            <ListView
+                                x:Name="SessionsListView"
+                                Grid.Row="1"
+                                ItemsSource="{x:Bind Sessions, Mode=OneWay}"
+                                SelectionMode="None">
+                                <ListView.ItemContainerStyle>
+                                    <Style TargetType="ListViewItem">
+                                        <Setter Property="Padding" Value="0" />
+                                        <Setter Property="Margin" Value="0,3" />
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                    </Style>
+                                </ListView.ItemContainerStyle>
+                                <ListView.ItemTemplate>
+                                    <DataTemplate x:DataType="views:SessionViewModel">
+                                        <Border
+                                            Background="{ThemeResource ControlFillColorDefaultBrush}"
+                                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                            BorderThickness="1"
+                                            CornerRadius="6"
+                                            Padding="12,10"
+                                            PointerPressed="OnSessionItemPointerPressed"
+                                            Tag="{x:Bind}">
+                                            <Grid RowSpacing="4">
+                                                <Grid.RowDefinitions>
+                                                    <RowDefinition Height="Auto" />
+                                                    <RowDefinition Height="Auto" />
+                                                    <RowDefinition Height="Auto" />
+                                                </Grid.RowDefinitions>
+
+                                                <!--  Title + state badge  -->
+                                                <Grid Grid.Row="0">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock
+                                                        Grid.Column="0"
+                                                        Text="{x:Bind Title}"
+                                                        FontSize="13"
+                                                        FontWeight="SemiBold"
+                                                        TextTrimming="CharacterEllipsis" />
+                                                    <Border
+                                                        Grid.Column="1"
+                                                        Background="{x:Bind StateBrush}"
+                                                        CornerRadius="3"
+                                                        Padding="5,1"
+                                                        VerticalAlignment="Center"
+                                                        Margin="8,0,0,0">
+                                                        <TextBlock
+                                                            Text="{x:Bind StateLabel}"
+                                                            FontSize="10"
+                                                            Foreground="White" />
+                                                    </Border>
+                                                </Grid>
+
+                                                <!--  Date + duration  -->
+                                                <TextBlock
+                                                    Grid.Row="1"
+                                                    Text="{x:Bind DateDurationDisplay}"
+                                                    FontSize="11"
+                                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                                                <!--  Preview text  -->
+                                                <TextBlock
+                                                    Grid.Row="2"
+                                                    Text="{x:Bind PreviewText}"
+                                                    FontSize="11"
+                                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                    TextTrimming="CharacterEllipsis"
+                                                    MaxLines="2"
+                                                    TextWrapping="Wrap" />
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                        </Grid>
+                    </PivotItem>
+
+                </Pivot>
             </Border>
         </Grid>
     </Page.Content>

@@ -7,6 +7,7 @@ using AudioRecorder.Services.Pipeline;
 using AudioRecorder.Services.Models;
 using AudioRecorder.Services.Settings;
 using AudioRecorder.Services.Transcription;
+using AudioRecorder.Services.Storage;
 using AudioRecorder.Services.Updates;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
@@ -139,6 +140,46 @@ public class TranscriptionSegmentViewModel : INotifyPropertyChanged
     }
 }
 
+public sealed class SessionViewModel
+{
+    public Guid Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string DateDurationDisplay { get; set; } = string.Empty;
+    public string PreviewText { get; set; } = string.Empty;
+    public string StateLabel { get; set; } = string.Empty;
+    public Microsoft.UI.Xaml.Media.Brush StateBrush { get; set; } =
+        new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Gray);
+    public string? TranscriptPath { get; set; }
+
+    public static SessionViewModel FromSession(Session s)
+    {
+        var (label, color) = s.State switch
+        {
+            SessionState.Recorded => ("Recorded", Windows.UI.Color.FromArgb(255, 100, 130, 200)),
+            SessionState.Transcribing => ("Transcribing…", Windows.UI.Color.FromArgb(255, 200, 150, 50)),
+            SessionState.Transcribed => ("Transcribed", Windows.UI.Color.FromArgb(255, 60, 160, 80)),
+            SessionState.Exported => ("Exported", Windows.UI.Color.FromArgb(255, 100, 100, 200)),
+            _ => ("Unknown", Windows.UI.Color.FromArgb(255, 128, 128, 128)),
+        };
+
+        var duration = TimeSpan.FromSeconds(s.DurationSeconds);
+        var durationStr = s.DurationSeconds >= 3600
+            ? duration.ToString(@"h\:mm\:ss")
+            : duration.ToString(@"m\:ss");
+
+        return new SessionViewModel
+        {
+            Id = s.Id,
+            Title = s.Title,
+            DateDurationDisplay = $"{s.RecordedAt:dd MMM yyyy, HH:mm}  ·  {durationStr}",
+            PreviewText = s.PreviewText ?? string.Empty,
+            StateLabel = label,
+            StateBrush = new Microsoft.UI.Xaml.Media.SolidColorBrush(color),
+            TranscriptPath = s.TranscriptPath,
+        };
+    }
+}
+
 public sealed partial class MainPage : Page
 {
     private readonly IAudioCaptureService _audioCaptureService;
@@ -146,6 +187,7 @@ public sealed partial class MainPage : Page
     private readonly ISettingsService _settingsService;
     private readonly IAudioPlaybackService _playbackService;
     private readonly ISessionPipelineService _sessionPipelineService;
+    private readonly ISessionStore _sessionStore;
     private readonly AppUpdateService _appUpdateService;
     private readonly WhisperRuntimeInstallerService _runtimeInstallerService;
     private WhisperModelDownloadService _modelDownloadService;
@@ -155,6 +197,8 @@ public sealed partial class MainPage : Page
     private readonly DispatcherQueueTimer _updateTimer;
     private string? _lastRecordingPath;
     private string? _lastTranscriptionPath;
+    private Guid? _currentSessionId;
+    private DispatcherQueueTimer? _searchDebounceTimer;
     private CancellationTokenSource? _transcriptionCts;
     private bool _isSettingsPanelVisible = true;
     private TranscriptionSegmentViewModel? _playingSegment;
@@ -178,6 +222,7 @@ public sealed partial class MainPage : Page
     public ObservableCollection<AudioSourceViewModel> InputSources { get; } = new();
     public ObservableCollection<SpeakerViewModel> Speakers { get; } = new();
     public ObservableCollection<TranscriptionSegmentViewModel> TranscriptionSegments { get; } = new();
+    public ObservableCollection<SessionViewModel> Sessions { get; } = new();
 
     public MainPage()
     {
@@ -195,6 +240,7 @@ public sealed partial class MainPage : Page
 
         _playbackService = new AudioPlaybackService();
         _sessionPipelineService = new SessionPipelineService();
+        _sessionStore = new SqliteSessionStore();
         _playbackService.StateChanged += OnPlaybackStateChanged;
         _appUpdateService = new AppUpdateService();
         var customInstallRoot = _settingsService.LoadInstallRootPath();
@@ -229,6 +275,8 @@ public sealed partial class MainPage : Page
 
     private async void OnPageLoaded(object sender, RoutedEventArgs e)
     {
+        await _sessionStore.InitializeAsync();
+        _ = LoadSessionsAsync();
         await LoadAudioSourcesAsync();
         LoadOutputFolderSetting();
         LoadTranscriptionModeSetting();
@@ -1000,6 +1048,8 @@ public sealed partial class MainPage : Page
             }
             else
             {
+                var recordingInfo = _audioCaptureService.GetCurrentRecordingInfo();
+                var recordedDuration = recordingInfo.Duration;
                 await _audioCaptureService.StopRecordingAsync();
 
                 StartStopButton.Content = "Start recording";
@@ -1029,6 +1079,7 @@ public sealed partial class MainPage : Page
                     }
 
                     ShowTranscriptionSection();
+                    _ = SaveNewSessionAsync(_lastRecordingPath, recordedDuration);
                     await ShowRecordingSavedDialogAsync(_lastRecordingPath);
                 }
             }
@@ -1252,6 +1303,8 @@ public sealed partial class MainPage : Page
                     await _playbackService.LoadAsync(_lastRecordingPath);
                 }
 
+                _ = UpdateSessionAfterTranscriptionAsync(result.OutputPath, result.Segments);
+
                 var fileName = Path.GetFileName(_lastRecordingPath ?? "recording");
                 NotificationService.ShowTranscriptionCompleted(fileName, result.Segments.Count, result.OutputPath);
             }
@@ -1312,6 +1365,39 @@ public sealed partial class MainPage : Page
         {
             var speakerName = speakerMap.TryGetValue(segment.Speaker, out var speaker) ? speaker.Name : segment.Speaker;
             TranscriptionSegments.Add(new TranscriptionSegmentViewModel(segment, speakerName));
+        }
+
+        SpeakersPanel.Visibility = Speakers.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
+        SaveTranscriptionButton.Visibility = Visibility.Visible;
+        SetUnsavedChanges(false);
+
+        return Task.CompletedTask;
+    }
+
+    private Task LoadTranscriptionToUI(
+        IReadOnlyList<TranscriptionSegment> segments,
+        Dictionary<string, string> existingSpeakerNames)
+    {
+        TranscriptionSegments.Clear();
+        Speakers.Clear();
+        _speakerNameMap.Clear();
+
+        var speakerIds = segments.Select(s => s.Speaker).Distinct().ToList();
+        var speakerViewMap = new Dictionary<string, SpeakerViewModel>();
+
+        foreach (var id in speakerIds)
+        {
+            var displayName = existingSpeakerNames.TryGetValue(id, out var saved) ? saved : id;
+            var speaker = new SpeakerViewModel(id, displayName);
+            Speakers.Add(speaker);
+            speakerViewMap[id] = speaker;
+            _speakerNameMap[id] = displayName;
+        }
+
+        foreach (var segment in segments)
+        {
+            var name = speakerViewMap.TryGetValue(segment.Speaker, out var sv) ? sv.Name : segment.Speaker;
+            TranscriptionSegments.Add(new TranscriptionSegmentViewModel(segment, name));
         }
 
         SpeakersPanel.Visibility = Speakers.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
@@ -1595,6 +1681,186 @@ public sealed partial class MainPage : Page
         DurationTextBlock.Text = info.Duration.ToString(@"hh\:mm\:ss");
         FileSizeTextBlock.Text = FormatFileSize(info.FileSizeBytes);
     }
+
+    // ── Sessions UI ─────────────────────────────────────────────────────────
+
+    private async Task LoadSessionsAsync(string? query = null)
+    {
+        try
+        {
+            var sessions = string.IsNullOrWhiteSpace(query)
+                ? await _sessionStore.GetAllAsync()
+                : await _sessionStore.SearchAsync(query);
+
+            _dispatcherQueue.TryEnqueue(() =>
+            {
+                Sessions.Clear();
+                foreach (var s in sessions)
+                    Sessions.Add(SessionViewModel.FromSession(s));
+            });
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogError($"LoadSessionsAsync failed: {ex.Message}");
+        }
+    }
+
+    private void OnSessionSearchChanged(object sender, TextChangedEventArgs e)
+    {
+        // Debounce: wait 350ms after user stops typing
+        _searchDebounceTimer?.Stop();
+        _searchDebounceTimer = _dispatcherQueue.CreateTimer();
+        _searchDebounceTimer.Interval = TimeSpan.FromMilliseconds(350);
+        _searchDebounceTimer.IsRepeating = false;
+        _searchDebounceTimer.Tick += (_, _) =>
+        {
+            var q = SessionSearchBox.Text;
+            _ = LoadSessionsAsync(q);
+        };
+        _searchDebounceTimer.Start();
+    }
+
+    private async void OnSessionItemPointerPressed(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        if (sender is Border { Tag: SessionViewModel vm } && vm.TranscriptPath != null)
+        {
+            try
+            {
+                var session = await _sessionStore.GetAsync(vm.Id);
+                if (session is null) return;
+
+                // Load transcript from file
+                if (session.TranscriptPath != null && File.Exists(session.TranscriptPath))
+                {
+                    // Switch to Transcript tab and show the loaded data
+                    RightPanelPivot.SelectedIndex = 0;
+                    _lastTranscriptionPath = session.TranscriptPath;
+
+                    // Parse the stored segments and display them
+                    await LoadTranscriptFromFileAsync(session);
+                }
+            }
+            catch (Exception ex)
+            {
+                AudioRecorder.Services.Logging.AppLogger.LogError($"Failed to open session: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task LoadTranscriptFromFileAsync(Core.Models.Session session)
+    {
+        try
+        {
+            if (session.TranscriptPath == null || !File.Exists(session.TranscriptPath))
+                return;
+
+            var text = await File.ReadAllTextAsync(session.TranscriptPath);
+            var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+            // Restore speaker names if available
+            Dictionary<string, string> speakerMap = new();
+            if (!string.IsNullOrEmpty(session.SpeakerNamesJson))
+            {
+                try
+                {
+                    speakerMap = System.Text.Json.JsonSerializer
+                        .Deserialize<Dictionary<string, string>>(session.SpeakerNamesJson) ?? [];
+                }
+                catch { }
+            }
+
+            // Parse simple "SPEAKER_XX: text" or "[HH:MM:SS] SPEAKER_XX: text" format
+            var segments = new List<TranscriptionSegment>();
+            var timeRegex = new System.Text.RegularExpressions.Regex(
+                @"^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s+(\w+):\s+(.+)$");
+            var speakerOnlyRegex = new System.Text.RegularExpressions.Regex(
+                @"^(\w+):\s+(.+)$");
+
+            foreach (var line in lines)
+            {
+                var m = timeRegex.Match(line.Trim());
+                if (m.Success && TimeSpan.TryParse(m.Groups[1].Value, out var ts))
+                {
+                    segments.Add(new TranscriptionSegment(ts, ts + TimeSpan.FromSeconds(5),
+                        m.Groups[2].Value, m.Groups[3].Value));
+                    continue;
+                }
+
+                var m2 = speakerOnlyRegex.Match(line.Trim());
+                if (m2.Success)
+                {
+                    segments.Add(new TranscriptionSegment(TimeSpan.Zero, TimeSpan.Zero,
+                        m2.Groups[1].Value, m2.Groups[2].Value));
+                }
+            }
+
+            await LoadTranscriptionToUI(segments, speakerMap);
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogError($"LoadTranscriptFromFileAsync: {ex.Message}");
+        }
+    }
+
+    // ── Session persistence ─────────────────────────────────────────────────
+
+    private async Task SaveNewSessionAsync(string audioPath, TimeSpan duration)
+    {
+        try
+        {
+            var fileName = Path.GetFileNameWithoutExtension(audioPath);
+            var session = new Session
+            {
+                Title = fileName,
+                RecordedAt = DateTime.Now,
+                DurationSeconds = duration.TotalSeconds,
+                AudioPath = audioPath,
+                State = SessionState.Recorded,
+            };
+            await _sessionStore.CreateAsync(session);
+            _currentSessionId = session.Id;
+            AudioRecorder.Services.Logging.AppLogger.LogInfo($"Session saved: {session.Id}");
+            _ = LoadSessionsAsync();
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogError($"Failed to save session: {ex.Message}");
+        }
+    }
+
+    private async Task UpdateSessionAfterTranscriptionAsync(
+        string? transcriptPath,
+        IReadOnlyList<TranscriptionSegment> segments)
+    {
+        if (_currentSessionId is not { } sessionId) return;
+        try
+        {
+            var session = await _sessionStore.GetAsync(sessionId);
+            if (session is null) return;
+
+            var previewText = string.Join(" ", segments.Take(5).Select(s => s.Text)).Trim();
+            if (previewText.Length > 300) previewText = previewText[..300];
+
+            session.TranscriptPath = transcriptPath;
+            session.State = SessionState.Transcribed;
+            session.PreviewText = previewText;
+
+            // Build speaker names JSON from current UI map
+            if (_speakerNameMap.Count > 0)
+            {
+                session.SpeakerNamesJson = System.Text.Json.JsonSerializer.Serialize(_speakerNameMap);
+            }
+
+            await _sessionStore.UpdateAsync(session);
+            _ = LoadSessionsAsync();
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogError($"Failed to update session after transcription: {ex.Message}");
+        }
+    }
+
+    // ── Formatting helpers ──────────────────────────────────────────────────
 
     private static string FormatFileSize(long bytes)
     {
