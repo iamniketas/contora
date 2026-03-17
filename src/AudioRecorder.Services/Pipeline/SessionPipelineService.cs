@@ -33,6 +33,7 @@ public sealed class SessionPipelineService : ISessionPipelineService
                 Success: false,
                 CleanedText: string.Empty,
                 SummaryText: null,
+                GeneratedTitle: null,
                 TargetPath: string.Empty,
                 UsedBackup: false,
                 ErrorMessage: "Cleaned transcript is empty.");
@@ -43,9 +44,13 @@ public sealed class SessionPipelineService : ISessionPipelineService
         var backupPath = Path.Combine(outputDir, _options.BackupFileName);
         var systemPrompt = await LoadSystemPromptAsync(ct);
 
+        // Title generation runs in parallel (best-effort, never throws)
+        var titleTask = _ollamaClient.GenerateTitleAsync(cleanedText, ct);
+
         try
         {
             var summary = await _ollamaClient.GenerateSummaryAsync(systemPrompt, cleanedText, ct);
+            var generatedTitle = await titleTask;
             await AppendSessionAsync(masterPath, summary, ct);
             AppLogger.LogInfo($"Session pipeline: summary appended to {masterPath}");
 
@@ -53,12 +58,14 @@ public sealed class SessionPipelineService : ISessionPipelineService
                 Success: true,
                 CleanedText: cleanedText,
                 SummaryText: summary,
+                GeneratedTitle: generatedTitle,
                 TargetPath: masterPath,
                 UsedBackup: false,
                 ErrorMessage: null);
         }
         catch (Exception ex) when (IsOllamaUnavailable(ex))
         {
+            var generatedTitle = titleTask.IsCompletedSuccessfully ? titleTask.Result : null;
             AppLogger.LogWarning($"Session pipeline: Ollama unavailable. Fallback to backup. {ex.Message}");
             try
             {
@@ -67,6 +74,7 @@ public sealed class SessionPipelineService : ISessionPipelineService
                     Success: true,
                     CleanedText: cleanedText,
                     SummaryText: null,
+                    GeneratedTitle: generatedTitle,
                     TargetPath: backupPath,
                     UsedBackup: true,
                     ErrorMessage: ex.Message);
@@ -78,6 +86,7 @@ public sealed class SessionPipelineService : ISessionPipelineService
                     Success: false,
                     CleanedText: cleanedText,
                     SummaryText: null,
+                    GeneratedTitle: null,
                     TargetPath: backupPath,
                     UsedBackup: true,
                     ErrorMessage: $"Ollama error: {ex.Message}. Backup error: {backupEx.Message}");
@@ -90,6 +99,7 @@ public sealed class SessionPipelineService : ISessionPipelineService
                 Success: false,
                 CleanedText: cleanedText,
                 SummaryText: null,
+                GeneratedTitle: null,
                 TargetPath: masterPath,
                 UsedBackup: false,
                 ErrorMessage: ex.Message);

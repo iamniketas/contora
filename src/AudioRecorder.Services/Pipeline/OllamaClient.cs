@@ -17,6 +17,39 @@ public sealed class OllamaClient
         };
     }
 
+    private const string TitleSystemPrompt =
+        "Придумай короткое название (3–7 слов) для этой записи разговора. " +
+        "Только название, без кавычек, без пунктуации в конце.";
+
+    /// <summary>
+    /// Generates a short title for the session. Returns null on any error — best-effort only.
+    /// </summary>
+    public async Task<string?> GenerateTitleAsync(string cleanedText, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(cleanedText)) return null;
+        var excerpt = cleanedText.Length > 1500 ? cleanedText[..1500] : cleanedText;
+        try
+        {
+            var request = new OllamaGenerateRequest
+            {
+                Model = _options.Model,
+                System = TitleSystemPrompt,
+                Prompt = excerpt,
+                Stream = false,
+            };
+            using var response = await _httpClient.PostAsJsonAsync(_options.OllamaUrl, request, ct);
+            var payload = await response.Content.ReadFromJsonAsync<OllamaGenerateResponse>(cancellationToken: ct);
+            if (!response.IsSuccessStatusCode || payload == null || string.IsNullOrWhiteSpace(payload.Response))
+                return null;
+            var title = payload.Response.Trim().TrimEnd('.', '!', '?').Trim();
+            return title.Length > 80 ? title[..80] : title;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public async Task<string> GenerateSummaryAsync(string systemPrompt, string cleanedText, CancellationToken ct)
     {
         var request = new OllamaGenerateRequest

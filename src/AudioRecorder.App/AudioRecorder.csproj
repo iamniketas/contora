@@ -19,7 +19,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <RootNamespace>AudioRecorder</RootNamespace>
         <AssemblyName>Contora</AssemblyName>
-        <Version>0.3.5</Version>
+        <Version>0.4.0</Version>
         <ApplicationIcon>Assets\Contora.ico</ApplicationIcon>
         <Product>Contora</Product>
         <FileDescription>Contora</FileDescription>

@@ -675,12 +675,14 @@
                                                     <RowDefinition Height="Auto" />
                                                     <RowDefinition Height="Auto" />
                                                     <RowDefinition Height="Auto" />
+                                                    <RowDefinition Height="Auto" />
                                                 </Grid.RowDefinitions>
 
-                                                <!--  Title + state badge  -->
+                                                <!--  Title + rename button + state badge  -->
                                                 <Grid Grid.Row="0">
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
                                                         <ColumnDefinition Width="Auto" />
                                                     </Grid.ColumnDefinitions>
                                                     <TextBlock
@@ -689,13 +691,30 @@
                                                         FontSize="13"
                                                         FontWeight="SemiBold"
                                                         TextTrimming="CharacterEllipsis" />
-                                                    <Border
+                                                    <Button
                                                         Grid.Column="1"
+                                                        Click="OnRenameButtonClicked"
+                                                        Tag="{x:Bind}"
+                                                        Background="Transparent"
+                                                        BorderThickness="0"
+                                                        Width="22"
+                                                        Height="22"
+                                                        Padding="0"
+                                                        Margin="4,0,2,0"
+                                                        VerticalAlignment="Center"
+                                                        ToolTipService.ToolTip="Rename">
+                                                        <FontIcon
+                                                            FontFamily="Segoe Fluent Icons"
+                                                            Glyph="&#xE70F;"
+                                                            FontSize="11" />
+                                                    </Button>
+                                                    <Border
+                                                        Grid.Column="2"
                                                         Background="{x:Bind StateBrush}"
                                                         CornerRadius="3"
                                                         Padding="5,1"
                                                         VerticalAlignment="Center"
-                                                        Margin="8,0,0,0">
+                                                        Margin="4,0,0,0">
                                                         <TextBlock
                                                             Text="{x:Bind StateLabel}"
                                                             FontSize="10"
@@ -719,6 +738,16 @@
                                                     TextTrimming="CharacterEllipsis"
                                                     MaxLines="2"
                                                     TextWrapping="Wrap" />
+
+                                                <!--  Outline link (visible only when published)  -->
+                                                <HyperlinkButton
+                                                    Grid.Row="3"
+                                                    Tag="{x:Bind OutlineDocumentUrl}"
+                                                    Visibility="{x:Bind OutlineUrlVisibility}"
+                                                    Click="OnOutlineLinkClicked"
+                                                    Content="Open in Outline"
+                                                    FontSize="11"
+                                                    Padding="0,2,0,0" />
                                             </Grid>
                                         </Border>
                                     </DataTemplate>

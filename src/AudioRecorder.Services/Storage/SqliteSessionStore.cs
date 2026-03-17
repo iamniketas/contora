@@ -69,6 +69,13 @@ public sealed class SqliteSessionStore : ISessionStore
             );
             """);
 
+        // outline_doc_url column — added in v0.4; idempotent via catch
+        try
+        {
+            await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN outline_doc_url TEXT;");
+        }
+        catch (SqliteException) { }
+
         // Embedding column — added in v0.5; ALTER TABLE is idempotent via catch
         // Stores a float32 BLOB (4 bytes × dim). Architecture is sqlite-vec-compatible
         // for future migration when dataset grows beyond in-memory threshold.
@@ -128,10 +135,10 @@ public sealed class SqliteSessionStore : ISessionStore
         cmd.CommandText = """
             INSERT INTO sessions
                 (id, title, recorded_at, duration_sec, audio_path, transcript_path,
-                 state, speaker_names, outline_doc_id, preview_text, created_at)
+                 state, speaker_names, outline_doc_id, outline_doc_url, preview_text, created_at)
             VALUES
                 ($id, $title, $recorded_at, $dur, $audio, $transcript,
-                 $state, $speakers, $outline, $preview, $created);
+                 $state, $speakers, $outline, $outline_url, $preview, $created);
             """;
         BindSession(cmd, session);
         await cmd.ExecuteNonQueryAsync();
@@ -157,6 +164,7 @@ public sealed class SqliteSessionStore : ISessionStore
                 state           = $state,
                 speaker_names   = $speakers,
                 outline_doc_id  = $outline,
+                outline_doc_url = $outline_url,
                 preview_text    = $preview
             WHERE id = $id;
             """;
@@ -311,6 +319,7 @@ public sealed class SqliteSessionStore : ISessionStore
         cmd.Parameters.AddWithValue("$state", s.State.ToString());
         cmd.Parameters.AddWithValue("$speakers", (object?)s.SpeakerNamesJson ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$outline", (object?)s.OutlineDocumentId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$outline_url", (object?)s.OutlineDocumentUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preview", (object?)s.PreviewText ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$created", s.CreatedAt.ToString("O"));
     }
@@ -326,6 +335,7 @@ public sealed class SqliteSessionStore : ISessionStore
         State = Enum.TryParse<SessionState>(r.GetString(r.GetOrdinal("state")), out var st) ? st : SessionState.Recorded,
         SpeakerNamesJson = r.IsDBNull(r.GetOrdinal("speaker_names")) ? null : r.GetString(r.GetOrdinal("speaker_names")),
         OutlineDocumentId = r.IsDBNull(r.GetOrdinal("outline_doc_id")) ? null : r.GetString(r.GetOrdinal("outline_doc_id")),
+        OutlineDocumentUrl = r.IsDBNull(r.GetOrdinal("outline_doc_url")) ? null : r.GetString(r.GetOrdinal("outline_doc_url")),
         PreviewText = r.IsDBNull(r.GetOrdinal("preview_text")) ? null : r.GetString(r.GetOrdinal("preview_text")),
         CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at"))),
     };

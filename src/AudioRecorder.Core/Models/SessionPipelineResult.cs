@@ -7,6 +7,7 @@ public record SessionPipelineResult(
     bool Success,
     string CleanedText,
     string? SummaryText,
+    string? GeneratedTitle,
     string TargetPath,
     bool UsedBackup,
     string? ErrorMessage

@@ -152,6 +152,12 @@ public sealed class SessionViewModel
     public Microsoft.UI.Xaml.Media.Brush StateBrush { get; set; } =
         new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Gray);
     public string? TranscriptPath { get; set; }
+    public string? OutlineDocumentUrl { get; set; }
+
+    public Microsoft.UI.Xaml.Visibility OutlineUrlVisibility =>
+        OutlineDocumentUrl != null
+            ? Microsoft.UI.Xaml.Visibility.Visible
+            : Microsoft.UI.Xaml.Visibility.Collapsed;
 
     public static SessionViewModel FromSession(Session s)
     {
@@ -178,6 +184,7 @@ public sealed class SessionViewModel
             StateLabel = label,
             StateBrush = new Microsoft.UI.Xaml.Media.SolidColorBrush(color),
             TranscriptPath = s.TranscriptPath,
+            OutlineDocumentUrl = s.OutlineDocumentUrl,
         };
     }
 }
@@ -1363,7 +1370,7 @@ public sealed partial class MainPage : Page
                     await _playbackService.LoadAsync(audioPath);
                 }
 
-                _ = UpdateSessionAfterTranscriptionAsync(transcriptionSessionId, result.OutputPath, result.Segments);
+                _ = UpdateSessionAfterTranscriptionAsync(transcriptionSessionId, result.OutputPath, result.Segments, pipelineResult.GeneratedTitle);
 
                 // Publish to Outline if configured (fire-and-forget)
                 if (_outlineService.IsConfigured && pipelineResult.TargetPath != null)
@@ -1817,6 +1824,48 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private async void OnRenameButtonClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { Tag: SessionViewModel vm }) return;
+
+        var textBox = new TextBox { Text = vm.Title, MinWidth = 300, SelectionStart = vm.Title.Length };
+        var dialog = new ContentDialog
+        {
+            Title = "Rename session",
+            Content = textBox,
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot,
+        };
+
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+        var newTitle = textBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(newTitle) || newTitle == vm.Title) return;
+
+        try
+        {
+            var session = await _sessionStore.GetAsync(vm.Id);
+            if (session is null) return;
+            session.Title = newTitle;
+            await _sessionStore.UpdateAsync(session);
+            _ = LoadSessionsAsync();
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogError($"Rename session failed: {ex.Message}");
+        }
+    }
+
+    private async void OnOutlineLinkClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string url } && !string.IsNullOrEmpty(url))
+        {
+            try { await Windows.System.Launcher.LaunchUriAsync(new Uri(url)); }
+            catch { }
+        }
+    }
+
     private async Task LoadTranscriptFromFileAsync(Core.Models.Session session)
     {
         try
@@ -1907,13 +1956,14 @@ public sealed partial class MainPage : Page
             AudioRecorder.Services.Logging.AppLogger.LogInfo(
                 $"Published to Outline: {outlineResult.DocumentUrl ?? outlineResult.DocumentId}");
 
-            // Persist the Outline document ID on the session
+            // Persist the Outline document ID and URL on the session
             if (sessionId is { } sid && outlineResult.DocumentId != null)
             {
                 var session = await _sessionStore.GetAsync(sid);
                 if (session != null)
                 {
                     session.OutlineDocumentId = outlineResult.DocumentId;
+                    session.OutlineDocumentUrl = outlineResult.DocumentUrl;
                     session.State = SessionState.Exported;
                     await _sessionStore.UpdateAsync(session);
                     _ = LoadSessionsAsync();
@@ -1957,7 +2007,8 @@ public sealed partial class MainPage : Page
     private async Task UpdateSessionAfterTranscriptionAsync(
         Guid? sessionId,
         string? transcriptPath,
-        IReadOnlyList<TranscriptionSegment> segments)
+        IReadOnlyList<TranscriptionSegment> segments,
+        string? generatedTitle = null)
     {
         if (sessionId is not { } sid) return;
         try
@@ -1971,6 +2022,9 @@ public sealed partial class MainPage : Page
             session.TranscriptPath = transcriptPath;
             session.State = SessionState.Transcribed;
             session.PreviewText = previewText;
+
+            if (!string.IsNullOrWhiteSpace(generatedTitle))
+                session.Title = generatedTitle;
 
             // Build speaker names JSON from current UI map
             if (_speakerNameMap.Count > 0)

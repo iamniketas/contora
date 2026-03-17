@@ -24,6 +24,9 @@ public sealed class Session
     /// <summary>Outline document id set after export.</summary>
     public string? OutlineDocumentId { get; set; }
 
+    /// <summary>Full URL of the published Outline document.</summary>
+    public string? OutlineDocumentUrl { get; set; }
+
     /// <summary>First ~300 chars of the transcript for list preview.</summary>
     public string? PreviewText { get; set; }
 

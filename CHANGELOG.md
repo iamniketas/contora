@@ -5,6 +5,15 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-03-18
+
+### Added
+- **AI-generated session title**: after transcription Ollama (same model) auto-generates a short 3–7 word title for the session. Falls back to the filename if Ollama is unavailable.
+- **Manual rename**: pencil icon button on each session card opens an inline ContentDialog to rename the session; the new name is persisted in the database immediately.
+- **Outline link in session card**: after publishing to Outline the session card shows a clickable "Open in Outline" hyperlink. The full document URL is stored in the database so links survive app restarts.
+- **Unified model selector**: Whisper model ComboBox on the main page is dynamically populated from the installed models list; the active model is shared with Settings → Models where an "Active" badge and "Use" button let you switch models without re-entering the main page.
+- **Semantic search (passive)**: BGE-M3 embeddings via Ollama are computed after each transcription and stored as float32 BLOBs (sqlite-vec-compatible layout). Hybrid FTS5 + cosine-similarity search is wired up but acts as a silent upgrade path — the UI search box still works even when Ollama is down.
+
 ## [0.3.7] - 2026-03-06
 
 ### Fixed
