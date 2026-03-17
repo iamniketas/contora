@@ -69,6 +69,18 @@ public sealed class SqliteSessionStore : ISessionStore
             );
             """);
 
+        // Embedding column — added in v0.5; ALTER TABLE is idempotent via catch
+        // Stores a float32 BLOB (4 bytes × dim). Architecture is sqlite-vec-compatible
+        // for future migration when dataset grows beyond in-memory threshold.
+        try
+        {
+            await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN embedding BLOB;");
+        }
+        catch (SqliteException)
+        {
+            // Column already exists — safe to ignore
+        }
+
         // FTS5 virtual table for full-text search
         await ExecAsync(conn, """
             CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
@@ -226,6 +238,56 @@ public sealed class SqliteSessionStore : ISessionStore
         cmd.CommandText = "DELETE FROM sessions WHERE id = $id;";
         cmd.Parameters.AddWithValue("$id", id.ToString());
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    // ── Embeddings ───────────────────────────────────────────────────────────
+
+    public async Task StoreEmbeddingAsync(Guid sessionId, float[] embedding)
+    {
+        await EnsureInitializedAsync();
+        await using var conn = OpenConnection();
+        await conn.OpenAsync();
+
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE sessions SET embedding = $embedding WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", sessionId.ToString());
+        cmd.Parameters.AddWithValue("$embedding", FloatArrayToBlob(embedding));
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    public async Task<IReadOnlyList<(Guid Id, float[] Embedding)>> GetAllEmbeddingsAsync()
+    {
+        await EnsureInitializedAsync();
+        await using var conn = OpenConnection();
+        await conn.OpenAsync();
+
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, embedding FROM sessions WHERE embedding IS NOT NULL;";
+
+        var result = new List<(Guid, float[])>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var id = Guid.Parse(reader.GetString(0));
+            var blob = (byte[])reader.GetValue(1);
+            result.Add((id, BlobToFloatArray(blob)));
+        }
+
+        return result;
+    }
+
+    private static byte[] FloatArrayToBlob(float[] arr)
+    {
+        var bytes = new byte[arr.Length * sizeof(float)];
+        Buffer.BlockCopy(arr, 0, bytes, 0, bytes.Length);
+        return bytes;
+    }
+
+    private static float[] BlobToFloatArray(byte[] blob)
+    {
+        var arr = new float[blob.Length / sizeof(float)];
+        Buffer.BlockCopy(blob, 0, arr, 0, blob.Length);
+        return arr;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────

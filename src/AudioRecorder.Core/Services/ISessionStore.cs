@@ -17,5 +17,11 @@ public interface ISessionStore
     /// <summary>Full-text search across transcript text and titles.</summary>
     Task<IReadOnlyList<Session>> SearchAsync(string query, int limit = 50);
 
+    /// <summary>Stores a pre-computed embedding vector for a session (upsert).</summary>
+    Task StoreEmbeddingAsync(Guid sessionId, float[] embedding);
+
+    /// <summary>Returns all sessions that have a stored embedding vector.</summary>
+    Task<IReadOnlyList<(Guid Id, float[] Embedding)>> GetAllEmbeddingsAsync();
+
     Task DeleteAsync(Guid id);
 }

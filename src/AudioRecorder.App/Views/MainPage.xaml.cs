@@ -8,6 +8,7 @@ using AudioRecorder.Services.Pipeline;
 using AudioRecorder.Services.Models;
 using AudioRecorder.Services.Settings;
 using AudioRecorder.Services.Transcription;
+using AudioRecorder.Services.Embeddings;
 using AudioRecorder.Services.Storage;
 using AudioRecorder.Services.Updates;
 using Microsoft.UI.Dispatching;
@@ -205,6 +206,8 @@ public sealed partial class MainPage : Page
     private bool _isSettingsPanelVisible = true;
     private TranscriptionSegmentViewModel? _playingSegment;
     private bool _hasUnsavedChanges;
+    private OllamaEmbeddingService _embeddingService = null!;
+    private SemanticSearchService _semanticSearch = null!;
     private bool _isRuntimeDownloadInProgress;
     private CancellationTokenSource? _runtimeDownloadCts;
     private bool _isModelDownloadInProgress;
@@ -252,6 +255,8 @@ public sealed partial class MainPage : Page
         _modelDownloadService = new WhisperModelDownloadService(_whisperModel);
         _ffmpegInstallerService = new FfmpegInstallerService();
         _sharedConfigService = new SharedModelConfigService();
+        _embeddingService = new OllamaEmbeddingService();
+        _semanticSearch = new SemanticSearchService(_sessionStore, _embeddingService);
 
         NotificationService.Initialize();
 
@@ -1755,9 +1760,7 @@ public sealed partial class MainPage : Page
     {
         try
         {
-            var sessions = string.IsNullOrWhiteSpace(query)
-                ? await _sessionStore.GetAllAsync()
-                : await _sessionStore.SearchAsync(query);
+            var sessions = await _semanticSearch.SearchAsync(query);
 
             _dispatcherQueue.TryEnqueue(() =>
             {
@@ -1977,10 +1980,35 @@ public sealed partial class MainPage : Page
 
             await _sessionStore.UpdateAsync(session);
             _ = LoadSessionsAsync();
+
+            // Fire-and-forget: generate and store embedding for semantic search
+            _ = IndexSessionEmbeddingAsync(sid, segments);
         }
         catch (Exception ex)
         {
             AudioRecorder.Services.Logging.AppLogger.LogError($"Failed to update session after transcription: {ex.Message}");
+        }
+    }
+
+    private async Task IndexSessionEmbeddingAsync(Guid sessionId, IReadOnlyList<TranscriptionSegment> segments)
+    {
+        try
+        {
+            // Use full transcript text for rich semantic representation
+            var fullText = string.Join(" ", segments.Select(s => s.Text)).Trim();
+            if (string.IsNullOrWhiteSpace(fullText)) return;
+
+            var embedding = await _embeddingService.EmbedAsync(fullText);
+            if (embedding != null)
+            {
+                await _sessionStore.StoreEmbeddingAsync(sessionId, embedding);
+                AudioRecorder.Services.Logging.AppLogger.LogInfo(
+                    $"Embedding stored for session {sessionId} ({embedding.Length}-dim)");
+            }
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogWarning($"IndexSessionEmbeddingAsync failed: {ex.Message}");
         }
     }
 
