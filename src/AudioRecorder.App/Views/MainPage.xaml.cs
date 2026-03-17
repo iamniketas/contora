@@ -216,6 +216,7 @@ public sealed partial class MainPage : Page
     private string _whisperModel = "large-v2";
     private string _deviceMode = "auto";
     private bool _isTranscribing = false;
+    private string? _pendingAudioPath;
     private readonly Dictionary<string, string> _speakerNameMap = new();
 
     public ObservableCollection<AudioSourceViewModel> OutputSources { get; } = new();
@@ -1078,7 +1079,10 @@ public sealed partial class MainPage : Page
                         StateTextBlock.Text = "Stopped";
                     }
 
-                    ShowTranscriptionSection();
+                    if (_isTranscribing)
+                        _pendingAudioPath = _lastRecordingPath;
+                    else
+                        ShowTranscriptionSection();
                     _ = SaveNewSessionAsync(_lastRecordingPath, recordedDuration);
                     await ShowRecordingSavedDialogAsync(_lastRecordingPath);
                 }
@@ -1226,6 +1230,10 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        // Capture current values so a new recording started in parallel doesn't overwrite them
+        var audioPath = _lastRecordingPath;
+        var transcriptionSessionId = _currentSessionId;
+
         _isTranscribing = true;
         TranscribeButton.Content = "Stop transcription";
         TranscriptionProgressPanel.Visibility = Visibility.Visible;
@@ -1237,7 +1245,7 @@ public sealed partial class MainPage : Page
 
         try
         {
-            var result = await _transcriptionService.TranscribeAsync(_lastRecordingPath, _transcriptionCts.Token);
+            var result = await _transcriptionService.TranscribeAsync(audioPath, _transcriptionCts.Token);
 
             if (result.Success)
             {
@@ -1267,11 +1275,12 @@ public sealed partial class MainPage : Page
                     }
                 }
 
-                var mp3Path = Path.ChangeExtension(_lastRecordingPath, ".mp3");
+                var mp3Path = Path.ChangeExtension(audioPath, ".mp3");
                 if (File.Exists(mp3Path))
                 {
-                    _lastRecordingPath = mp3Path;
-                    CurrentFileTextBlock.Text = Path.GetFileName(mp3Path);
+                    audioPath = mp3Path;
+                    if (_pendingAudioPath == null) // only update UI file label if no new recording is pending
+                        CurrentFileTextBlock.Text = Path.GetFileName(mp3Path);
                 }
 
                 await LoadTranscriptionToUI(result.Segments);
@@ -1298,14 +1307,14 @@ public sealed partial class MainPage : Page
                         $"Session pipeline failed after transcription: {pipelineResult.ErrorMessage}");
                 }
 
-                if (_lastRecordingPath != null && File.Exists(_lastRecordingPath))
+                if (File.Exists(audioPath))
                 {
-                    await _playbackService.LoadAsync(_lastRecordingPath);
+                    await _playbackService.LoadAsync(audioPath);
                 }
 
-                _ = UpdateSessionAfterTranscriptionAsync(result.OutputPath, result.Segments);
+                _ = UpdateSessionAfterTranscriptionAsync(transcriptionSessionId, result.OutputPath, result.Segments);
 
-                var fileName = Path.GetFileName(_lastRecordingPath ?? "recording");
+                var fileName = Path.GetFileName(audioPath);
                 NotificationService.ShowTranscriptionCompleted(fileName, result.Segments.Count, result.OutputPath);
             }
             else
@@ -1341,6 +1350,14 @@ public sealed partial class MainPage : Page
             TranscribeButton.IsEnabled = true;
             _transcriptionCts?.Dispose();
             _transcriptionCts = null;
+
+            // If a new recording finished while we were transcribing, activate it now
+            if (_pendingAudioPath != null)
+            {
+                _lastRecordingPath = _pendingAudioPath;
+                _pendingAudioPath = null;
+                ShowTranscriptionSection();
+            }
         }
     }
 
@@ -1829,13 +1846,14 @@ public sealed partial class MainPage : Page
     }
 
     private async Task UpdateSessionAfterTranscriptionAsync(
+        Guid? sessionId,
         string? transcriptPath,
         IReadOnlyList<TranscriptionSegment> segments)
     {
-        if (_currentSessionId is not { } sessionId) return;
+        if (sessionId is not { } sid) return;
         try
         {
-            var session = await _sessionStore.GetAsync(sessionId);
+            var session = await _sessionStore.GetAsync(sid);
             if (session is null) return;
 
             var previewText = string.Join(" ", segments.Take(5).Select(s => s.Text)).Trim();
