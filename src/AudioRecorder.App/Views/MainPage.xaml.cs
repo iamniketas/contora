@@ -2,6 +2,7 @@
 using AudioRecorder.Core.Services;
 using AudioRecorder.Services.Audio;
 using AudioRecorder.Services.Hardware;
+using AudioRecorder.Services.Integrations;
 using AudioRecorder.Services.Notifications;
 using AudioRecorder.Services.Pipeline;
 using AudioRecorder.Services.Models;
@@ -188,6 +189,7 @@ public sealed partial class MainPage : Page
     private readonly IAudioPlaybackService _playbackService;
     private readonly ISessionPipelineService _sessionPipelineService;
     private readonly ISessionStore _sessionStore;
+    private IOutlineService _outlineService;
     private readonly AppUpdateService _appUpdateService;
     private readonly WhisperRuntimeInstallerService _runtimeInstallerService;
     private WhisperModelDownloadService _modelDownloadService;
@@ -242,6 +244,7 @@ public sealed partial class MainPage : Page
         _playbackService = new AudioPlaybackService();
         _sessionPipelineService = new SessionPipelineService();
         _sessionStore = new SqliteSessionStore();
+        _outlineService = CreateOutlineService();
         _playbackService.StateChanged += OnPlaybackStateChanged;
         _appUpdateService = new AppUpdateService();
         var customInstallRoot = _settingsService.LoadInstallRootPath();
@@ -795,6 +798,7 @@ public sealed partial class MainPage : Page
                     LoadOutputFolderSetting();
                     UpdateTranscriptionAvailabilityUi();
                     UpdateDeviceInfoText();
+                    _outlineService = CreateOutlineService();
                 });
             });
 
@@ -1314,6 +1318,10 @@ public sealed partial class MainPage : Page
 
                 _ = UpdateSessionAfterTranscriptionAsync(transcriptionSessionId, result.OutputPath, result.Segments);
 
+                // Publish to Outline if configured (fire-and-forget)
+                if (_outlineService.IsConfigured && pipelineResult.TargetPath != null)
+                    _ = PublishToOutlineAsync(transcriptionSessionId, audioPath, pipelineResult.TargetPath, pipelineCt);
+
                 var fileName = Path.GetFileName(audioPath);
                 NotificationService.ShowTranscriptionCompleted(fileName, result.Segments.Count, result.OutputPath);
             }
@@ -1816,6 +1824,62 @@ public sealed partial class MainPage : Page
         catch (Exception ex)
         {
             AudioRecorder.Services.Logging.AppLogger.LogError($"LoadTranscriptFromFileAsync: {ex.Message}");
+        }
+    }
+
+    // ── Outline integration ──────────────────────────────────────────────────
+
+    private IOutlineService CreateOutlineService()
+    {
+        var settings = new OutlineSettings
+        {
+            BaseUrl = _settingsService.LoadOutlineBaseUrl(),
+            ApiToken = _settingsService.LoadOutlineApiToken(),
+            DefaultCollectionId = _settingsService.LoadOutlineDefaultCollectionId(),
+        };
+        return new OutlineService(settings);
+    }
+
+    private async Task PublishToOutlineAsync(
+        Guid? sessionId,
+        string audioPath,
+        string markdownPath,
+        CancellationToken ct)
+    {
+        try
+        {
+            var title = Path.GetFileNameWithoutExtension(audioPath);
+            var markdownText = await File.ReadAllTextAsync(markdownPath, ct);
+
+            var outlineResult = await _outlineService.CreateDocumentAsync(title, markdownText, ct: ct);
+            if (!outlineResult.Success)
+            {
+                AudioRecorder.Services.Logging.AppLogger.LogWarning(
+                    $"Outline publish failed: {outlineResult.ErrorMessage}");
+                return;
+            }
+
+            AudioRecorder.Services.Logging.AppLogger.LogInfo(
+                $"Published to Outline: {outlineResult.DocumentUrl ?? outlineResult.DocumentId}");
+
+            // Persist the Outline document ID on the session
+            if (sessionId is { } sid && outlineResult.DocumentId != null)
+            {
+                var session = await _sessionStore.GetAsync(sid);
+                if (session != null)
+                {
+                    session.OutlineDocumentId = outlineResult.DocumentId;
+                    session.State = SessionState.Exported;
+                    await _sessionStore.UpdateAsync(session);
+                    _ = LoadSessionsAsync();
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogError(
+                $"PublishToOutlineAsync exception: {ex.Message}");
         }
     }
 

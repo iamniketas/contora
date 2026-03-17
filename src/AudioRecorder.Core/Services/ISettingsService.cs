@@ -27,4 +27,15 @@ public interface ISettingsService
     void SaveInstallRootPath(string path);
 
     string? LoadInstallRootPath();
+
+    // ── Outline integration ──────────────────────────────────────────────────
+
+    void SaveOutlineBaseUrl(string url);
+    string? LoadOutlineBaseUrl();
+
+    void SaveOutlineApiToken(string token);
+    string? LoadOutlineApiToken();
+
+    void SaveOutlineDefaultCollectionId(string collectionId);
+    string? LoadOutlineDefaultCollectionId();
 }
