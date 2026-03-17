@@ -300,6 +300,7 @@ public sealed partial class SettingsWindow : Window
     {
         await _sharedConfigService.RefreshFromDiskAsync();
         var config = await _sharedConfigService.LoadAsync();
+        var activeModelName = config.ActiveModelName;
         InstalledModelsPanel.Children.Clear();
 
         if (config.InstalledModels.Count == 0)
@@ -315,11 +316,17 @@ public sealed partial class SettingsWindow : Window
 
         foreach (var model in config.InstalledModels)
         {
+            var isActive = string.Equals(model.Name, activeModelName, StringComparison.OrdinalIgnoreCase);
+
             var card = new Border
             {
                 Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["CardBackgroundFillColorSecondaryBrush"],
                 CornerRadius = new CornerRadius(4),
-                Padding = new Thickness(12, 8, 12, 8)
+                Padding = new Thickness(12, 8, 12, 8),
+                BorderThickness = new Thickness(isActive ? 1.5 : 0),
+                BorderBrush = isActive
+                    ? (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["AccentFillColorDefaultBrush"]
+                    : null
             };
 
             var grid = new Grid();
@@ -334,6 +341,24 @@ public sealed partial class SettingsWindow : Window
                 FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
                 VerticalAlignment = VerticalAlignment.Center
             });
+
+            if (isActive)
+            {
+                nameLine.Children.Add(new Border
+                {
+                    Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["AccentFillColorDefaultBrush"],
+                    CornerRadius = new CornerRadius(3),
+                    Padding = new Thickness(4, 1, 4, 1),
+                    Child = new TextBlock
+                    {
+                        Text = "Active",
+                        FontSize = 10,
+                        Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextOnAccentFillColorPrimaryBrush"],
+                        VerticalAlignment = VerticalAlignment.Center
+                    }
+                });
+            }
+
             var source = GetModelSource(model.DirectoryPath);
             if (source != null)
             {
@@ -350,6 +375,7 @@ public sealed partial class SettingsWindow : Window
                     }
                 });
             }
+
             var sizeText = new TextBlock
             {
                 Text = $"{FormatFileSize(model.SizeBytes)}  {model.DirectoryPath}",
@@ -363,6 +389,23 @@ public sealed partial class SettingsWindow : Window
             grid.Children.Add(info);
 
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+
+            if (!isActive)
+            {
+                var useBtn = new Button { Content = "Use", Padding = new Thickness(8, 4, 8, 4) };
+                var capturedName = model.Name;
+                useBtn.Click += async (_, _) =>
+                {
+                    var cfg = await _sharedConfigService.LoadAsync();
+                    cfg.ActiveModelName = capturedName;
+                    await _sharedConfigService.SaveAsync(cfg);
+                    _settingsService.SaveWhisperModel(capturedName);
+                    _onSettingsChanged?.Invoke();
+                    await LoadModelsDataAsync();
+                };
+                buttons.Children.Add(useBtn);
+            }
+
             var deleteBtn = new Button { Content = "Delete", Padding = new Thickness(8, 4, 8, 4) };
             var modelName = model.Name;
             var modelRuntimeId = model.RuntimeId;
