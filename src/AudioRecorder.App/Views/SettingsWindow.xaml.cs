@@ -1,5 +1,7 @@
+using AudioRecorder.Core.Models;
 using AudioRecorder.Core.Services;
 using AudioRecorder.Services.Hardware;
+using AudioRecorder.Services.Integrations;
 using AudioRecorder.Services.Models;
 using AudioRecorder.Services.Settings;
 using AudioRecorder.Services.Transcription;
@@ -73,6 +75,7 @@ public sealed partial class SettingsWindow : Window
             ModelsSection.Visibility = tag == "models" ? Visibility.Visible : Visibility.Collapsed;
             StorageSection.Visibility = tag == "storage" ? Visibility.Visible : Visibility.Collapsed;
             GeneralSection.Visibility = tag == "general" ? Visibility.Visible : Visibility.Collapsed;
+            IntegrationsSection.Visibility = tag == "integrations" ? Visibility.Visible : Visibility.Collapsed;
         }
     }
 
@@ -82,6 +85,7 @@ public sealed partial class SettingsWindow : Window
         await LoadModelsDataAsync();
         LoadStorageData();
         LoadGeneralData();
+        LoadIntegrationsData();
         _ = LoadHardwareDiagnosticsAsync();
     }
 
@@ -613,6 +617,93 @@ public sealed partial class SettingsWindow : Window
     private void OnCancelFfmpegClicked(object sender, RoutedEventArgs e)
     {
         _ffmpegDownloadCts?.Cancel();
+    }
+
+    // ─── Integrations (Outline) ───
+
+    private void LoadIntegrationsData()
+    {
+        var url = _settingsService.LoadOutlineBaseUrl() ?? string.Empty;
+        var token = _settingsService.LoadOutlineApiToken() ?? string.Empty;
+        var collectionId = _settingsService.LoadOutlineDefaultCollectionId() ?? string.Empty;
+
+        // Prevent TextChanged from firing saves during initial load
+        OutlineBaseUrlBox.TextChanged -= OnOutlineSettingChanged;
+        OutlineCollectionIdBox.TextChanged -= OnOutlineSettingChanged;
+
+        OutlineBaseUrlBox.Text = url;
+        OutlineCollectionIdBox.Text = collectionId;
+        OutlineApiTokenBox.Password = token;
+
+        OutlineBaseUrlBox.TextChanged += OnOutlineSettingChanged;
+        OutlineCollectionIdBox.TextChanged += OnOutlineSettingChanged;
+
+        UpdateOutlineStatusBadge();
+    }
+
+    private void OnOutlineSettingChanged(object sender, TextChangedEventArgs e)
+    {
+        _settingsService.SaveOutlineBaseUrl(OutlineBaseUrlBox.Text);
+        _settingsService.SaveOutlineDefaultCollectionId(OutlineCollectionIdBox.Text);
+        UpdateOutlineStatusBadge();
+        _onSettingsChanged?.Invoke();
+    }
+
+    private void OnOutlineTokenChanged(object sender, RoutedEventArgs e)
+    {
+        _settingsService.SaveOutlineApiToken(OutlineApiTokenBox.Password);
+        UpdateOutlineStatusBadge();
+        _onSettingsChanged?.Invoke();
+    }
+
+    private void UpdateOutlineStatusBadge()
+    {
+        var hasUrl = !string.IsNullOrWhiteSpace(OutlineBaseUrlBox.Text);
+        var hasToken = !string.IsNullOrWhiteSpace(OutlineApiTokenBox.Password);
+        OutlineStatusBadge.Text = (hasUrl && hasToken) ? "Configured" : "Not configured";
+    }
+
+    private async void OnOutlineTestClicked(object sender, RoutedEventArgs e)
+    {
+        OutlineTestBtn.IsEnabled = false;
+        OutlineTestResultText.Text = "Testing...";
+        OutlineTestResultText.Visibility = Visibility.Visible;
+
+        try
+        {
+            var settings = new OutlineSettings
+            {
+                BaseUrl = OutlineBaseUrlBox.Text.Trim(),
+                ApiToken = OutlineApiTokenBox.Password.Trim(),
+                DefaultCollectionId = OutlineCollectionIdBox.Text.Trim(),
+                AutoPublish = false,
+            };
+
+            var svc = new OutlineService(settings);
+            if (!svc.IsConfigured)
+            {
+                OutlineTestResultText.Text = "Fill in Base URL and API Token first.";
+                return;
+            }
+
+            // Use documents.info on an empty query to verify auth
+            var result = await svc.CreateDocumentAsync(
+                title: "[Contora connection test]",
+                text: "_This document was created to test the Contora → Outline connection. You can delete it._",
+                collectionId: string.IsNullOrWhiteSpace(OutlineCollectionIdBox.Text) ? null : OutlineCollectionIdBox.Text.Trim());
+
+            OutlineTestResultText.Text = result.Success
+                ? $"Connected! Doc created: {result.DocumentUrl ?? result.DocumentId}"
+                : $"Failed: {result.ErrorMessage}";
+        }
+        catch (Exception ex)
+        {
+            OutlineTestResultText.Text = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            OutlineTestBtn.IsEnabled = true;
+        }
     }
 
     // ─── Helpers ───

@@ -225,6 +225,45 @@ public class LocalSettingsService : ISettingsService
         }
     }
 
+    public void SaveOutlineBaseUrl(string url)
+    {
+        var settings = LoadSettings();
+        settings.OutlineBaseUrl = url?.Trim();
+        SaveSettings(settings);
+    }
+
+    public string? LoadOutlineBaseUrl()
+    {
+        var settings = LoadSettings();
+        return string.IsNullOrWhiteSpace(settings.OutlineBaseUrl) ? null : settings.OutlineBaseUrl;
+    }
+
+    public void SaveOutlineApiToken(string token)
+    {
+        var settings = LoadSettings();
+        settings.OutlineApiToken = token?.Trim();
+        SaveSettings(settings);
+    }
+
+    public string? LoadOutlineApiToken()
+    {
+        var settings = LoadSettings();
+        return string.IsNullOrWhiteSpace(settings.OutlineApiToken) ? null : settings.OutlineApiToken;
+    }
+
+    public void SaveOutlineDefaultCollectionId(string collectionId)
+    {
+        var settings = LoadSettings();
+        settings.OutlineDefaultCollectionId = collectionId?.Trim();
+        SaveSettings(settings);
+    }
+
+    public string? LoadOutlineDefaultCollectionId()
+    {
+        var settings = LoadSettings();
+        return string.IsNullOrWhiteSpace(settings.OutlineDefaultCollectionId) ? null : settings.OutlineDefaultCollectionId;
+    }
+
     private class AppSettings
     {
         public List<string> SelectedSourceIds { get; set; } = new();
@@ -233,6 +272,9 @@ public class LocalSettingsService : ISettingsService
         public string WhisperModel { get; set; } = "large-v2";
         public string DeviceMode { get; set; } = "auto";
         public string? InstallRootPath { get; set; }
+        public string? OutlineBaseUrl { get; set; }
+        public string? OutlineApiToken { get; set; }
+        public string? OutlineDefaultCollectionId { get; set; }
     }
 
     private static string NormalizeWhisperModel(string? modelName)

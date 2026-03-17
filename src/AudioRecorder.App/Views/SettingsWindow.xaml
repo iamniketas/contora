@@ -36,6 +36,11 @@
                         <FontIcon Glyph="&#xE713;" />
                     </NavigationViewItem.Icon>
                 </NavigationViewItem>
+                <NavigationViewItem Content="Integrations" Tag="integrations">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE8C8;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
             </NavigationView.MenuItems>
 
             <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="24,16,24,24">
@@ -421,6 +426,85 @@
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                     TextWrapping="Wrap"
                                     Visibility="Collapsed" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- Integrations -->
+                    <StackPanel x:Name="IntegrationsSection" Spacing="16" Visibility="Collapsed">
+                        <TextBlock Text="Integrations" FontSize="24" FontWeight="SemiBold" />
+
+                        <!-- Outline card -->
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Outline" FontSize="16" FontWeight="Medium" VerticalAlignment="Center" />
+                                    <TextBlock
+                                        x:Name="OutlineStatusBadge"
+                                        Text="Not configured"
+                                        FontSize="11"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        VerticalAlignment="Center" />
+                                </StackPanel>
+
+                                <TextBlock
+                                    Text="Automatically publish transcriptions to your Outline wiki after processing."
+                                    FontSize="12"
+                                    TextWrapping="Wrap"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                                <Grid ColumnSpacing="8" RowSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="150" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Base URL" VerticalAlignment="Center"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="13" />
+                                    <TextBox
+                                        x:Name="OutlineBaseUrlBox"
+                                        Grid.Row="0" Grid.Column="1"
+                                        PlaceholderText="https://app.getoutline.com"
+                                        TextChanged="OnOutlineSettingChanged" />
+
+                                    <TextBlock Grid.Row="1" Grid.Column="0" Text="API Token" VerticalAlignment="Center"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="13" />
+                                    <PasswordBox
+                                        x:Name="OutlineApiTokenBox"
+                                        Grid.Row="1" Grid.Column="1"
+                                        PlaceholderText="ol_api_..."
+                                        PasswordChanged="OnOutlineTokenChanged" />
+
+                                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Default Collection ID" VerticalAlignment="Center"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="13" />
+                                    <TextBox
+                                        x:Name="OutlineCollectionIdBox"
+                                        Grid.Row="2" Grid.Column="1"
+                                        PlaceholderText="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                                        TextChanged="OnOutlineSettingChanged" />
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button
+                                        x:Name="OutlineTestBtn"
+                                        Content="Test connection"
+                                        Click="OnOutlineTestClicked" />
+                                    <TextBlock
+                                        x:Name="OutlineTestResultText"
+                                        VerticalAlignment="Center"
+                                        FontSize="12"
+                                        Visibility="Collapsed" />
+                                </StackPanel>
                             </StackPanel>
                         </Border>
                     </StackPanel>
