@@ -334,12 +334,7 @@
                                 <ComboBox
                                     x:Name="WhisperModelComboBox"
                                     Grid.Column="1"
-                                    SelectionChanged="OnWhisperModelChanged">
-                                    <ComboBoxItem Content="tiny" Tag="tiny" />
-                                    <ComboBoxItem Content="small" Tag="small" />
-                                    <ComboBoxItem Content="medium" Tag="medium" />
-                                    <ComboBoxItem Content="large-v2" Tag="large-v2" />
-                                </ComboBox>
+                                    SelectionChanged="OnWhisperModelChanged" />
                             </Grid>
 <Border
                                 Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"

@@ -354,19 +354,49 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void LoadWhisperModelSetting()
+    private void LoadWhisperModelSetting() => _ = LoadWhisperModelSettingAsync();
+
+    private async Task LoadWhisperModelSettingAsync()
     {
         var savedModel = _settingsService.LoadWhisperModel();
-        _whisperModel = WhisperModelDownloadService.NormalizeModelName(savedModel);
+        var config = await _sharedConfigService.LoadAsync();
 
-        // Items: 0=tiny, 1=small, 2=medium, 3=large-v2
-        WhisperModelComboBox.SelectedIndex = _whisperModel switch
+        // SharedModelConfig.ActiveModelName is the canonical source; fall back to saved setting
+        var activeModel = !string.IsNullOrWhiteSpace(config.ActiveModelName)
+            ? config.ActiveModelName
+            : WhisperModelDownloadService.NormalizeModelName(savedModel);
+
+        // Populate ComboBox from installed models; fall back to 4 defaults if nothing installed
+        WhisperModelComboBox.SelectionChanged -= OnWhisperModelChanged;
+        WhisperModelComboBox.Items.Clear();
+
+        if (config.InstalledModels.Count > 0)
         {
-            "tiny" => 0,
-            "small" => 1,
-            "medium" => 2,
-            _ => 3
-        };
+            foreach (var m in config.InstalledModels)
+                WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = m.Name, Tag = m.Name });
+        }
+        else
+        {
+            foreach (var name in new[] { "tiny", "small", "medium", "large-v2" })
+                WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = name, Tag = name });
+        }
+
+        // Select the active model
+        for (int i = 0; i < WhisperModelComboBox.Items.Count; i++)
+        {
+            if (WhisperModelComboBox.Items[i] is ComboBoxItem item &&
+                string.Equals(item.Tag?.ToString(), activeModel, StringComparison.OrdinalIgnoreCase))
+            {
+                WhisperModelComboBox.SelectedIndex = i;
+                break;
+            }
+        }
+
+        WhisperModelComboBox.SelectionChanged += OnWhisperModelChanged;
+
+        // Apply the active model to the transcription service
+        if (!string.Equals(_whisperModel, activeModel, StringComparison.OrdinalIgnoreCase))
+            ApplyWhisperModel(activeModel, save: false);
     }
 
     private async Task InitializeDiagnosticsAsync()
@@ -417,6 +447,7 @@ public sealed partial class MainPage : Page
         if (save)
         {
             _settingsService.SaveWhisperModel(_whisperModel);
+            _ = UpdateSharedActiveModelAsync(_whisperModel);
         }
 
         _modelDownloadService = new WhisperModelDownloadService(_whisperModel);
@@ -428,6 +459,17 @@ public sealed partial class MainPage : Page
 
         UpdateTranscriptionAvailabilityUi();
         UpdateDeviceInfoText();
+    }
+
+    private async Task UpdateSharedActiveModelAsync(string modelName)
+    {
+        try
+        {
+            var config = await _sharedConfigService.LoadAsync();
+            config.ActiveModelName = modelName;
+            await _sharedConfigService.SaveAsync(config);
+        }
+        catch { }
     }
 
     private Task TryAutoSetupWhisperAsync()

@@ -52,13 +52,8 @@ public sealed class WhisperModelDownloadService
 
     public static string NormalizeModelName(string? modelName)
     {
-        return modelName?.Trim().ToLowerInvariant() switch
-        {
-            "tiny" => "tiny",
-            "small" => "small",
-            "medium" => "medium",
-            _ => "large-v2"
-        };
+        var name = modelName?.Trim().ToLowerInvariant();
+        return string.IsNullOrWhiteSpace(name) ? "large-v2" : name;
     }
 
     public async Task<ModelDownloadResult> DownloadModelAsync(
