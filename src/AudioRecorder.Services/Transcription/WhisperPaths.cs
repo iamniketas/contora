@@ -179,13 +179,14 @@ public static class WhisperPaths
 
     private static string GetSharedModelsRoot()
     {
+        var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
         var explicitShared = Environment.GetEnvironmentVariable(EnvSharedModelsRoot);
         if (!string.IsNullOrWhiteSpace(explicitShared))
             return explicitShared;
 
-        var configPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "SharedWhisperModels", "config.json");
+        // Contora shared config
+        var configPath = Path.Combine(appDataPath, "SharedWhisperModels", "config.json");
         if (File.Exists(configPath))
         {
             try
@@ -199,10 +200,29 @@ public static class WhisperPaths
                         return modelsRoot;
                 }
             }
-            catch
+            catch { }
+        }
+
+        // Dictator shared config (%LOCALAPPDATA%\AudioModels\config.json)
+        var dictatorConfigPath = Path.Combine(appDataPath, "AudioModels", "config.json");
+        if (File.Exists(dictatorConfigPath))
+        {
+            try
             {
-                // Ignore config read errors.
+                var json = File.ReadAllText(dictatorConfigPath);
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                // Dictator config may use "modelsRootPath" or "models_root"
+                foreach (var key in new[] { "modelsRootPath", "models_root", "modelsRoot" })
+                {
+                    if (doc.RootElement.TryGetProperty(key, out var el))
+                    {
+                        var path = el.GetString();
+                        if (!string.IsNullOrWhiteSpace(path) && Directory.Exists(path))
+                            return path;
+                    }
+                }
             }
+            catch { }
         }
 
         var dictatorModelPath = Environment.GetEnvironmentVariable("DICTATOR_WHISPER_MODEL_PATH");
@@ -212,6 +232,11 @@ public static class WhisperPaths
             if (Directory.Exists(modelPath))
                 return Path.GetDirectoryName(modelPath) ?? modelPath;
         }
+
+        // Dictator canonical location: %LOCALAPPDATA%\AudioModels
+        var audioModelsPath = Path.Combine(appDataPath, "AudioModels");
+        if (Directory.Exists(audioModelsPath) && HasAnyModelDir(audioModelsPath))
+            return audioModelsPath;
 
         var probes = new[]
         {
@@ -225,8 +250,25 @@ public static class WhisperPaths
                 return probe;
         }
 
-        var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         return Path.Combine(appDataPath, "SharedWhisperModels");
+    }
+
+    private static bool HasAnyModelDir(string root)
+    {
+        try
+        {
+            // Accept faster-whisper-* subdirs OR bare model name dirs containing model.bin
+            foreach (var dir in Directory.EnumerateDirectories(root))
+            {
+                var name = Path.GetFileName(dir);
+                if (name.StartsWith("faster-whisper-", StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (File.Exists(Path.Combine(dir, "model.bin")))
+                    return true;
+            }
+        }
+        catch { }
+        return false;
     }
 
     private static string GetWhisperExecutableFileName()

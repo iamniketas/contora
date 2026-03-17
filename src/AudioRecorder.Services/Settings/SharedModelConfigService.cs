@@ -233,13 +233,20 @@ public sealed class SharedModelConfigService
                 }
             }
 
-            // Scan shared models location
-            var sharedModels = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "SharedWhisperModels");
-            if (Directory.Exists(sharedModels))
+            // Scan shared model locations (SharedWhisperModels + AudioModels from Dictator)
+            var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var sharedModelRoots = new[]
             {
-                foreach (var dir in Directory.EnumerateDirectories(sharedModels, "faster-whisper-*"))
+                Path.Combine(appDataPath, "SharedWhisperModels"),
+                Path.Combine(appDataPath, "AudioModels"),
+            };
+
+            foreach (var sharedRoot in sharedModelRoots)
+            {
+                if (!Directory.Exists(sharedRoot)) continue;
+
+                // faster-whisper-* subdirectories (Contora naming)
+                foreach (var dir in Directory.EnumerateDirectories(sharedRoot, "faster-whisper-*"))
                 {
                     var modelName = Path.GetFileName(dir).Replace("faster-whisper-", "");
                     if (HasRequiredModelFiles(dir) && !config.InstalledModels.Any(m => m.Name == modelName))
@@ -247,6 +254,25 @@ public sealed class SharedModelConfigService
                         config.InstalledModels.Add(new InstalledModel
                         {
                             Name = modelName,
+                            RuntimeId = "faster-whisper-xxl",
+                            DirectoryPath = dir,
+                            SizeBytes = CalculateDirectorySize(dir)
+                        });
+                    }
+                }
+
+                // Bare model-name subdirectories (e.g. "large-v2/") — Dictator may use this layout
+                foreach (var dir in Directory.EnumerateDirectories(sharedRoot))
+                {
+                    var dirName = Path.GetFileName(dir);
+                    if (dirName.StartsWith("faster-whisper-", StringComparison.OrdinalIgnoreCase))
+                        continue; // already handled above
+
+                    if (HasRequiredModelFiles(dir) && !config.InstalledModels.Any(m => m.Name == dirName))
+                    {
+                        config.InstalledModels.Add(new InstalledModel
+                        {
+                            Name = dirName,
                             RuntimeId = "faster-whisper-xxl",
                             DirectoryPath = dir,
                             SizeBytes = CalculateDirectorySize(dir)
