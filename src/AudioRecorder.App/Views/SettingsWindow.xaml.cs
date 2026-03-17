@@ -83,6 +83,7 @@ public sealed partial class SettingsWindow : Window
     {
         await LoadEnginesDataAsync();
         await LoadModelsDataAsync();
+        LoadSharedModelsFolderData();
         LoadStorageData();
         LoadGeneralData();
         LoadIntegrationsData();
@@ -326,18 +327,37 @@ public sealed partial class SettingsWindow : Window
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             var info = new StackPanel { Spacing = 2 };
-            var nameText = new TextBlock
+            var nameLine = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+            nameLine.Children.Add(new TextBlock
             {
                 Text = model.Name,
-                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
-            };
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            var source = GetModelSource(model.DirectoryPath);
+            if (source != null)
+            {
+                nameLine.Children.Add(new Border
+                {
+                    Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["SystemFillColorAttentionBackgroundBrush"],
+                    CornerRadius = new CornerRadius(3),
+                    Padding = new Thickness(4, 1, 4, 1),
+                    Child = new TextBlock
+                    {
+                        Text = source,
+                        FontSize = 10,
+                        VerticalAlignment = VerticalAlignment.Center
+                    }
+                });
+            }
             var sizeText = new TextBlock
             {
-                Text = FormatFileSize(model.SizeBytes),
+                Text = $"{FormatFileSize(model.SizeBytes)}  {model.DirectoryPath}",
                 FontSize = 11,
-                Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+                Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+                TextWrapping = TextWrapping.Wrap
             };
-            info.Children.Add(nameText);
+            info.Children.Add(nameLine);
             info.Children.Add(sizeText);
             Grid.SetColumn(info, 0);
             grid.Children.Add(info);
@@ -454,6 +474,76 @@ public sealed partial class SettingsWindow : Window
     private void OnCancelModelClicked(object sender, RoutedEventArgs e)
     {
         _modelDownloadCts?.Cancel();
+    }
+
+    // ─── Shared Models Folder ───
+
+    private static readonly string DictatorAudioModelsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "AudioModels");
+
+    private void LoadSharedModelsFolderData()
+    {
+        var whisperPath = AudioRecorder.Services.Transcription.WhisperPaths.GetDefaultWhisperPath();
+        var activeFolder = AudioRecorder.Services.Transcription.WhisperPaths.GetModelsRoot(whisperPath);
+        SharedModelsFolderText.Text = activeFolder;
+
+        var dictatorExists = Directory.Exists(DictatorAudioModelsPath);
+        var isLinked = string.Equals(activeFolder, DictatorAudioModelsPath, StringComparison.OrdinalIgnoreCase);
+
+        if (dictatorExists)
+        {
+            DictatorStatusText.Text = isLinked
+                ? $"Linked — {DictatorAudioModelsPath}"
+                : $"Detected — {DictatorAudioModelsPath}";
+            DictatorStatusText.Foreground = isLinked
+                ? (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["SystemFillColorSuccessBrush"]
+                : (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+        }
+        else
+        {
+            DictatorStatusText.Text = "Not installed";
+            DictatorStatusText.Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+        }
+
+        LinkToDictatorBtn.Visibility = (dictatorExists && !isLinked) ? Visibility.Visible : Visibility.Collapsed;
+        UnlinkDictatorBtn.Visibility = isLinked ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private async void OnLinkToDictatorClicked(object sender, RoutedEventArgs e)
+    {
+        var config = await _sharedConfigService.LoadAsync();
+        config.ModelsRootPath = DictatorAudioModelsPath;
+        await _sharedConfigService.SaveAsync(config);
+        _sharedConfigService.InvalidateCache();
+        await LoadModelsDataAsync();
+        LoadSharedModelsFolderData();
+        _onSettingsChanged?.Invoke();
+    }
+
+    private async void OnUnlinkDictatorClicked(object sender, RoutedEventArgs e)
+    {
+        var config = await _sharedConfigService.LoadAsync();
+        config.ModelsRootPath = null;
+        await _sharedConfigService.SaveAsync(config);
+        _sharedConfigService.InvalidateCache();
+        await LoadModelsDataAsync();
+        LoadSharedModelsFolderData();
+        _onSettingsChanged?.Invoke();
+    }
+
+    /// <summary>Returns a short source label if the model path belongs to a known location.</summary>
+    private static string? GetModelSource(string directoryPath)
+    {
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var dictatorRoot = Path.Combine(appData, "AudioModels");
+        var sharedRoot = Path.Combine(appData, "SharedWhisperModels");
+
+        if (directoryPath.StartsWith(dictatorRoot, StringComparison.OrdinalIgnoreCase))
+            return "Dictator";
+        if (directoryPath.StartsWith(sharedRoot, StringComparison.OrdinalIgnoreCase))
+            return "Shared";
+        return null;
     }
 
     // ─── Storage ───
