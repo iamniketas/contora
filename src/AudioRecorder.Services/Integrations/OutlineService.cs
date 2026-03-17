@@ -112,6 +112,61 @@ public sealed class OutlineService : IOutlineService
         }
     }
 
+    public async Task<OutlineCollectionsResult> GetCollectionsAsync(CancellationToken ct = default)
+    {
+        if (!IsConfigured)
+            return new OutlineCollectionsResult { Success = false, ErrorMessage = "Outline not configured" };
+
+        try
+        {
+            var baseUrl = _settings.BaseUrl!.TrimEnd('/');
+            var url = $"{baseUrl}/api/collections.list";
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, url);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _settings.ApiToken);
+            // Empty body — Outline collections.list accepts no required params
+            request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+
+            using var response = await _http.SendAsync(request, ct);
+            var responseBody = await response.Content.ReadAsStringAsync(ct);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                AppLogger.LogError($"OutlineService collections.list failed: HTTP {(int)response.StatusCode}");
+                return new OutlineCollectionsResult { Success = false, ErrorMessage = $"HTTP {(int)response.StatusCode}" };
+            }
+
+            using var doc = JsonDocument.Parse(responseBody);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
+                return new OutlineCollectionsResult { Success = false, ErrorMessage = "Unexpected response format" };
+
+            var collections = new List<OutlineCollection>();
+            foreach (var item in data.EnumerateArray())
+            {
+                var id = item.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+                var name = item.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : null;
+                var description = item.TryGetProperty("description", out var descEl) ? descEl.GetString() : null;
+
+                if (id != null && name != null)
+                    collections.Add(new OutlineCollection { Id = id, Name = name, Description = description });
+            }
+
+            AppLogger.LogInfo($"OutlineService: loaded {collections.Count} collections");
+            return new OutlineCollectionsResult { Success = true, Collections = collections };
+        }
+        catch (OperationCanceledException)
+        {
+            return new OutlineCollectionsResult { Success = false, ErrorMessage = "Cancelled" };
+        }
+        catch (Exception ex)
+        {
+            AppLogger.LogError($"OutlineService collections.list exception: {ex.Message}");
+            return new OutlineCollectionsResult { Success = false, ErrorMessage = ex.Message };
+        }
+    }
+
     private static OutlineDocumentResult Fail(string msg) =>
         new() { Success = false, ErrorMessage = msg };
 }

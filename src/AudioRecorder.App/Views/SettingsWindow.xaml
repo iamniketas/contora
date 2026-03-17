@@ -485,13 +485,25 @@
                                         PlaceholderText="ol_api_..."
                                         PasswordChanged="OnOutlineTokenChanged" />
 
-                                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Default Collection ID" VerticalAlignment="Center"
+                                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Collection" VerticalAlignment="Center"
                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="13" />
-                                    <TextBox
-                                        x:Name="OutlineCollectionIdBox"
-                                        Grid.Row="2" Grid.Column="1"
-                                        PlaceholderText="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                                        TextChanged="OnOutlineSettingChanged" />
+                                    <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                                        <ComboBox
+                                            x:Name="OutlineCollectionCombo"
+                                            MinWidth="240"
+                                            PlaceholderText="— load collections first —"
+                                            SelectionChanged="OnOutlineCollectionSelected" />
+                                        <Button
+                                            x:Name="OutlineLoadCollectionsBtn"
+                                            Content="Load"
+                                            ToolTipService.ToolTip="Fetch collections from Outline"
+                                            Click="OnOutlineLoadCollectionsClicked" />
+                                        <ProgressRing
+                                            x:Name="OutlineLoadProgress"
+                                            Width="18" Height="18"
+                                            IsActive="False"
+                                            Visibility="Collapsed" />
+                                    </StackPanel>
                                 </Grid>
 
                                 <StackPanel Orientation="Horizontal" Spacing="8">

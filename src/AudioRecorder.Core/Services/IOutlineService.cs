@@ -22,4 +22,9 @@ public interface IOutlineService
         string documentId,
         string appendText,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns all collections the authenticated user can publish to.
+    /// </summary>
+    Task<OutlineCollectionsResult> GetCollectionsAsync(CancellationToken ct = default);
 }

@@ -625,18 +625,21 @@ public sealed partial class SettingsWindow : Window
     {
         var url = _settingsService.LoadOutlineBaseUrl() ?? string.Empty;
         var token = _settingsService.LoadOutlineApiToken() ?? string.Empty;
-        var collectionId = _settingsService.LoadOutlineDefaultCollectionId() ?? string.Empty;
+        var savedCollectionId = _settingsService.LoadOutlineDefaultCollectionId();
 
-        // Prevent TextChanged from firing saves during initial load
         OutlineBaseUrlBox.TextChanged -= OnOutlineSettingChanged;
-        OutlineCollectionIdBox.TextChanged -= OnOutlineSettingChanged;
-
         OutlineBaseUrlBox.Text = url;
-        OutlineCollectionIdBox.Text = collectionId;
         OutlineApiTokenBox.Password = token;
-
         OutlineBaseUrlBox.TextChanged += OnOutlineSettingChanged;
-        OutlineCollectionIdBox.TextChanged += OnOutlineSettingChanged;
+
+        // If a collection was previously saved, show it as a placeholder item
+        // until the user loads the full list
+        OutlineCollectionCombo.Items.Clear();
+        if (!string.IsNullOrWhiteSpace(savedCollectionId))
+        {
+            OutlineCollectionCombo.Items.Add(new CollectionItem(savedCollectionId, $"Saved: {savedCollectionId[..8]}…"));
+            OutlineCollectionCombo.SelectedIndex = 0;
+        }
 
         UpdateOutlineStatusBadge();
     }
@@ -644,7 +647,6 @@ public sealed partial class SettingsWindow : Window
     private void OnOutlineSettingChanged(object sender, TextChangedEventArgs e)
     {
         _settingsService.SaveOutlineBaseUrl(OutlineBaseUrlBox.Text);
-        _settingsService.SaveOutlineDefaultCollectionId(OutlineCollectionIdBox.Text);
         UpdateOutlineStatusBadge();
         _onSettingsChanged?.Invoke();
     }
@@ -656,11 +658,90 @@ public sealed partial class SettingsWindow : Window
         _onSettingsChanged?.Invoke();
     }
 
+    private void OnOutlineCollectionSelected(object sender, SelectionChangedEventArgs e)
+    {
+        if (OutlineCollectionCombo.SelectedItem is CollectionItem item)
+        {
+            _settingsService.SaveOutlineDefaultCollectionId(item.Id);
+            _onSettingsChanged?.Invoke();
+        }
+    }
+
+    private async void OnOutlineLoadCollectionsClicked(object sender, RoutedEventArgs e)
+    {
+        OutlineLoadCollectionsBtn.IsEnabled = false;
+        OutlineLoadProgress.IsActive = true;
+        OutlineLoadProgress.Visibility = Visibility.Visible;
+        OutlineTestResultText.Visibility = Visibility.Collapsed;
+
+        try
+        {
+            var settings = new OutlineSettings
+            {
+                BaseUrl = OutlineBaseUrlBox.Text.Trim(),
+                ApiToken = OutlineApiTokenBox.Password.Trim(),
+            };
+            var svc = new OutlineService(settings);
+
+            if (!svc.IsConfigured)
+            {
+                OutlineTestResultText.Text = "Fill in Base URL and API Token first.";
+                OutlineTestResultText.Visibility = Visibility.Visible;
+                return;
+            }
+
+            var result = await svc.GetCollectionsAsync();
+
+            if (!result.Success)
+            {
+                OutlineTestResultText.Text = $"Failed to load: {result.ErrorMessage}";
+                OutlineTestResultText.Visibility = Visibility.Visible;
+                return;
+            }
+
+            var savedId = _settingsService.LoadOutlineDefaultCollectionId();
+
+            OutlineCollectionCombo.SelectionChanged -= OnOutlineCollectionSelected;
+            OutlineCollectionCombo.Items.Clear();
+            CollectionItem? toSelect = null;
+
+            foreach (var col in result.Collections)
+            {
+                var item = new CollectionItem(col.Id, col.Name);
+                OutlineCollectionCombo.Items.Add(item);
+                if (col.Id == savedId)
+                    toSelect = item;
+            }
+
+            OutlineCollectionCombo.SelectionChanged += OnOutlineCollectionSelected;
+
+            if (toSelect != null)
+                OutlineCollectionCombo.SelectedItem = toSelect;
+            else if (OutlineCollectionCombo.Items.Count > 0)
+                OutlineCollectionCombo.SelectedIndex = 0;
+
+            OutlineTestResultText.Text = $"{result.Collections.Count} collection(s) loaded.";
+            OutlineTestResultText.Visibility = Visibility.Visible;
+        }
+        catch (Exception ex)
+        {
+            OutlineTestResultText.Text = $"Error: {ex.Message}";
+            OutlineTestResultText.Visibility = Visibility.Visible;
+        }
+        finally
+        {
+            OutlineLoadCollectionsBtn.IsEnabled = true;
+            OutlineLoadProgress.IsActive = false;
+            OutlineLoadProgress.Visibility = Visibility.Collapsed;
+        }
+    }
+
     private void UpdateOutlineStatusBadge()
     {
         var hasUrl = !string.IsNullOrWhiteSpace(OutlineBaseUrlBox.Text);
         var hasToken = !string.IsNullOrWhiteSpace(OutlineApiTokenBox.Password);
-        OutlineStatusBadge.Text = (hasUrl && hasToken) ? "Configured" : "Not configured";
+        var hasCollection = OutlineCollectionCombo.SelectedItem is CollectionItem;
+        OutlineStatusBadge.Text = (hasUrl && hasToken && hasCollection) ? "Configured" : "Not configured";
     }
 
     private async void OnOutlineTestClicked(object sender, RoutedEventArgs e)
@@ -671,11 +752,12 @@ public sealed partial class SettingsWindow : Window
 
         try
         {
+            var selectedCollectionId = (OutlineCollectionCombo.SelectedItem as CollectionItem)?.Id;
             var settings = new OutlineSettings
             {
                 BaseUrl = OutlineBaseUrlBox.Text.Trim(),
                 ApiToken = OutlineApiTokenBox.Password.Trim(),
-                DefaultCollectionId = OutlineCollectionIdBox.Text.Trim(),
+                DefaultCollectionId = selectedCollectionId,
                 AutoPublish = false,
             };
 
@@ -686,11 +768,10 @@ public sealed partial class SettingsWindow : Window
                 return;
             }
 
-            // Use documents.info on an empty query to verify auth
             var result = await svc.CreateDocumentAsync(
                 title: "[Contora connection test]",
                 text: "_This document was created to test the Contora → Outline connection. You can delete it._",
-                collectionId: string.IsNullOrWhiteSpace(OutlineCollectionIdBox.Text) ? null : OutlineCollectionIdBox.Text.Trim());
+                collectionId: selectedCollectionId);
 
             OutlineTestResultText.Text = result.Success
                 ? $"Connected! Doc created: {result.DocumentUrl ?? result.DocumentId}"
@@ -704,6 +785,14 @@ public sealed partial class SettingsWindow : Window
         {
             OutlineTestBtn.IsEnabled = true;
         }
+    }
+
+    // Simple wrapper for ComboBox items so SelectedItem works by reference
+    private sealed class CollectionItem(string id, string name)
+    {
+        public string Id { get; } = id;
+        public string Name { get; } = name;
+        public override string ToString() => Name;
     }
 
     // ─── Helpers ───

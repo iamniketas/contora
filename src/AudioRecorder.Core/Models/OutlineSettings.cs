@@ -15,3 +15,17 @@ public sealed class OutlineDocumentResult
     public string? DocumentUrl { get; init; }
     public string? ErrorMessage { get; init; }
 }
+
+public sealed class OutlineCollection
+{
+    public string Id { get; init; } = string.Empty;
+    public string Name { get; init; } = string.Empty;
+    public string? Description { get; init; }
+}
+
+public sealed class OutlineCollectionsResult
+{
+    public bool Success { get; init; }
+    public IReadOnlyList<OutlineCollection> Collections { get; init; } = [];
+    public string? ErrorMessage { get; init; }
+}
