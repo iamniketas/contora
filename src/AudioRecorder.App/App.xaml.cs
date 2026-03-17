@@ -37,6 +37,19 @@ namespace AudioRecorder
         private const uint LR_LOADFROMFILE = 0x0010;
         private const uint LR_DEFAULTSIZE = 0x0040;
 
+        // Global hotkey: Win+Shift+R
+        private const uint WM_HOTKEY = 0x0312;
+        private const int GWLP_WNDPROC = -4;
+        private const int HOTKEY_ID_TOGGLE = 0xB001;
+        private const uint MOD_SHIFT = 0x0004;
+        private const uint MOD_WIN = 0x0008;
+        private const uint VK_R = 0x52;
+
+        private delegate nint WndProcDelegate(nint hWnd, uint msg, nint wParam, nint lParam);
+        private WndProcDelegate? _hotkeyWndProc; // keep alive to prevent GC
+        private nint _oldWndProc;
+        private nint _hotKeyHWnd;
+
         /// <summary>
         /// Main application window.
         /// </summary>
@@ -183,6 +196,40 @@ namespace AudioRecorder
             _appWindow = AppWindow.GetFromWindowId(windowId);
             _appWindow.Closing += OnAppWindowClosing;
             _appWindow.Changed += OnAppWindowChanged;
+
+            RegisterGlobalHotkey(hWnd);
+        }
+
+        private void RegisterGlobalHotkey(nint hWnd)
+        {
+            try
+            {
+                _hotKeyHWnd = hWnd;
+                _hotkeyWndProc = HotkeyWndProc;
+                var newProc = Marshal.GetFunctionPointerForDelegate(_hotkeyWndProc);
+                _oldWndProc = (nint)GetWindowLongW(hWnd, GWLP_WNDPROC);
+                SetWindowLongW(hWnd, GWLP_WNDPROC, (int)newProc);
+
+                if (!RegisterHotKey(hWnd, HOTKEY_ID_TOGGLE, MOD_WIN | MOD_SHIFT, VK_R))
+                    AudioRecorder.Services.Logging.AppLogger.LogWarning(
+                        $"RegisterHotKey Win+Shift+R failed (error {Marshal.GetLastWin32Error()})");
+                else
+                    AudioRecorder.Services.Logging.AppLogger.LogInfo("Global hotkey Win+Shift+R registered");
+            }
+            catch (Exception ex)
+            {
+                AudioRecorder.Services.Logging.AppLogger.LogError($"RegisterGlobalHotkey: {ex.Message}");
+            }
+        }
+
+        private nint HotkeyWndProc(nint hWnd, uint msg, nint wParam, nint lParam)
+        {
+            if (msg == WM_HOTKEY && (int)wParam == HOTKEY_ID_TOGGLE)
+            {
+                ToggleRecordingFromTray();
+                return 0;
+            }
+            return CallWindowProcW(_oldWndProc, hWnd, msg, wParam, lParam);
         }
 
         private void OnAppWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
@@ -362,6 +409,14 @@ namespace AudioRecorder
         {
             try
             {
+                if (_hotKeyHWnd != 0)
+                {
+                    UnregisterHotKey(_hotKeyHWnd, HOTKEY_ID_TOGGLE);
+                    if (_oldWndProc != 0)
+                        SetWindowLongW(_hotKeyHWnd, GWLP_WNDPROC, (int)_oldWndProc);
+                    _hotKeyHWnd = 0;
+                }
+
                 if (_notifyIcon != null)
                 {
                     _notifyIcon.Visible = false;
@@ -402,6 +457,23 @@ namespace AudioRecorder
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool DestroyIcon(nint hIcon);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+        private static extern int SetWindowLongW(nint hWnd, int nIndex, int dwNewLong);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+        private static extern int GetWindowLongW(nint hWnd, int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern nint CallWindowProcW(nint lpPrevWndFunc, nint hWnd, uint msg, nint wParam, nint lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool RegisterHotKey(nint hWnd, int id, uint fsModifiers, uint vk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnregisterHotKey(nint hWnd, int id);
 
         /// <summary>
         /// Invoked when navigation to a certain page fails.
