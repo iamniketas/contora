@@ -16,6 +16,7 @@ public sealed partial class SettingsWindow : Window
     private WhisperRuntimeInstallerService _runtimeInstaller;
     private readonly FfmpegInstallerService _ffmpegInstaller;
     private readonly SharedModelConfigService _sharedConfigService;
+    private readonly DictatorSharedStoreService _dictatorStore;
     private readonly ISettingsService _settingsService;
     private readonly DispatcherQueue _dispatcherQueue;
 
@@ -32,6 +33,7 @@ public sealed partial class SettingsWindow : Window
         WhisperRuntimeInstallerService runtimeInstaller,
         FfmpegInstallerService ffmpegInstaller,
         SharedModelConfigService sharedConfigService,
+        DictatorSharedStoreService dictatorStore,
         ISettingsService settingsService,
         Action? onSettingsChanged = null)
     {
@@ -40,6 +42,7 @@ public sealed partial class SettingsWindow : Window
         _runtimeInstaller = runtimeInstaller;
         _ffmpegInstaller = ffmpegInstaller;
         _sharedConfigService = sharedConfigService;
+        _dictatorStore = dictatorStore;
         _settingsService = settingsService;
         _onSettingsChanged = onSettingsChanged;
         _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
@@ -303,6 +306,7 @@ public sealed partial class SettingsWindow : Window
         var activeModelName = config.ActiveModelName;
         InstalledModelsPanel.Children.Clear();
 
+        // ─── Contora models (CTranslate2 / Whisper) ───
         if (config.InstalledModels.Count == 0)
         {
             InstalledModelsPanel.Children.Add(new TextBlock
@@ -311,7 +315,6 @@ public sealed partial class SettingsWindow : Window
                 FontSize = 12,
                 Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
             });
-            return;
         }
 
         foreach (var model in config.InstalledModels)
@@ -433,6 +436,131 @@ public sealed partial class SettingsWindow : Window
 
             card.Child = grid;
             InstalledModelsPanel.Children.Add(card);
+        }
+
+        // ─── Dictator shared models (NeMo / GGML) ───
+        await _dictatorStore.LoadStoreAsync();
+        var dictatorStore = _dictatorStore.GetCached();
+        if (dictatorStore?.InstalledModels is { Count: > 0 })
+        {
+            // Section header
+            InstalledModelsPanel.Children.Add(new TextBlock
+            {
+                Text = "Shared with Dictator",
+                FontSize = 12,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Margin = new Thickness(0, 16, 0, 4),
+                Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+            });
+
+            var hasPythonVenv = _dictatorStore.IsPythonVenvAvailable();
+
+            foreach (var dm in dictatorStore.InstalledModels)
+            {
+                var isGgml = DictatorSharedStoreService.IsGgmlModel(dm);
+                var isActive = string.Equals(dm.Id, activeModelName, StringComparison.OrdinalIgnoreCase);
+                var isUsable = !isGgml && hasPythonVenv;
+
+                var card = new Border
+                {
+                    Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["CardBackgroundFillColorSecondaryBrush"],
+                    CornerRadius = new CornerRadius(4),
+                    Padding = new Thickness(12, 8, 12, 8),
+                    BorderThickness = new Thickness(isActive ? 1.5 : 0),
+                    BorderBrush = isActive
+                        ? (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["AccentFillColorDefaultBrush"]
+                        : null,
+                    Opacity = isUsable ? 1.0 : 0.55
+                };
+
+                var grid = new Grid();
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+                var info = new StackPanel { Spacing = 2 };
+                var nameLine = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+
+                nameLine.Children.Add(new TextBlock
+                {
+                    Text = dm.Id,
+                    FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+
+                if (isActive)
+                {
+                    nameLine.Children.Add(new Border
+                    {
+                        Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["AccentFillColorDefaultBrush"],
+                        CornerRadius = new CornerRadius(3),
+                        Padding = new Thickness(4, 1, 4, 1),
+                        Child = new TextBlock
+                        {
+                            Text = "Active",
+                            FontSize = 10,
+                            Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextOnAccentFillColorPrimaryBrush"],
+                            VerticalAlignment = VerticalAlignment.Center
+                        }
+                    });
+                }
+
+                var runtimeLabel = DictatorSharedStoreService.GetModelRuntimeLabel(dm);
+                nameLine.Children.Add(new Border
+                {
+                    Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["SystemFillColorAttentionBackgroundBrush"],
+                    CornerRadius = new CornerRadius(3),
+                    Padding = new Thickness(4, 1, 4, 1),
+                    Child = new TextBlock
+                    {
+                        Text = runtimeLabel,
+                        FontSize = 10,
+                        VerticalAlignment = VerticalAlignment.Center
+                    }
+                });
+
+                var sizeStr = dm.SizeBytes.HasValue
+                    ? FormatFileSize(dm.SizeBytes.Value)
+                    : "—";
+                var statusNote = isGgml
+                    ? "Только для Dictator (GGML). В Contora не поддерживается."
+                    : (!hasPythonVenv
+                        ? "Python venv не найден — установите Dictator для использования."
+                        : dm.DirectoryPath);
+
+                info.Children.Add(nameLine);
+                info.Children.Add(new TextBlock
+                {
+                    Text = $"{sizeStr}  {statusNote}",
+                    FontSize = 11,
+                    Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+                    TextWrapping = TextWrapping.Wrap
+                });
+
+                Grid.SetColumn(info, 0);
+                grid.Children.Add(info);
+
+                if (isUsable && !isActive)
+                {
+                    var useBtn = new Button { Content = "Use", Padding = new Thickness(8, 4, 8, 4) };
+                    var capturedId = dm.Id;
+                    useBtn.Click += async (_, _) =>
+                    {
+                        var cfg = await _sharedConfigService.LoadAsync();
+                        cfg.ActiveModelName = capturedId;
+                        await _sharedConfigService.SaveAsync(cfg);
+                        _settingsService.SaveWhisperModel(capturedId);
+                        _onSettingsChanged?.Invoke();
+                        await LoadModelsDataAsync();
+                    };
+                    var btns = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+                    btns.Children.Add(useBtn);
+                    Grid.SetColumn(btns, 1);
+                    grid.Children.Add(btns);
+                }
+
+                card.Child = grid;
+                InstalledModelsPanel.Children.Add(card);
+            }
         }
     }
 

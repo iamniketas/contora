@@ -286,6 +286,8 @@
                                         <ComboBoxItem Content="small — ~500 МБ | CPU: умеренно" Tag="small" />
                                         <ComboBoxItem Content="medium — ~1.5 ГБ | GPU 2+ ГБ" Tag="medium" />
                                         <ComboBoxItem Content="large-v2 — ~3 ГБ | GPU 4+ ГБ" Tag="large-v2" />
+                                        <ComboBoxItem Content="large-v3 — ~3 ГБ | GPU 4+ ГБ (улучшенная)" Tag="large-v3" />
+                                        <ComboBoxItem Content="large-v3-turbo — ~1.6 ГБ | GPU 4+ ГБ (быстрая)" Tag="large-v3-turbo" />
                                     </ComboBox>
                                     <Button
                                         x:Name="DownloadModelBtn"

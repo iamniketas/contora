@@ -13,29 +13,54 @@ public partial class WhisperTranscriptionService : ITranscriptionService
     private readonly string _modelName;
     private readonly bool _enableDiarization;
     private readonly string _deviceMode; // "auto", "cuda", "cpu"
+    private readonly DictatorSharedStoreService? _dictatorStore;
     private TimeSpan _audioDuration;
     private DateTime _transcriptionStartTime;
+    private WhisperServerBackend? _serverBackend;
 
     public event EventHandler<TranscriptionProgress>? ProgressChanged;
 
-    public bool IsWhisperAvailable => File.Exists(_whisperPath);
+    public bool IsWhisperAvailable => File.Exists(_whisperPath)
+                                      || (_dictatorStore?.IsServerModel(_modelName) == true
+                                          && _dictatorStore.IsPythonVenvAvailable());
 
     public WhisperTranscriptionService(
         string? whisperPath = null,
         string modelName = "large-v2",
         bool enableDiarization = true,
-        string deviceMode = "auto")
+        string deviceMode = "auto",
+        DictatorSharedStoreService? dictatorStore = null)
     {
         _whisperPath = whisperPath ?? WhisperPaths.GetDefaultWhisperPath();
         _modelName = modelName;
         _enableDiarization = enableDiarization;
         _deviceMode = deviceMode;
+        _dictatorStore = dictatorStore;
     }
     public async Task<TranscriptionResult> TranscribeAsync(string audioPath, CancellationToken ct = default)
     {
         if (!File.Exists(audioPath))
         {
             return new TranscriptionResult(false, null, [], $"File not found: {audioPath}");
+        }
+
+        // ─── Route to Python ASR server (NeMo / transformers models from Dictator) ───
+        if (_dictatorStore is not null)
+        {
+            var dictatorModel = _dictatorStore.GetInstalledModel(_modelName);
+            if (dictatorModel is not null)
+            {
+                if (DictatorSharedStoreService.IsGgmlModel(dictatorModel))
+                {
+                    return new TranscriptionResult(false, null, [],
+                        $"Модель «{_modelName}» — GGML-формат (только для Dictator).\n" +
+                        "Для Contora скачайте Whisper-модель через Настройки → Models.");
+                }
+
+                // server_python_asr → NeMo / transformers
+                return await TranscribeWithServerAsync(audioPath, dictatorModel, ct);
+            }
+            // Model not in Dictator store — fall through to faster-whisper-xxl below
         }
 
         if (!IsWhisperAvailable)
@@ -120,6 +145,107 @@ public partial class WhisperTranscriptionService : ITranscriptionService
             }
         }
     }
+
+    // ─── Python ASR server backend (NeMo / transformers) ───
+
+    private async Task<TranscriptionResult> TranscribeWithServerAsync(
+        string audioPath, DictatorInstalledModel model, CancellationToken ct)
+    {
+        var pythonExe = _dictatorStore!.GetPythonVenvPath();
+        if (pythonExe is null)
+        {
+            return new TranscriptionResult(false, null, [],
+                $"Python venv не найден в AudioModels\\runtimes\\python-asr\\.\n" +
+                "Установите Dictator и скачайте модель через его настройки.");
+        }
+
+        var scriptPath = WhisperServerBackend.FindScript();
+        if (scriptPath is null)
+        {
+            return new TranscriptionResult(false, null, [],
+                "whisper_server.py не найден. Переустановите Contora или Dictator.");
+        }
+
+        _serverBackend ??= new WhisperServerBackend(pythonExe, scriptPath);
+
+        // Handle non-ASCII paths before sending to server
+        string processPath = audioPath;
+        string? tempDir = null;
+        try
+        {
+            if (ContainsNonAscii(audioPath))
+            {
+                RaiseProgress(TranscriptionState.Converting, 0, "Copying file...");
+                tempDir = Path.Combine(Path.GetTempPath(), $"Contora_{Guid.NewGuid():N}");
+                Directory.CreateDirectory(tempDir);
+                var safeName = $"audio_{DateTime.Now:yyyyMMdd_HHmmss}{Path.GetExtension(audioPath)}";
+                processPath = Path.Combine(tempDir, safeName);
+                File.Copy(audioPath, processPath);
+            }
+
+            // Server needs MP3/WAV — convert if WAV
+            if (AudioConverter.IsWavFile(processPath))
+            {
+                RaiseProgress(TranscriptionState.Converting, 0, "Converting to MP3...");
+                processPath = await AudioConverter.ConvertToMp3Async(processPath, deleteOriginal: tempDir != null);
+            }
+
+            _audioDuration = await GetAudioDurationAsync(processPath);
+
+            var runtimeLabel = DictatorSharedStoreService.GetModelRuntimeLabel(model);
+            RaiseProgress(TranscriptionState.Transcribing, 0, $"Запуск {model.Id} ({runtimeLabel})...");
+
+            if (!await _serverBackend.StartAsync(model.DirectoryPath, model.Id, ct))
+            {
+                return new TranscriptionResult(false, null, [],
+                    $"Не удалось запустить Python ASR сервер для модели «{model.Id}».\n" +
+                    "Проверьте, что Python venv установлен корректно.");
+            }
+
+            RaiseProgress(TranscriptionState.Transcribing, 5, "Transcribing...");
+
+            var language = "ru"; // TODO: from settings
+            var (success, text, error) = await _serverBackend.TranscribeAsync(processPath, language, ct);
+
+            if (!success)
+                return new TranscriptionResult(false, null, [], error ?? "Server transcription failed");
+
+            // Save result as .txt alongside original audio
+            var originalFileName = Path.GetFileNameWithoutExtension(audioPath);
+            var originalDir = Path.GetDirectoryName(audioPath) ?? Path.GetTempPath();
+            var txtPath = Path.Combine(originalDir, $"{originalFileName}.txt");
+
+            var durationStr = FormatTimeSpanForSegment(_audioDuration);
+            var line = $"[00:00:00.000 --> {durationStr}] {text}";
+            await File.WriteAllTextAsync(txtPath, line, System.Text.Encoding.UTF8, ct);
+
+            var segments = new List<TranscriptionSegment>
+            {
+                new TranscriptionSegment(TimeSpan.Zero, _audioDuration, "SPEAKER_00", text)
+            };
+
+            RaiseProgress(TranscriptionState.Completed, 100, "Transcription completed");
+            return new TranscriptionResult(true, txtPath, segments, null);
+        }
+        catch (OperationCanceledException)
+        {
+            RaiseProgress(TranscriptionState.Failed, 0, "Transcription cancelled");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            RaiseProgress(TranscriptionState.Failed, 0, ex.Message);
+            return new TranscriptionResult(false, null, [], ex.Message);
+        }
+        finally
+        {
+            if (tempDir is not null)
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
+
+    private static string FormatTimeSpanForSegment(TimeSpan ts)
+        => $"{(int)ts.TotalHours:D2}:{ts.Minutes:D2}:{ts.Seconds:D2}.{ts.Milliseconds:D3}";
 
     private static bool ContainsNonAscii(string path)
     {

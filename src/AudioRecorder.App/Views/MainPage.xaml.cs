@@ -203,6 +203,7 @@ public sealed partial class MainPage : Page
     private WhisperModelDownloadService _modelDownloadService;
     private readonly FfmpegInstallerService _ffmpegInstallerService;
     private readonly SharedModelConfigService _sharedConfigService;
+    private readonly DictatorSharedStoreService _dictatorStoreService;
     private readonly DispatcherQueue _dispatcherQueue;
     private readonly DispatcherQueueTimer _updateTimer;
     private string? _lastRecordingPath;
@@ -262,6 +263,8 @@ public sealed partial class MainPage : Page
         _modelDownloadService = new WhisperModelDownloadService(_whisperModel);
         _ffmpegInstallerService = new FfmpegInstallerService();
         _sharedConfigService = new SharedModelConfigService();
+        _dictatorStoreService = new DictatorSharedStoreService();
+        _ = _dictatorStoreService.LoadStoreAsync(); // warm up async, non-blocking
         _embeddingService = new OllamaEmbeddingService();
         _semanticSearch = new SemanticSearchService(_sessionStore, _embeddingService);
 
@@ -318,7 +321,11 @@ public sealed partial class MainPage : Page
     {
         bool enableDiarization = !string.Equals(mode, "light", StringComparison.OrdinalIgnoreCase);
         var effectiveDevice = ResolveEffectiveDevice();
-        return new WhisperTranscriptionService(modelName: _whisperModel, enableDiarization: enableDiarization, deviceMode: effectiveDevice);
+        return new WhisperTranscriptionService(
+            modelName: _whisperModel,
+            enableDiarization: enableDiarization,
+            deviceMode: effectiveDevice,
+            dictatorStore: _dictatorStoreService);
     }
 
     /// <summary>
@@ -836,6 +843,7 @@ public sealed partial class MainPage : Page
             _runtimeInstallerService,
             _ffmpegInstallerService,
             _sharedConfigService,
+            _dictatorStoreService,
             _settingsService,
             onSettingsChanged: () =>
             {
