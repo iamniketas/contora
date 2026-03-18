@@ -159,6 +159,12 @@ public sealed class SessionViewModel
             ? Microsoft.UI.Xaml.Visibility.Visible
             : Microsoft.UI.Xaml.Visibility.Collapsed;
 
+    /// <summary>Shown when transcript exists but not yet published to Outline.</summary>
+    public Microsoft.UI.Xaml.Visibility PublishButtonVisibility =>
+        TranscriptPath != null && OutlineDocumentUrl == null
+            ? Microsoft.UI.Xaml.Visibility.Visible
+            : Microsoft.UI.Xaml.Visibility.Collapsed;
+
     public static SessionViewModel FromSession(Session s)
     {
         var (label, color) = s.State switch
@@ -1874,15 +1880,158 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private async void OnPublishSessionToOutlineClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { Tag: SessionViewModel vm }) return;
+        await PublishSessionFromHistoryAsync(vm);
+    }
+
+    private async Task PublishSessionFromHistoryAsync(SessionViewModel vm)
+    {
+        if (!_outlineService.IsConfigured)
+        {
+            var dlg = new ContentDialog
+            {
+                Title = "Outline not configured",
+                Content = "Open Settings → Integrations and enter your Outline URL and API key.",
+                CloseButtonText = "OK",
+                XamlRoot = XamlRoot
+            };
+            await dlg.ShowAsync();
+            return;
+        }
+
+        var session = await _sessionStore.GetAsync(vm.Id);
+        if (session is null) return;
+
+        if (session.TranscriptPath is null || !File.Exists(session.TranscriptPath))
+        {
+            var dlg = new ContentDialog
+            {
+                Title = "No transcript",
+                Content = "This session has no transcript file. Transcribe it first.",
+                CloseButtonText = "OK",
+                XamlRoot = XamlRoot
+            };
+            await dlg.ShowAsync();
+            return;
+        }
+
+        // Show collection picker
+        var collections = await _outlineService.GetCollectionsAsync();
+        string? chosenCollectionId = null;
+
+        if (collections.Success && collections.Collections.Count > 0)
+        {
+            var combo = new ComboBox { MinWidth = 300, Margin = new Thickness(0, 8, 0, 0) };
+            foreach (var c in collections.Collections)
+                combo.Items.Add(new ComboBoxItem { Content = c.Name, Tag = c.Id });
+            combo.SelectedIndex = 0;
+
+            var pickerContent = new StackPanel { Spacing = 4 };
+            pickerContent.Children.Add(new TextBlock { Text = "Select collection:", FontSize = 12 });
+            pickerContent.Children.Add(combo);
+
+            var pickerDlg = new ContentDialog
+            {
+                Title = "Publish to Outline",
+                Content = pickerContent,
+                PrimaryButtonText = "Publish",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Primary,
+                XamlRoot = XamlRoot
+            };
+
+            if (await pickerDlg.ShowAsync() != ContentDialogResult.Primary) return;
+            chosenCollectionId = (combo.SelectedItem as ComboBoxItem)?.Tag?.ToString();
+        }
+
+        // Build markdown from transcript segments
+        var segments = await ParseTranscriptFileAsync(session.TranscriptPath);
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"# {session.Title}");
+        sb.AppendLine();
+        sb.AppendLine($"*{session.RecordedAt:dd MMM yyyy, HH:mm}*");
+        sb.AppendLine();
+
+        string? lastSpeaker = null;
+        foreach (var seg in segments)
+        {
+            if (seg.Speaker != lastSpeaker)
+            {
+                if (lastSpeaker != null) sb.AppendLine();
+                sb.AppendLine($"**{seg.Speaker}**");
+                lastSpeaker = seg.Speaker;
+            }
+            sb.AppendLine(seg.Text.Trim());
+        }
+
+        var markdown = sb.ToString();
+
+        // Publish
+        var progressDlg = new ContentDialog
+        {
+            Title = "Publishing…",
+            Content = new ProgressRing { IsActive = true, Width = 40, Height = 40 },
+            XamlRoot = XamlRoot
+        };
+        _ = progressDlg.ShowAsync();
+
+        try
+        {
+            var result = await _outlineService.CreateDocumentAsync(
+                session.Title, markdown, collectionId: chosenCollectionId);
+
+            progressDlg.Hide();
+
+            if (!result.Success)
+            {
+                var errDlg = new ContentDialog
+                {
+                    Title = "Publish failed",
+                    Content = result.ErrorMessage ?? "Unknown error",
+                    CloseButtonText = "OK",
+                    XamlRoot = XamlRoot
+                };
+                await errDlg.ShowAsync();
+                return;
+            }
+
+            session.OutlineDocumentId = result.DocumentId;
+            session.OutlineDocumentUrl = result.DocumentUrl;
+            session.State = SessionState.Exported;
+            await _sessionStore.UpdateAsync(session);
+            _ = LoadSessionsAsync();
+
+            if (result.DocumentUrl != null)
+            {
+                var okDlg = new ContentDialog
+                {
+                    Title = "Published ✓",
+                    Content = $"Document created in Outline.\n{result.DocumentUrl}",
+                    PrimaryButtonText = "Open in Outline",
+                    CloseButtonText = "Close",
+                    DefaultButton = ContentDialogButton.Primary,
+                    XamlRoot = XamlRoot
+                };
+                if (await okDlg.ShowAsync() == ContentDialogResult.Primary)
+                    try { await Windows.System.Launcher.LaunchUriAsync(new Uri(result.DocumentUrl)); }
+                    catch { }
+            }
+        }
+        catch (Exception ex)
+        {
+            progressDlg.Hide();
+            AudioRecorder.Services.Logging.AppLogger.LogError($"PublishSessionFromHistoryAsync: {ex.Message}");
+        }
+    }
+
     private async Task LoadTranscriptFromFileAsync(Core.Models.Session session)
     {
         try
         {
             if (session.TranscriptPath == null || !File.Exists(session.TranscriptPath))
                 return;
-
-            var text = await File.ReadAllTextAsync(session.TranscriptPath);
-            var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
             // Restore speaker names if available
             Dictionary<string, string> speakerMap = new();
@@ -1896,36 +2045,74 @@ public sealed partial class MainPage : Page
                 catch { }
             }
 
-            // Parse simple "SPEAKER_XX: text" or "[HH:MM:SS] SPEAKER_XX: text" format
-            var segments = new List<TranscriptionSegment>();
-            var timeRegex = new System.Text.RegularExpressions.Regex(
-                @"^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s+(\w+):\s+(.+)$");
-            var speakerOnlyRegex = new System.Text.RegularExpressions.Regex(
-                @"^(\w+):\s+(.+)$");
-
-            foreach (var line in lines)
-            {
-                var m = timeRegex.Match(line.Trim());
-                if (m.Success && TimeSpan.TryParse(m.Groups[1].Value, out var ts))
-                {
-                    segments.Add(new TranscriptionSegment(ts, ts + TimeSpan.FromSeconds(5),
-                        m.Groups[2].Value, m.Groups[3].Value));
-                    continue;
-                }
-
-                var m2 = speakerOnlyRegex.Match(line.Trim());
-                if (m2.Success)
-                {
-                    segments.Add(new TranscriptionSegment(TimeSpan.Zero, TimeSpan.Zero,
-                        m2.Groups[1].Value, m2.Groups[2].Value));
-                }
-            }
-
+            var segments = await ParseTranscriptFileAsync(session.TranscriptPath);
             await LoadTranscriptionToUI(segments, speakerMap);
         }
         catch (Exception ex)
         {
             AudioRecorder.Services.Logging.AppLogger.LogError($"LoadTranscriptFromFileAsync: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Parses a transcript .txt file using the same segment format produced by
+    /// WhisperTranscriptionService: [HH:MM:SS.mmm --> HH:MM:SS.mmm] [SPEAKER_XX] text
+    /// </summary>
+    private static async Task<List<TranscriptionSegment>> ParseTranscriptFileAsync(string txtPath)
+    {
+        var segments = new List<TranscriptionSegment>();
+        var lines = await File.ReadAllLinesAsync(txtPath, System.Text.Encoding.UTF8);
+
+        // Matches: [00:00:00.000 --> 00:01:23.456] [SPEAKER_00] : text
+        var regex = new System.Text.RegularExpressions.Regex(
+            @"^\s*\[(\d{2}:\d{2}(?::\d{2})?[.,]\d{3})\s*-->\s*(\d{2}:\d{2}(?::\d{2})?[.,]\d{3})\]\s*(?:\[([^\]]+)\])?\s*:?\s*(.*)$");
+
+        TimeSpan curStart = TimeSpan.Zero, curEnd = TimeSpan.Zero;
+        string curSpeaker = "SPEAKER_00";
+        var curText = new System.Text.StringBuilder();
+        bool hasSegment = false;
+
+        void Flush()
+        {
+            var t = curText.ToString().Trim();
+            if (hasSegment && !string.IsNullOrWhiteSpace(t))
+                segments.Add(new TranscriptionSegment(curStart, curEnd, curSpeaker, t));
+            curText.Clear();
+            hasSegment = false;
+        }
+
+        foreach (var raw in lines)
+        {
+            var line = raw.Trim('\uFEFF', '\u200B');
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            var m = regex.Match(line);
+            if (m.Success)
+            {
+                Flush();
+                curStart  = ParseTs(m.Groups[1].Value);
+                curEnd    = ParseTs(m.Groups[2].Value);
+                curSpeaker = m.Groups[3].Success ? m.Groups[3].Value : "SPEAKER_00";
+                curText.Append(m.Groups[4].Value.Trim());
+                hasSegment = true;
+            }
+            else if (hasSegment)
+            {
+                if (curText.Length > 0) curText.Append(' ');
+                curText.Append(line.Trim());
+            }
+        }
+        Flush();
+        return segments;
+
+        static TimeSpan ParseTs(string s)
+        {
+            s = s.Trim().Replace(',', '.');
+            var parts = s.Split('.');
+            if (parts.Length == 2 && parts[0].Count(c => c == ':') == 1)
+                s = "00:" + s;
+            return TimeSpan.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out var ts)
+                ? ts : TimeSpan.Zero;
         }
     }
 

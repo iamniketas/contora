@@ -676,6 +676,7 @@
                                                     <RowDefinition Height="Auto" />
                                                     <RowDefinition Height="Auto" />
                                                     <RowDefinition Height="Auto" />
+                                                    <RowDefinition Height="Auto" />
                                                 </Grid.RowDefinitions>
 
                                                 <!--  Title + rename button + state badge  -->
@@ -739,9 +740,24 @@
                                                     MaxLines="2"
                                                     TextWrapping="Wrap" />
 
+                                                <!--  Publish to Outline (visible when transcribed but not yet published)  -->
+                                                <Button
+                                                    Grid.Row="3"
+                                                    Tag="{x:Bind}"
+                                                    Visibility="{x:Bind PublishButtonVisibility}"
+                                                    Click="OnPublishSessionToOutlineClicked"
+                                                    FontSize="11"
+                                                    Padding="6,3"
+                                                    HorizontalAlignment="Left">
+                                                    <StackPanel Orientation="Horizontal" Spacing="5">
+                                                        <FontIcon Glyph="&#xE8A1;" FontSize="11" />
+                                                        <TextBlock Text="Publish to Outline" FontSize="11" />
+                                                    </StackPanel>
+                                                </Button>
+
                                                 <!--  Outline link (visible only when published)  -->
                                                 <HyperlinkButton
-                                                    Grid.Row="3"
+                                                    Grid.Row="4"
                                                     Tag="{x:Bind OutlineDocumentUrl}"
                                                     Visibility="{x:Bind OutlineUrlVisibility}"
                                                     Click="OnOutlineLinkClicked"
