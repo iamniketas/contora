@@ -153,6 +153,9 @@ public sealed class SessionViewModel
         new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Gray);
     public string? TranscriptPath { get; set; }
     public string? OutlineDocumentUrl { get; set; }
+    public string? SummaryText { get; set; }
+    public string? ActionItemsJson { get; set; }
+    public string? DecisionsJson { get; set; }
 
     public Microsoft.UI.Xaml.Visibility OutlineUrlVisibility =>
         OutlineDocumentUrl != null
@@ -191,6 +194,9 @@ public sealed class SessionViewModel
             StateBrush = new Microsoft.UI.Xaml.Media.SolidColorBrush(color),
             TranscriptPath = s.TranscriptPath,
             OutlineDocumentUrl = s.OutlineDocumentUrl,
+            SummaryText = s.SummaryText,
+            ActionItemsJson = s.ActionItemsJson,
+            DecisionsJson = s.DecisionsJson,
         };
     }
 }
@@ -243,6 +249,11 @@ public sealed partial class MainPage : Page
     public ObservableCollection<SpeakerViewModel> Speakers { get; } = new();
     public ObservableCollection<TranscriptionSegmentViewModel> TranscriptionSegments { get; } = new();
     public ObservableCollection<SessionViewModel> Sessions { get; } = new();
+
+    // ── Analysis panel data ─────────────────────────────────────────────────
+    public ObservableCollection<string> AnalysisActionItems { get; } = new();
+    public ObservableCollection<string> AnalysisDecisions { get; } = new();
+    public ObservableCollection<string> AnalysisRisks { get; } = new();
 
     public MainPage()
     {
@@ -906,7 +917,13 @@ public sealed partial class MainPage : Page
                 return;
             }
 
+            // Show top-of-page banner with the available version
             _availableUpdateInfo = checkResult.UpdateInfo;
+            var newVersion = checkResult.UpdateInfo.TargetFullRelease.Version;
+            UpdateAvailableBanner.Message = $"Версия {newVersion} — скачивается в фоне...";
+            UpdateAvailableBanner.IsOpen = true;
+            UpdateBannerInstallButton.IsEnabled = false;
+
             UpdateStatusText.Text = $"{checkResult.StatusMessage} Downloading...";
             UpdateProgressBar.Visibility = Visibility.Visible;
             UpdateProgressBar.Value = 0;
@@ -932,6 +949,14 @@ public sealed partial class MainPage : Page
             _readyToApplyRelease = downloadResult.ReadyToApplyRelease;
             UpdateStatusText.Text = downloadResult.StatusMessage;
             ApplyUpdateButton.Visibility = Visibility.Visible;
+
+            // Update banner: ready to install
+            if (UpdateAvailableBanner.IsOpen)
+            {
+                var readyVersion = _readyToApplyRelease.Version;
+                UpdateAvailableBanner.Message = $"Версия {readyVersion} загружена и готова к установке.";
+                UpdateBannerInstallButton.IsEnabled = true;
+            }
         }
         finally
         {
@@ -974,6 +999,36 @@ public sealed partial class MainPage : Page
         {
             await ShowErrorDialogAsync("Failed to apply update.");
         }
+    }
+
+    /// <summary>
+    /// "Обновить" button in the top InfoBar banner — same as OnApplyUpdateClicked.
+    /// </summary>
+    private async void OnUpdateBannerInstallClicked(object sender, RoutedEventArgs e)
+    {
+        await OnApplyUpdateClickedCore();
+    }
+
+    private async Task OnApplyUpdateClickedCore()
+    {
+        if (_readyToApplyRelease == null) return;
+
+        var dialog = new ContentDialog
+        {
+            Title = "Применить обновление",
+            Content = "Приложение перезапустится для завершения установки.",
+            PrimaryButtonText = "Обновить и перезапустить",
+            CloseButtonText = "Отмена",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result != ContentDialogResult.Primary) return;
+
+        var started = _appUpdateService.ApplyUpdateAndRestart(_readyToApplyRelease);
+        if (!started)
+            await ShowErrorDialogAsync("Failed to apply update.");
     }
 
     private void LoadOutputFolderSetting()
@@ -1384,7 +1439,7 @@ public sealed partial class MainPage : Page
                     await _playbackService.LoadAsync(audioPath);
                 }
 
-                _ = UpdateSessionAfterTranscriptionAsync(transcriptionSessionId, result.OutputPath, result.Segments, pipelineResult.GeneratedTitle);
+                _ = UpdateSessionAfterTranscriptionAsync(transcriptionSessionId, result.OutputPath, result.Segments, pipelineResult.GeneratedTitle, pipelineResult.StructuredOutput);
 
                 // Publish to Outline if configured (fire-and-forget)
                 if (_outlineService.IsConfigured && pipelineResult.TargetPath != null)
@@ -1857,6 +1912,7 @@ public sealed partial class MainPage : Page
 
             _lastTranscriptionPath = session.TranscriptPath;
             await LoadTranscriptFromFileAsync(session);
+            LoadAnalysisFromSession(session);
         }
         catch (Exception ex)
         {
@@ -2081,6 +2137,62 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
+    /// Populates the Analysis pivot tab from session's LLM-structured data.
+    /// </summary>
+    private void LoadAnalysisFromSession(Core.Models.Session session)
+    {
+        AnalysisActionItems.Clear();
+        AnalysisDecisions.Clear();
+        AnalysisRisks.Clear();
+
+        // Update summary TextBlock if it exists
+        if (AnalysisSummaryText != null)
+        {
+            AnalysisSummaryText.Text = session.SummaryText ?? string.Empty;
+            AnalysisSummarySection.Visibility = string.IsNullOrWhiteSpace(session.SummaryText)
+                ? Microsoft.UI.Xaml.Visibility.Collapsed
+                : Microsoft.UI.Xaml.Visibility.Visible;
+        }
+
+        if (!string.IsNullOrWhiteSpace(session.ActionItemsJson))
+        {
+            try
+            {
+                var items = System.Text.Json.JsonSerializer.Deserialize<List<string>>(session.ActionItemsJson) ?? [];
+                foreach (var item in items) AnalysisActionItems.Add(item);
+            }
+            catch { }
+        }
+
+        if (!string.IsNullOrWhiteSpace(session.DecisionsJson))
+        {
+            try
+            {
+                var decisions = System.Text.Json.JsonSerializer.Deserialize<List<string>>(session.DecisionsJson) ?? [];
+                foreach (var d in decisions) AnalysisDecisions.Add(d);
+            }
+            catch { }
+        }
+
+        // Show/hide Analysis tab sections
+        if (AnalysisActionItemsSection != null)
+            AnalysisActionItemsSection.Visibility = AnalysisActionItems.Count > 0
+                ? Microsoft.UI.Xaml.Visibility.Visible
+                : Microsoft.UI.Xaml.Visibility.Collapsed;
+        if (AnalysisDecisionsSection != null)
+            AnalysisDecisionsSection.Visibility = AnalysisDecisions.Count > 0
+                ? Microsoft.UI.Xaml.Visibility.Visible
+                : Microsoft.UI.Xaml.Visibility.Collapsed;
+        if (AnalysisEmptyHint != null)
+            AnalysisEmptyHint.Visibility =
+                string.IsNullOrWhiteSpace(session.SummaryText)
+                    && AnalysisActionItems.Count == 0
+                    && AnalysisDecisions.Count == 0
+                    ? Microsoft.UI.Xaml.Visibility.Visible
+                    : Microsoft.UI.Xaml.Visibility.Collapsed;
+    }
+
+    /// <summary>
     /// Parses a transcript .txt file using the same segment format produced by
     /// WhisperTranscriptionService: [HH:MM:SS.mmm --> HH:MM:SS.mmm] [SPEAKER_XX] text
     /// </summary>
@@ -2229,7 +2341,8 @@ public sealed partial class MainPage : Page
         Guid? sessionId,
         string? transcriptPath,
         IReadOnlyList<TranscriptionSegment> segments,
-        string? generatedTitle = null)
+        string? generatedTitle = null,
+        AudioRecorder.Core.Models.StructuredSessionOutput? structuredOutput = null)
     {
         if (sessionId is not { } sid) return;
         try
@@ -2244,8 +2357,20 @@ public sealed partial class MainPage : Page
             session.State = SessionState.Transcribed;
             session.PreviewText = previewText;
 
-            if (!string.IsNullOrWhiteSpace(generatedTitle))
-                session.Title = generatedTitle;
+            // Title: prefer structured output title, then generatedTitle
+            var resolvedTitle = structuredOutput?.Title ?? generatedTitle;
+            if (!string.IsNullOrWhiteSpace(resolvedTitle))
+                session.Title = resolvedTitle;
+
+            // Save structured LLM output
+            if (structuredOutput != null)
+            {
+                session.SummaryText = structuredOutput.Summary;
+                if (structuredOutput.ActionItems.Count > 0)
+                    session.ActionItemsJson = System.Text.Json.JsonSerializer.Serialize(structuredOutput.ActionItems);
+                if (structuredOutput.Decisions.Count > 0)
+                    session.DecisionsJson = System.Text.Json.JsonSerializer.Serialize(structuredOutput.Decisions);
+            }
 
             // Build speaker names JSON from current UI map
             if (_speakerNameMap.Count > 0)

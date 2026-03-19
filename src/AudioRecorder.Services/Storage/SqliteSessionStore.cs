@@ -79,14 +79,16 @@ public sealed class SqliteSessionStore : ISessionStore
         // Embedding column — added in v0.5; ALTER TABLE is idempotent via catch
         // Stores a float32 BLOB (4 bytes × dim). Architecture is sqlite-vec-compatible
         // for future migration when dataset grows beyond in-memory threshold.
-        try
-        {
-            await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN embedding BLOB;");
-        }
-        catch (SqliteException)
-        {
-            // Column already exists — safe to ignore
-        }
+        try { await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN embedding BLOB;"); }
+        catch (SqliteException) { }
+
+        // Structured LLM output columns — added in v0.5
+        try { await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN summary_text TEXT;"); }
+        catch (SqliteException) { }
+        try { await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN action_items_json TEXT;"); }
+        catch (SqliteException) { }
+        try { await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN decisions_json TEXT;"); }
+        catch (SqliteException) { }
 
         // FTS5 virtual table for full-text search
         await ExecAsync(conn, """
@@ -135,10 +137,12 @@ public sealed class SqliteSessionStore : ISessionStore
         cmd.CommandText = """
             INSERT INTO sessions
                 (id, title, recorded_at, duration_sec, audio_path, transcript_path,
-                 state, speaker_names, outline_doc_id, outline_doc_url, preview_text, created_at)
+                 state, speaker_names, outline_doc_id, outline_doc_url, preview_text,
+                 summary_text, action_items_json, decisions_json, created_at)
             VALUES
                 ($id, $title, $recorded_at, $dur, $audio, $transcript,
-                 $state, $speakers, $outline, $outline_url, $preview, $created);
+                 $state, $speakers, $outline, $outline_url, $preview,
+                 $summary, $action_items, $decisions, $created);
             """;
         BindSession(cmd, session);
         await cmd.ExecuteNonQueryAsync();
@@ -156,16 +160,19 @@ public sealed class SqliteSessionStore : ISessionStore
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE sessions SET
-                title           = $title,
-                recorded_at     = $recorded_at,
-                duration_sec    = $dur,
-                audio_path      = $audio,
-                transcript_path = $transcript,
-                state           = $state,
-                speaker_names   = $speakers,
-                outline_doc_id  = $outline,
-                outline_doc_url = $outline_url,
-                preview_text    = $preview
+                title            = $title,
+                recorded_at      = $recorded_at,
+                duration_sec     = $dur,
+                audio_path       = $audio,
+                transcript_path  = $transcript,
+                state            = $state,
+                speaker_names    = $speakers,
+                outline_doc_id   = $outline,
+                outline_doc_url  = $outline_url,
+                preview_text     = $preview,
+                summary_text     = $summary,
+                action_items_json = $action_items,
+                decisions_json   = $decisions
             WHERE id = $id;
             """;
         BindSession(cmd, session);
@@ -321,6 +328,9 @@ public sealed class SqliteSessionStore : ISessionStore
         cmd.Parameters.AddWithValue("$outline", (object?)s.OutlineDocumentId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$outline_url", (object?)s.OutlineDocumentUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preview", (object?)s.PreviewText ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$summary", (object?)s.SummaryText ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$action_items", (object?)s.ActionItemsJson ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$decisions", (object?)s.DecisionsJson ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$created", s.CreatedAt.ToString("O"));
     }
 
@@ -337,6 +347,9 @@ public sealed class SqliteSessionStore : ISessionStore
         OutlineDocumentId = r.IsDBNull(r.GetOrdinal("outline_doc_id")) ? null : r.GetString(r.GetOrdinal("outline_doc_id")),
         OutlineDocumentUrl = r.IsDBNull(r.GetOrdinal("outline_doc_url")) ? null : r.GetString(r.GetOrdinal("outline_doc_url")),
         PreviewText = r.IsDBNull(r.GetOrdinal("preview_text")) ? null : r.GetString(r.GetOrdinal("preview_text")),
+        SummaryText = SafeGetString(r, "summary_text"),
+        ActionItemsJson = SafeGetString(r, "action_items_json"),
+        DecisionsJson = SafeGetString(r, "decisions_json"),
         CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at"))),
     };
 
@@ -368,6 +381,23 @@ public sealed class SqliteSessionStore : ISessionStore
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Safely reads a string column that may not exist in older DB schemas.
+    /// Returns null instead of throwing if column is absent.
+    /// </summary>
+    private static string? SafeGetString(SqliteDataReader r, string columnName)
+    {
+        try
+        {
+            var ord = r.GetOrdinal(columnName);
+            return r.IsDBNull(ord) ? null : r.GetString(ord);
+        }
+        catch (IndexOutOfRangeException)
+        {
+            return null;
+        }
     }
 
     /// <summary>

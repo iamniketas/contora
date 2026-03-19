@@ -10,6 +10,31 @@
     mc:Ignorable="d">
     <Page.Content>
         <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <!--  ── Update available banner ────────────────────────────────  -->
+            <InfoBar
+                x:Name="UpdateAvailableBanner"
+                Grid.Row="0"
+                IsOpen="False"
+                IsClosable="True"
+                Severity="Informational"
+                Title="Доступно обновление"
+                Message="">
+                <InfoBar.ActionButton>
+                    <Button
+                        x:Name="UpdateBannerInstallButton"
+                        Content="Обновить"
+                        Style="{StaticResource AccentButtonStyle}"
+                        Click="OnUpdateBannerInstallClicked" />
+                </InfoBar.ActionButton>
+            </InfoBar>
+
+            <!--  ── Main content ─────────────────────────────────────────────  -->
+            <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
 <ColumnDefinition x:Name="SettingsColumn" Width="280" />
 <ColumnDefinition Width="Auto" />
@@ -632,6 +657,107 @@
                         </Grid>
                     </PivotItem>
 
+                    <!--  ── Analysis tab ─────────────────────────────────────  -->
+                    <PivotItem Header="Analysis">
+                        <ScrollViewer Margin="0,12,0,0" VerticalScrollBarVisibility="Auto">
+                            <StackPanel Spacing="16">
+
+                                <!--  Empty hint  -->
+                                <TextBlock
+                                    x:Name="AnalysisEmptyHint"
+                                    Text="Откройте сессию из вкладки Sessions, чтобы увидеть AI-анализ."
+                                    FontSize="13"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap"
+                                    Visibility="Visible" />
+
+                                <!--  Summary section  -->
+                                <StackPanel
+                                    x:Name="AnalysisSummarySection"
+                                    Spacing="6"
+                                    Visibility="Collapsed">
+                                    <TextBlock
+                                        FontSize="13"
+                                        FontWeight="SemiBold"
+                                        Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                        Text="📝 Summary" />
+                                    <TextBlock
+                                        x:Name="AnalysisSummaryText"
+                                        FontSize="13"
+                                        TextWrapping="Wrap"
+                                        Text="" />
+                                </StackPanel>
+
+                                <!--  Action Items section  -->
+                                <StackPanel
+                                    x:Name="AnalysisActionItemsSection"
+                                    Spacing="6"
+                                    Visibility="Collapsed">
+                                    <TextBlock
+                                        FontSize="13"
+                                        FontWeight="SemiBold"
+                                        Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                        Text="✅ Action Items" />
+                                    <ItemsRepeater ItemsSource="{x:Bind AnalysisActionItems, Mode=OneWay}">
+                                        <ItemsRepeater.Layout>
+                                            <StackLayout Spacing="4" />
+                                        </ItemsRepeater.Layout>
+                                        <ItemsRepeater.ItemTemplate>
+                                            <DataTemplate x:DataType="x:String">
+                                                <Grid ColumnSpacing="8">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="*" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <CheckBox
+                                                        Grid.Column="0"
+                                                        IsEnabled="False"
+                                                        VerticalAlignment="Top"
+                                                        Margin="0,-4,0,0" />
+                                                    <TextBlock
+                                                        Grid.Column="1"
+                                                        Text="{x:Bind}"
+                                                        FontSize="13"
+                                                        TextWrapping="Wrap"
+                                                        VerticalAlignment="Center" />
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ItemsRepeater.ItemTemplate>
+                                    </ItemsRepeater>
+                                </StackPanel>
+
+                                <!--  Decisions section  -->
+                                <StackPanel
+                                    x:Name="AnalysisDecisionsSection"
+                                    Spacing="6"
+                                    Visibility="Collapsed">
+                                    <TextBlock
+                                        FontSize="13"
+                                        FontWeight="SemiBold"
+                                        Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                        Text="🟢 Decisions" />
+                                    <ItemsRepeater ItemsSource="{x:Bind AnalysisDecisions, Mode=OneWay}">
+                                        <ItemsRepeater.Layout>
+                                            <StackLayout Spacing="4" />
+                                        </ItemsRepeater.Layout>
+                                        <ItemsRepeater.ItemTemplate>
+                                            <DataTemplate x:DataType="x:String">
+                                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                                    <TextBlock Text="·" FontSize="13" VerticalAlignment="Top" Margin="0,1,0,0" />
+                                                    <TextBlock
+                                                        Text="{x:Bind}"
+                                                        FontSize="13"
+                                                        TextWrapping="Wrap" />
+                                                </StackPanel>
+                                            </DataTemplate>
+                                        </ItemsRepeater.ItemTemplate>
+                                    </ItemsRepeater>
+                                </StackPanel>
+
+                            </StackPanel>
+                        </ScrollViewer>
+                    </PivotItem>
+
                     <!--  ── Sessions tab ──────────────────────────────────────  -->
                     <PivotItem Header="Sessions">
                         <Grid RowSpacing="10" Margin="0,12,0,0">
@@ -774,6 +900,7 @@
 
                 </Pivot>
             </Border>
+            </Grid>
         </Grid>
     </Page.Content>
 </Page>

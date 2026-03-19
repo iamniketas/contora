@@ -42,17 +42,36 @@ public sealed class SessionPipelineService : ISessionPipelineService
         var outputDir = ResolveOutputDirectory(transcriptionPath);
         var masterPath = Path.Combine(outputDir, _options.MasterFileName);
         var backupPath = Path.Combine(outputDir, _options.BackupFileName);
-        var systemPrompt = await LoadSystemPromptAsync(ct);
-
-        // Title generation runs in parallel (best-effort, never throws)
-        var titleTask = _ollamaClient.GenerateTitleAsync(cleanedText, ct);
-
         try
         {
+            // Primary path: one structured request → title + summary + action items + decisions + risks
+            var structured = await _ollamaClient.GenerateStructuredAsync(cleanedText, ct);
+
+            if (structured != null)
+            {
+                var summaryText = structured.Summary ?? string.Empty;
+                await AppendSessionAsync(masterPath, BuildMarkdownFromStructured(structured), ct);
+                AppLogger.LogInfo($"Session pipeline: structured output appended to {masterPath}");
+
+                return new SessionPipelineResult(
+                    Success: true,
+                    CleanedText: cleanedText,
+                    SummaryText: summaryText,
+                    GeneratedTitle: structured.Title,
+                    TargetPath: masterPath,
+                    UsedBackup: false,
+                    ErrorMessage: null,
+                    StructuredOutput: structured);
+            }
+
+            // Structured failed (model doesn't support JSON mode) — fall back to free-form summary + title
+            AppLogger.LogWarning("Session pipeline: structured output failed, falling back to free-form summary");
+            var systemPrompt = await LoadSystemPromptAsync(ct);
+            var titleTask = _ollamaClient.GenerateTitleAsync(cleanedText, ct);
             var summary = await _ollamaClient.GenerateSummaryAsync(systemPrompt, cleanedText, ct);
             var generatedTitle = await titleTask;
             await AppendSessionAsync(masterPath, summary, ct);
-            AppLogger.LogInfo($"Session pipeline: summary appended to {masterPath}");
+            AppLogger.LogInfo($"Session pipeline: free-form summary appended to {masterPath}");
 
             return new SessionPipelineResult(
                 Success: true,
@@ -65,7 +84,6 @@ public sealed class SessionPipelineService : ISessionPipelineService
         }
         catch (Exception ex) when (IsOllamaUnavailable(ex))
         {
-            var generatedTitle = titleTask.IsCompletedSuccessfully ? titleTask.Result : null;
             AppLogger.LogWarning($"Session pipeline: Ollama unavailable. Fallback to backup. {ex.Message}");
             try
             {
@@ -74,7 +92,7 @@ public sealed class SessionPipelineService : ISessionPipelineService
                     Success: true,
                     CleanedText: cleanedText,
                     SummaryText: null,
-                    GeneratedTitle: generatedTitle,
+                    GeneratedTitle: null,
                     TargetPath: backupPath,
                     UsedBackup: true,
                     ErrorMessage: ex.Message);
@@ -142,6 +160,39 @@ public sealed class SessionPipelineService : ISessionPipelineService
         {
             return DefaultSystemPrompt;
         }
+    }
+
+    private static string BuildMarkdownFromStructured(AudioRecorder.Core.Models.StructuredSessionOutput s)
+    {
+        var sb = new System.Text.StringBuilder();
+        if (!string.IsNullOrWhiteSpace(s.Summary))
+        {
+            sb.AppendLine("### Summary");
+            sb.AppendLine(s.Summary);
+            sb.AppendLine();
+        }
+        if (s.ActionItems.Count > 0)
+        {
+            sb.AppendLine("### Action Items");
+            foreach (var item in s.ActionItems)
+                sb.AppendLine($"- [ ] {item}");
+            sb.AppendLine();
+        }
+        if (s.Decisions.Count > 0)
+        {
+            sb.AppendLine("### Decisions");
+            foreach (var d in s.Decisions)
+                sb.AppendLine($"- {d}");
+            sb.AppendLine();
+        }
+        if (s.Risks.Count > 0)
+        {
+            sb.AppendLine("### Risks");
+            foreach (var r in s.Risks)
+                sb.AppendLine($"- ⚠️ {r}");
+            sb.AppendLine();
+        }
+        return sb.ToString().TrimEnd();
     }
 
     private static async Task AppendSessionAsync(string path, string text, CancellationToken ct)
