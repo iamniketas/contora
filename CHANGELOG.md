@@ -5,6 +5,21 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-03-19
+
+### Added
+- **Structured AI analysis**: after transcription Ollama generates a structured JSON response with `title`, `summary`, `action_items`, `decisions`, and `risks`. Stored in the database and shown in a new **Analysis** tab alongside each session. Falls back to free-form summary if the model doesn't support JSON mode.
+- **Analysis tab**: new pivot tab in the right panel showing AI-generated Summary, Action Items (as interactive checkboxes), Decisions, and Risks sections per session.
+- **Configurable global hotkey**: Win+Shift+R (default) to start/stop recording without focusing the window. Hotkey can be changed in Settings → General by clicking the key capture field and pressing any combination. Resets to default with one click.
+- **Auto-update banner**: InfoBar at the top of the main page notifies when a new version is available via Velopack. Shows version number, download progress, and an Install button that applies the update on next restart.
+- **Session filter bar**: filter Sessions by state — All / Recorded / Transcribed / Exported — via a RadioButtons bar above the list.
+- **Session pagination**: sessions load 20 at a time; a "Load more" button appends the next page without losing scroll position.
+- **Copy transcript**: button in the Transcript tab header copies all segments as `[hh:mm:ss] Speaker: text` lines to the clipboard.
+- **Copy analysis**: button in the Analysis tab copies the full AI analysis (summary + action items + decisions + risks) as Markdown to the clipboard.
+
+### Changed
+- Session database schema extended with `summary_text`, `action_items_json`, `decisions_json` columns (backward-compatible — old databases are migrated automatically).
+
 ## [0.4.0] - 2026-03-18
 
 ### Added
