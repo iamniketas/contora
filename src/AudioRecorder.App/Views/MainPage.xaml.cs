@@ -255,6 +255,11 @@ public sealed partial class MainPage : Page
     public ObservableCollection<string> AnalysisDecisions { get; } = new();
     public ObservableCollection<string> AnalysisRisks { get; } = new();
 
+    // ── Sessions filter & pagination ────────────────────────────────────────
+    private SessionState? _activeStateFilter = null;
+    private const int SessionPageSize = 20;
+    private int _sessionPageCount = 1; // how many pages loaded so far
+
     public MainPage()
     {
         InitializeComponent();
@@ -1336,6 +1341,7 @@ public sealed partial class MainPage : Page
         Speakers.Clear();
         SpeakersPanel.Visibility = Visibility.Collapsed;
         SaveTranscriptionButton.Visibility = Visibility.Collapsed;
+        CopyTranscriptButton.Visibility = Visibility.Collapsed;
 
         UpdateTranscriptionAvailabilityUi();
     }
@@ -1517,6 +1523,7 @@ public sealed partial class MainPage : Page
 
         SpeakersPanel.Visibility = Speakers.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
         SaveTranscriptionButton.Visibility = Visibility.Visible;
+        CopyTranscriptButton.Visibility = Visibility.Visible;
         SetUnsavedChanges(false);
 
         return Task.CompletedTask;
@@ -1550,6 +1557,7 @@ public sealed partial class MainPage : Page
 
         SpeakersPanel.Visibility = Speakers.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
         SaveTranscriptionButton.Visibility = Visibility.Visible;
+        CopyTranscriptButton.Visibility = Visibility.Visible;
         SetUnsavedChanges(false);
 
         return Task.CompletedTask;
@@ -1749,6 +1757,77 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private void OnCopyTranscriptClicked(object sender, RoutedEventArgs e)
+    {
+        if (TranscriptionSegments.Count == 0) return;
+
+        var sb = new StringBuilder();
+        foreach (var segment in TranscriptionSegments)
+        {
+            var speakerName = _speakerNameMap.TryGetValue(segment.SpeakerId, out var name)
+                ? name
+                : segment.SpeakerName;
+
+            if (segment.Start != TimeSpan.Zero || segment.End != TimeSpan.Zero)
+            {
+                var startStr = $"{(int)segment.Start.TotalHours:00}:{segment.Start.Minutes:00}:{segment.Start.Seconds:00}";
+                sb.AppendLine($"[{startStr}] {speakerName}: {segment.Text}");
+            }
+            else
+            {
+                sb.AppendLine(segment.Text);
+            }
+        }
+
+        var dp = new Windows.ApplicationModel.DataTransfer.DataPackage();
+        dp.SetText(sb.ToString().TrimEnd());
+        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(dp);
+    }
+
+    private void OnCopyAnalysisClicked(object sender, RoutedEventArgs e)
+    {
+        var sb = new StringBuilder();
+
+        var summaryText = AnalysisSummaryText?.Text;
+        if (!string.IsNullOrWhiteSpace(summaryText))
+        {
+            sb.AppendLine("## Summary");
+            sb.AppendLine(summaryText);
+            sb.AppendLine();
+        }
+
+        if (AnalysisActionItems.Count > 0)
+        {
+            sb.AppendLine("## Action Items");
+            foreach (var item in AnalysisActionItems)
+                sb.AppendLine($"- [ ] {item}");
+            sb.AppendLine();
+        }
+
+        if (AnalysisDecisions.Count > 0)
+        {
+            sb.AppendLine("## Decisions");
+            foreach (var d in AnalysisDecisions)
+                sb.AppendLine($"- {d}");
+            sb.AppendLine();
+        }
+
+        if (AnalysisRisks.Count > 0)
+        {
+            sb.AppendLine("## Risks");
+            foreach (var r in AnalysisRisks)
+                sb.AppendLine($"- ⚠️ {r}");
+            sb.AppendLine();
+        }
+
+        var text = sb.ToString().TrimEnd();
+        if (string.IsNullOrWhiteSpace(text)) return;
+
+        var dp = new Windows.ApplicationModel.DataTransfer.DataPackage();
+        dp.SetText(text);
+        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(dp);
+    }
+
     private void OnTranscriptionProgressChanged(object? sender, TranscriptionProgress progress)
     {
         _dispatcherQueue.TryEnqueue(() =>
@@ -1832,17 +1911,41 @@ public sealed partial class MainPage : Page
 
     // ── Sessions UI ─────────────────────────────────────────────────────────
 
-    private async Task LoadSessionsAsync(string? query = null)
+    /// <param name="query">Search query (null = show all).</param>
+    /// <param name="resetPaging">True to reset to page 1; false to append next page.</param>
+    private async Task LoadSessionsAsync(string? query = null, bool resetPaging = true)
     {
         try
         {
-            var sessions = await _semanticSearch.SearchAsync(query);
+            if (resetPaging) _sessionPageCount = 1;
+
+            // Get all matching sessions (semantic search already limits to 200)
+            var all = await _semanticSearch.SearchAsync(query);
+
+            // Apply state filter client-side
+            IEnumerable<AudioRecorder.Core.Models.Session> filtered = _activeStateFilter.HasValue
+                ? all.Where(s => s.State == _activeStateFilter.Value)
+                : all;
+
+            var filteredList = filtered.ToList();
+            var pageLimit = SessionPageSize * _sessionPageCount;
+            var page = filteredList.Take(pageLimit).ToList();
+            var remaining = filteredList.Count - page.Count;
 
             _dispatcherQueue.TryEnqueue(() =>
             {
                 Sessions.Clear();
-                foreach (var s in sessions)
+                foreach (var s in page)
                     Sessions.Add(SessionViewModel.FromSession(s));
+
+                if (LoadMoreButton != null)
+                {
+                    LoadMoreButton.Visibility = remaining > 0
+                        ? Microsoft.UI.Xaml.Visibility.Visible
+                        : Microsoft.UI.Xaml.Visibility.Collapsed;
+                    if (LoadMoreText != null)
+                        LoadMoreText.Text = $"Ещё {remaining} сессий";
+                }
             });
         }
         catch (Exception ex)
@@ -1864,6 +1967,22 @@ public sealed partial class MainPage : Page
             _ = LoadSessionsAsync(q);
         };
         _searchDebounceTimer.Start();
+    }
+
+    private void OnSessionFilterChanged(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton rb) return;
+        var tag = rb.Tag?.ToString() ?? string.Empty;
+        _activeStateFilter = string.IsNullOrEmpty(tag)
+            ? null
+            : Enum.TryParse<SessionState>(tag, out var st) ? st : null;
+        _ = LoadSessionsAsync(SessionSearchBox?.Text);
+    }
+
+    private void OnLoadMoreClicked(object sender, RoutedEventArgs e)
+    {
+        _sessionPageCount++;
+        _ = LoadSessionsAsync(SessionSearchBox?.Text, resetPaging: false);
     }
 
     private async void OnSessionItemPointerPressed(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
