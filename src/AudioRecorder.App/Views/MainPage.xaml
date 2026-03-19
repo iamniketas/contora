@@ -514,6 +514,7 @@
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
                                 <TextBlock
                                     Grid.Column="0"
@@ -523,8 +524,18 @@
                                     VerticalAlignment="Center"
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                 <Button
-                                    x:Name="SaveTranscriptionButton"
+                                    x:Name="CopyTranscriptButton"
                                     Grid.Column="1"
+                                    Click="OnCopyTranscriptClicked"
+                                    Visibility="Collapsed"
+                                    Padding="8,4"
+                                    Margin="0,0,4,0"
+                                    ToolTipService.ToolTip="Copy transcript">
+                                    <FontIcon Glyph="&#xE8C8;" FontSize="14" />
+                                </Button>
+                                <Button
+                                    x:Name="SaveTranscriptionButton"
+                                    Grid.Column="2"
                                     Click="OnSaveTranscriptionClicked"
                                     Visibility="Collapsed"
                                     Padding="8,4"
@@ -676,11 +687,27 @@
                                     x:Name="AnalysisSummarySection"
                                     Spacing="6"
                                     Visibility="Collapsed">
-                                    <TextBlock
-                                        FontSize="13"
-                                        FontWeight="SemiBold"
-                                        Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
-                                        Text="📝 Summary" />
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock
+                                            Grid.Column="0"
+                                            FontSize="13"
+                                            FontWeight="SemiBold"
+                                            Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                            Text="📝 Summary"
+                                            VerticalAlignment="Center" />
+                                        <Button
+                                            x:Name="CopyAnalysisButton"
+                                            Grid.Column="1"
+                                            Click="OnCopyAnalysisClicked"
+                                            Padding="8,4"
+                                            ToolTipService.ToolTip="Copy full analysis">
+                                            <FontIcon Glyph="&#xE8C8;" FontSize="14" />
+                                        </Button>
+                                    </Grid>
                                     <TextBlock
                                         x:Name="AnalysisSummaryText"
                                         FontSize="13"
@@ -760,10 +787,12 @@
 
                     <!--  ── Sessions tab ──────────────────────────────────────  -->
                     <PivotItem Header="Sessions">
-                        <Grid RowSpacing="10" Margin="0,12,0,0">
+                        <Grid RowSpacing="8" Margin="0,12,0,0">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
 
                             <!--  Search box  -->
@@ -773,10 +802,43 @@
                                 PlaceholderText="Search sessions..."
                                 TextChanged="OnSessionSearchChanged" />
 
+                            <!--  Filter bar  -->
+                            <StackPanel
+                                Grid.Row="1"
+                                Orientation="Horizontal"
+                                Spacing="4">
+                                <RadioButton
+                                    x:Name="FilterAll"
+                                    GroupName="SessionFilter"
+                                    Content="All"
+                                    IsChecked="True"
+                                    Style="{StaticResource DefaultRadioButtonStyle}"
+                                    Checked="OnSessionFilterChanged"
+                                    Tag="" />
+                                <RadioButton
+                                    x:Name="FilterRecorded"
+                                    GroupName="SessionFilter"
+                                    Content="Recorded"
+                                    Checked="OnSessionFilterChanged"
+                                    Tag="Recorded" />
+                                <RadioButton
+                                    x:Name="FilterTranscribed"
+                                    GroupName="SessionFilter"
+                                    Content="Transcribed"
+                                    Checked="OnSessionFilterChanged"
+                                    Tag="Transcribed" />
+                                <RadioButton
+                                    x:Name="FilterExported"
+                                    GroupName="SessionFilter"
+                                    Content="Exported"
+                                    Checked="OnSessionFilterChanged"
+                                    Tag="Exported" />
+                            </StackPanel>
+
                             <!--  Sessions list  -->
                             <ListView
                                 x:Name="SessionsListView"
-                                Grid.Row="1"
+                                Grid.Row="2"
                                 ItemsSource="{x:Bind Sessions, Mode=OneWay}"
                                 SelectionMode="None">
                                 <ListView.ItemContainerStyle>
@@ -895,6 +957,22 @@
                                     </DataTemplate>
                                 </ListView.ItemTemplate>
                             </ListView>
+
+                            <!--  Load more  -->
+                            <Button
+                                x:Name="LoadMoreButton"
+                                Grid.Row="3"
+                                HorizontalAlignment="Stretch"
+                                Margin="0,4,0,0"
+                                Padding="0,8"
+                                Visibility="Collapsed"
+                                Click="OnLoadMoreClicked">
+                                <TextBlock
+                                    x:Name="LoadMoreText"
+                                    Text="Load more"
+                                    FontSize="12" />
+                            </Button>
+
                         </Grid>
                     </PivotItem>
 
