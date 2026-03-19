@@ -1813,28 +1813,54 @@ public sealed partial class MainPage : Page
 
     private async void OnSessionItemPointerPressed(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
-        if (sender is Border { Tag: SessionViewModel vm } && vm.TranscriptPath != null)
+        if (sender is not Border { Tag: SessionViewModel vm }) return;
+
+        try
         {
-            try
+            var session = await _sessionStore.GetAsync(vm.Id);
+            if (session is null)
             {
-                var session = await _sessionStore.GetAsync(vm.Id);
-                if (session is null) return;
+                AudioRecorder.Services.Logging.AppLogger.LogWarning($"Session {vm.Id} not found in DB");
+                return;
+            }
 
-                // Load transcript from file
-                if (session.TranscriptPath != null && File.Exists(session.TranscriptPath))
+            // Switch to Transcript tab unconditionally so the user sees something
+            RightPanelPivot.SelectedIndex = 0;
+
+            if (session.TranscriptPath == null)
+            {
+                var msg = session.State == AudioRecorder.Core.Models.SessionState.Transcribed
+                    ? "Путь к расшифровке не сохранён в базе данных. Возможно, сессия была создана до обновления."
+                    : $"Расшифровка ещё не готова.\nСтатус: {session.State}";
+                await new ContentDialog
                 {
-                    // Switch to Transcript tab and show the loaded data
-                    RightPanelPivot.SelectedIndex = 0;
-                    _lastTranscriptionPath = session.TranscriptPath;
+                    Title = "Нет расшифровки",
+                    Content = msg,
+                    CloseButtonText = "OK",
+                    XamlRoot = XamlRoot
+                }.ShowAsync();
+                return;
+            }
 
-                    // Parse the stored segments and display them
-                    await LoadTranscriptFromFileAsync(session);
-                }
-            }
-            catch (Exception ex)
+            if (!File.Exists(session.TranscriptPath))
             {
-                AudioRecorder.Services.Logging.AppLogger.LogError($"Failed to open session: {ex.Message}");
+                AudioRecorder.Services.Logging.AppLogger.LogWarning($"Transcript file missing: {session.TranscriptPath}");
+                await new ContentDialog
+                {
+                    Title = "Файл не найден",
+                    Content = $"Файл расшифровки не найден:\n{session.TranscriptPath}",
+                    CloseButtonText = "OK",
+                    XamlRoot = XamlRoot
+                }.ShowAsync();
+                return;
             }
+
+            _lastTranscriptionPath = session.TranscriptPath;
+            await LoadTranscriptFromFileAsync(session);
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogError($"Failed to open session: {ex.Message}");
         }
     }
 
