@@ -482,6 +482,74 @@
                                     Visibility="Collapsed" />
                             </StackPanel>
                         </Border>
+
+                        <!-- Global Hotkey card -->
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Global Hotkey" FontSize="14" FontWeight="Medium" />
+                                <TextBlock
+                                    Text="Хоткей для старта/остановки записи из любого приложения."
+                                    FontSize="12"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap" />
+
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        Grid.Column="0"
+                                        Text="Комбинация:"
+                                        VerticalAlignment="Center"
+                                        FontSize="13"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <Border
+                                        Grid.Column="1"
+                                        x:Name="HotkeyDisplayBorder"
+                                        Background="{ThemeResource ControlFillColorDefaultBrush}"
+                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="6"
+                                        Padding="10,6"
+                                        PointerPressed="OnHotkeyBorderPressed">
+                                        <TextBlock
+                                            x:Name="HotkeyDisplayText"
+                                            Text="Win + Shift + R"
+                                            FontSize="13"
+                                            FontFamily="Consolas"
+                                            FontWeight="SemiBold"
+                                            HorizontalAlignment="Center" />
+                                    </Border>
+                                    <Button
+                                        Grid.Column="2"
+                                        x:Name="HotkeyResetBtn"
+                                        Content="Reset"
+                                        Click="OnHotkeyResetClicked"
+                                        Padding="8,6" />
+                                </Grid>
+
+                                <TextBlock
+                                    x:Name="HotkeyHintText"
+                                    Text="Нажмите на поле и введите новую комбинацию клавиш"
+                                    FontSize="11"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap"
+                                    Visibility="Collapsed" />
+
+                                <TextBlock
+                                    x:Name="HotkeyStatusText"
+                                    FontSize="12"
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+
                     </StackPanel>
 
                     <!-- Integrations -->

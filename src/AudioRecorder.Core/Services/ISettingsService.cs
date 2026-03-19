@@ -38,4 +38,10 @@ public interface ISettingsService
 
     void SaveOutlineDefaultCollectionId(string collectionId);
     string? LoadOutlineDefaultCollectionId();
+
+    // ── Global Hotkey ────────────────────────────────────────────────────────
+
+    /// <summary>Human-readable hotkey string, e.g. "Win+Shift+R".</summary>
+    void SaveGlobalHotkey(string hotkeyString);
+    string LoadGlobalHotkey();
 }

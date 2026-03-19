@@ -10,5 +10,6 @@ public record SessionPipelineResult(
     string? GeneratedTitle,
     string TargetPath,
     bool UsedBackup,
-    string? ErrorMessage
+    string? ErrorMessage,
+    StructuredSessionOutput? StructuredOutput = null
 );

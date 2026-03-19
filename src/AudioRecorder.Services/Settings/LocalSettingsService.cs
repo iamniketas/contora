@@ -264,6 +264,19 @@ public class LocalSettingsService : ISettingsService
         return string.IsNullOrWhiteSpace(settings.OutlineDefaultCollectionId) ? null : settings.OutlineDefaultCollectionId;
     }
 
+    public void SaveGlobalHotkey(string hotkeyString)
+    {
+        var settings = LoadSettings();
+        settings.GlobalHotkey = string.IsNullOrWhiteSpace(hotkeyString) ? "Win+Shift+R" : hotkeyString.Trim();
+        SaveSettings(settings);
+    }
+
+    public string LoadGlobalHotkey()
+    {
+        var settings = LoadSettings();
+        return string.IsNullOrWhiteSpace(settings.GlobalHotkey) ? "Win+Shift+R" : settings.GlobalHotkey;
+    }
+
     private class AppSettings
     {
         public List<string> SelectedSourceIds { get; set; } = new();
@@ -275,6 +288,7 @@ public class LocalSettingsService : ISettingsService
         public string? OutlineBaseUrl { get; set; }
         public string? OutlineApiToken { get; set; }
         public string? OutlineDefaultCollectionId { get; set; }
+        public string GlobalHotkey { get; set; } = "Win+Shift+R";
     }
 
     private static string NormalizeWhisperModel(string? modelName)

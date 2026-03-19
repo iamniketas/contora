@@ -808,6 +808,11 @@ public sealed partial class SettingsWindow : Window
             ? $"Установлен: {_ffmpegInstaller.GetInstalledPath()}"
             : "Не установлен. FFmpeg нужен для импорта видео (~140 МБ).";
         DownloadFfmpegBtn.Visibility = ffmpegInstalled ? Visibility.Collapsed : Visibility.Visible;
+
+        // Hotkey display
+        HotkeyDisplayText.Text = _settingsService.LoadGlobalHotkey();
+        HotkeyStatusText.Text = string.Empty;
+        HotkeyHintText.Visibility = Visibility.Collapsed;
     }
 
     private void UpdateDeviceModeHint(string mode)
@@ -878,6 +883,78 @@ public sealed partial class SettingsWindow : Window
     private void OnCancelFfmpegClicked(object sender, RoutedEventArgs e)
     {
         _ffmpegDownloadCts?.Cancel();
+    }
+
+    // ─── Global Hotkey ───
+
+    private bool _isCapturingHotkey;
+
+    private void OnHotkeyBorderPressed(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        if (_isCapturingHotkey) return;
+        _isCapturingHotkey = true;
+        HotkeyDisplayText.Text = "Нажмите комбинацию...";
+        HotkeyHintText.Visibility = Visibility.Visible;
+        HotkeyStatusText.Text = string.Empty;
+
+        // Capture next KeyDown via root content
+        if (Content is UIElement root) root.KeyDown += OnCaptureHotkeyKeyDown;
+    }
+
+    private void OnCaptureHotkeyKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs e)
+    {
+        if (!_isCapturingHotkey) return;
+
+        // Skip modifier-only presses
+        var key = e.Key;
+        if (key is Windows.System.VirtualKey.Control or Windows.System.VirtualKey.Shift
+            or Windows.System.VirtualKey.Menu or Windows.System.VirtualKey.LeftWindows
+            or Windows.System.VirtualKey.RightWindows)
+            return;
+
+        if (Content is UIElement root2) root2.KeyDown -= OnCaptureHotkeyKeyDown;
+        _isCapturingHotkey = false;
+
+        // Build hotkey string from modifiers + key
+        var parts = new System.Collections.Generic.List<string>();
+        var coreWindow = Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread;
+        bool win = (coreWindow(Windows.System.VirtualKey.LeftWindows) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0
+                || (coreWindow(Windows.System.VirtualKey.RightWindows) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        bool ctrl = (coreWindow(Windows.System.VirtualKey.Control) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        bool shift = (coreWindow(Windows.System.VirtualKey.Shift) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        bool alt = (coreWindow(Windows.System.VirtualKey.Menu) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+
+        if (win) parts.Add("Win");
+        if (ctrl) parts.Add("Ctrl");
+        if (alt) parts.Add("Alt");
+        if (shift) parts.Add("Shift");
+        parts.Add(key.ToString());
+
+        var hotkeyString = string.Join("+", parts);
+        HotkeyDisplayText.Text = hotkeyString;
+        HotkeyHintText.Visibility = Visibility.Collapsed;
+
+        _settingsService.SaveGlobalHotkey(hotkeyString);
+        HotkeyStatusText.Text = $"✓ Сохранено. Перезапустите приложение, чтобы применить новый хоткей.";
+        HotkeyStatusText.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+            Windows.UI.Color.FromArgb(255, 60, 160, 80));
+
+        e.Handled = true;
+    }
+
+    private void OnHotkeyResetClicked(object sender, RoutedEventArgs e)
+    {
+        if (_isCapturingHotkey)
+        {
+            if (Content is UIElement root2) root2.KeyDown -= OnCaptureHotkeyKeyDown;
+            _isCapturingHotkey = false;
+        }
+        _settingsService.SaveGlobalHotkey("Win+Shift+R");
+        HotkeyDisplayText.Text = "Win + Shift + R";
+        HotkeyHintText.Visibility = Visibility.Collapsed;
+        HotkeyStatusText.Text = "✓ Сброшено на Win + Shift + R. Перезапустите приложение.";
+        HotkeyStatusText.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+            Windows.UI.Color.FromArgb(255, 60, 160, 80));
     }
 
     // ─── Integrations (Outline) ───

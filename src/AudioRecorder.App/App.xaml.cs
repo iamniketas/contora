@@ -210,16 +210,50 @@ namespace AudioRecorder
                 _oldWndProc = (nint)GetWindowLongW(hWnd, GWLP_WNDPROC);
                 SetWindowLongW(hWnd, GWLP_WNDPROC, (int)newProc);
 
-                if (!RegisterHotKey(hWnd, HOTKEY_ID_TOGGLE, MOD_WIN | MOD_SHIFT, VK_R))
+                var hotkeyStr = new AudioRecorder.Services.Settings.LocalSettingsService().LoadGlobalHotkey();
+                var (mods, vk) = ParseHotkeyString(hotkeyStr);
+
+                if (!RegisterHotKey(hWnd, HOTKEY_ID_TOGGLE, mods, vk))
                     AudioRecorder.Services.Logging.AppLogger.LogWarning(
-                        $"RegisterHotKey Win+Shift+R failed (error {Marshal.GetLastWin32Error()})");
+                        $"RegisterHotKey '{hotkeyStr}' failed (error {Marshal.GetLastWin32Error()})");
                 else
-                    AudioRecorder.Services.Logging.AppLogger.LogInfo("Global hotkey Win+Shift+R registered");
+                    AudioRecorder.Services.Logging.AppLogger.LogInfo($"Global hotkey registered: {hotkeyStr}");
             }
             catch (Exception ex)
             {
                 AudioRecorder.Services.Logging.AppLogger.LogError($"RegisterGlobalHotkey: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Parses "Win+Shift+R" → (MOD_WIN|MOD_SHIFT, VK_R). Falls back to Win+Shift+R on error.
+        /// </summary>
+        private static (uint mods, uint vk) ParseHotkeyString(string hotkeyString)
+        {
+            const uint defaultMods = MOD_WIN | MOD_SHIFT;
+            const uint defaultVk = VK_R;
+            if (string.IsNullOrWhiteSpace(hotkeyString)) return (defaultMods, defaultVk);
+
+            uint mods = 0, vk = 0;
+            foreach (var part in hotkeyString.Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            {
+                switch (part.ToUpperInvariant())
+                {
+                    case "WIN":     mods |= MOD_WIN;   break;
+                    case "CTRL":
+                    case "CONTROL": mods |= 0x0002;    break;
+                    case "ALT":     mods |= 0x0001;    break;
+                    case "SHIFT":   mods |= MOD_SHIFT; break;
+                    default:
+                        if (part.Length == 1 && char.IsLetter(part[0]))
+                            vk = (uint)char.ToUpperInvariant(part[0]);
+                        else if (part.Length >= 2 && part[0] == 'F' &&
+                                 uint.TryParse(part[1..], out var fn) && fn is >= 1 and <= 12)
+                            vk = 0x6F + fn; // VK_F1=0x70
+                        break;
+                }
+            }
+            return (mods == 0 || vk == 0) ? (defaultMods, defaultVk) : (mods, vk);
         }
 
         private nint HotkeyWndProc(nint hWnd, uint msg, nint wParam, nint lParam)

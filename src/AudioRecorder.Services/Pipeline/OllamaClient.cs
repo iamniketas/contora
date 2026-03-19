@@ -1,4 +1,6 @@
+using AudioRecorder.Core.Models;
 using System.Net.Http.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace AudioRecorder.Services.Pipeline;
@@ -20,6 +22,20 @@ public sealed class OllamaClient
     private const string TitleSystemPrompt =
         "Придумай короткое название (3–7 слов) для этой записи разговора. " +
         "Только название, без кавычек, без пунктуации в конце.";
+
+    private const string StructuredSystemPrompt = """
+        Analyze the following conversation transcript and respond ONLY with valid JSON.
+        Use the SAME language as the transcript (Russian or English).
+        Required JSON format — do not add any text outside the JSON:
+        {
+          "title": "3-7 word short title of the conversation",
+          "summary": "2-3 sentence summary of key points discussed",
+          "action_items": ["concrete action 1", "concrete action 2"],
+          "decisions": ["decision made 1", "decision made 2"],
+          "risks": ["risk or concern 1"]
+        }
+        Rules: be concise; use empty arrays [] when nothing found; no markdown formatting inside strings.
+        """;
 
     /// <summary>
     /// Generates a short title for the session. Returns null on any error — best-effort only.
@@ -43,6 +59,42 @@ public sealed class OllamaClient
                 return null;
             var title = payload.Response.Trim().TrimEnd('.', '!', '?').Trim();
             return title.Length > 80 ? title[..80] : title;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Sends one structured request to Ollama and returns parsed <see cref="StructuredSessionOutput"/>.
+    /// Returns null on any error — best-effort only.
+    /// </summary>
+    public async Task<StructuredSessionOutput?> GenerateStructuredAsync(string cleanedText, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(cleanedText)) return null;
+        // Use up to 4000 chars — enough context without overloading small models
+        var excerpt = cleanedText.Length > 4000 ? cleanedText[..4000] : cleanedText;
+        try
+        {
+            var request = new OllamaGenerateRequest
+            {
+                Model = _options.Model,
+                System = StructuredSystemPrompt,
+                Prompt = excerpt,
+                Stream = false,
+                Format = "json",
+            };
+            using var response = await _httpClient.PostAsJsonAsync(_options.OllamaUrl, request, ct);
+            var payload = await response.Content.ReadFromJsonAsync<OllamaGenerateResponse>(cancellationToken: ct);
+            if (!response.IsSuccessStatusCode || payload == null || string.IsNullOrWhiteSpace(payload.Response))
+                return null;
+
+            var json = payload.Response.Trim();
+            // Strip markdown code fences if model wrapped JSON anyway
+            if (json.StartsWith("```")) json = json.Split('\n', 2)[1].TrimEnd('`').Trim();
+            var output = JsonSerializer.Deserialize<StructuredSessionOutput>(json);
+            return output;
         }
         catch
         {
@@ -92,6 +144,11 @@ public sealed class OllamaGenerateRequest
 
     [JsonPropertyName("stream")]
     public bool Stream { get; init; }
+
+    /// <summary>Set to "json" to force JSON output mode.</summary>
+    [JsonPropertyName("format")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Format { get; init; }
 }
 
 public sealed class OllamaGenerateResponse

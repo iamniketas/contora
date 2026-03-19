@@ -30,5 +30,14 @@ public sealed class Session
     /// <summary>First ~300 chars of the transcript for list preview.</summary>
     public string? PreviewText { get; set; }
 
+    /// <summary>LLM-generated summary paragraph.</summary>
+    public string? SummaryText { get; set; }
+
+    /// <summary>JSON array of action items extracted by LLM (e.g. ["Do X", "Check Y"]).</summary>
+    public string? ActionItemsJson { get; set; }
+
+    /// <summary>JSON array of decisions extracted by LLM.</summary>
+    public string? DecisionsJson { get; set; }
+
     public DateTime CreatedAt { get; set; } = DateTime.Now;
 }
