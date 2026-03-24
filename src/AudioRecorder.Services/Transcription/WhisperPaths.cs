@@ -1,7 +1,10 @@
-﻿namespace AudioRecorder.Services.Transcription;
+using System.Runtime.InteropServices;
+
+namespace AudioRecorder.Services.Transcription;
 
 public static class WhisperPaths
 {
+    public const string EnvSharedRuntimeRoot = "NIKETAS_SHARED_RUNTIME_ROOT";
     public const string EnvWhisperExe = "CONTORA_WHISPER_EXE";
     public const string EnvWhisperRoot = "CONTORA_WHISPER_ROOT";
     public const string EnvWhisperModelsRoot = "CONTORA_WHISPER_MODELS_DIR";
@@ -38,31 +41,40 @@ public static class WhisperPaths
             return legacyCanonicalPath;
 
         var exeDir = AppContext.BaseDirectory;
-        var toolsPath = Path.Combine(exeDir, "tools", "faster-whisper-xxl", "faster-whisper-xxl.exe");
+        var toolsPath = Path.Combine(exeDir, "tools", "faster-whisper-xxl", GetWhisperExecutableFileName());
         if (File.Exists(toolsPath))
             return toolsPath;
 
         var projectRoot = FindProjectRoot(exeDir);
         if (projectRoot != null)
         {
-            toolsPath = Path.Combine(projectRoot, "tools", "faster-whisper-xxl", "faster-whisper-xxl.exe");
+            toolsPath = Path.Combine(projectRoot, "tools", "faster-whisper-xxl", GetWhisperExecutableFileName());
             if (File.Exists(toolsPath))
                 return toolsPath;
         }
 
-        // 3) Fallback: canonical runtime path in LocalAppData.
         return canonicalPath;
     }
 
     public static string GetCanonicalRuntimeRoot()
     {
-        var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        return Path.Combine(appDataPath, "Contora", "runtime", RuntimeFolderName);
+        var sharedRoot = Environment.GetEnvironmentVariable(EnvSharedRuntimeRoot);
+        if (!string.IsNullOrWhiteSpace(sharedRoot))
+            return Path.Combine(sharedRoot, RuntimeFolderName);
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            return Path.Combine(appDataPath, "Contora", "runtime", RuntimeFolderName);
+        }
+
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return Path.Combine(userProfile, "Library", "Application Support", "NiketasAI", "runtime", RuntimeFolderName);
     }
 
     public static string GetCanonicalWhisperPath()
     {
-        return Path.Combine(GetCanonicalRuntimeRoot(), "faster-whisper-xxl.exe");
+        return Path.Combine(GetCanonicalRuntimeRoot(), GetWhisperExecutableFileName());
     }
 
     public static string GetModelsRoot(string whisperPath)
@@ -149,6 +161,9 @@ public static class WhisperPaths
 
     private static string GetLegacyCanonicalWhisperPath()
     {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            return string.Empty;
+
         var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         return Path.Combine(appDataPath, "AudioRecorder", "runtime", RuntimeFolderName, "faster-whisper-xxl.exe");
     }
@@ -168,7 +183,6 @@ public static class WhisperPaths
         if (!string.IsNullOrWhiteSpace(explicitShared))
             return explicitShared;
 
-        // Read from shared config if available
         var configPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "SharedWhisperModels", "config.json");
@@ -187,7 +201,7 @@ public static class WhisperPaths
             }
             catch
             {
-                // Ignore config read errors
+                // Ignore config read errors.
             }
         }
 
@@ -196,9 +210,7 @@ public static class WhisperPaths
         {
             var modelPath = dictatorModelPath.Trim();
             if (Directory.Exists(modelPath))
-            {
                 return Path.GetDirectoryName(modelPath) ?? modelPath;
-            }
         }
 
         var probes = new[]
@@ -215,5 +227,12 @@ public static class WhisperPaths
 
         var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         return Path.Combine(appDataPath, "SharedWhisperModels");
+    }
+
+    private static string GetWhisperExecutableFileName()
+    {
+        return RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? "faster-whisper-xxl.exe"
+            : "faster-whisper-xxl";
     }
 }

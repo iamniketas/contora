@@ -54,6 +54,8 @@ packages/
 *.vspscc
 *.vssscc
 .builds
+.build/
+**/.build/
 *.pidb
 *.svclog
 *.scc

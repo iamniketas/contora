@@ -103,6 +103,22 @@ Key messages:
 - **Your private intelligence agency.**
 - **Free, Local, Unstoppable.**
 
+## macOS (в разработке)
+
+- Базовый нативный skeleton: `apps/macos` (SwiftUI + AppKit).
+- Foundation для системного захвата аудио через `ScreenCaptureKit`.
+- MVP-запись на macOS: выбор источника (`System` / `Mic` / `System+Mic`) и сохранение WAV.
+- Общая стратегия shared runtime для моделей между Contora и Dictator:
+  `docs/SHARED_RUNTIME_STRATEGY.md`.
+- Детали по системному аудиозахвату: `docs/MACOS_AUDIO_CAPTURE_ARCHITECTURE.md`.
+- План общего локального сервера транскрибации: `docs/LOCAL_TRANSCRIPTION_SERVER_PLAN.md`.
+- Interop-конфигурация общего сервера между приложениями:
+  `docs/SHARED_TRANSCRIPTION_SERVER_INTEROP.md`.
+- Обновленный roadmap macOS на базе текущей Windows-версии:
+  `docs/MACOS_ROADMAP_2026_03.md`.
+- Разбор полезных продуктовых паттернов из OpenOats:
+  `docs/OPENOATS_REVIEW_2026_03.md`.
+
 ## Legal
 
 Use recording features only in compliance with laws in your jurisdiction.  
