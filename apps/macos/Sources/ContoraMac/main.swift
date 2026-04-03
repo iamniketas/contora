@@ -1248,7 +1248,7 @@ final class AppModel: ObservableObject {
 
     @Published var isRecording = false
     @Published var captureSourceMode: CaptureSourceMode = .mixed
-    @Published var transcriptionEnabled = false
+    @Published var transcriptionEnabled = true
     @Published var streamingEnabled = false
     @Published var launchAtLogin = false
     @Published var chunkSeconds = 8
@@ -1368,6 +1368,43 @@ final class AppModel: ObservableObject {
             sharedServerConfigStatus = "Saved"
         } catch {
             sharedServerConfigStatus = "Save failed: \(error.localizedDescription)"
+        }
+    }
+
+    func retranscribeSession(_ session: ContoraSession) {
+        guard !isRecording, !isTranscribing, !isFinalizingStop else { return }
+
+        isFinalizingStop = true
+        statusMessage = "Loading audio..."
+        postStopStartedAt = Date()
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try audioFileImportService.importAudioFile(from: session.recordingURL)
+                await MainActor.run {
+                    self.lastAudioDurationSeconds = result.durationSeconds
+                    self.lastCaptureSamples = result.samples16kMono.count
+                    self.currentRecordingFileURL = session.recordingURL
+                    self.currentSessionIdentity = RecordingArchiveService.SessionIdentity(
+                        sessionID: session.id,
+                        title: session.title,
+                        createdAt: session.createdAt
+                    )
+                    self.statusMessage = "Transcribing \(session.title)..."
+                    self.runTranscription(
+                        samples16k: result.samples16kMono,
+                        audioDurationSeconds: result.durationSeconds,
+                        mode: .normal
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    self.isFinalizingStop = false
+                    self.statusMessage = "Failed to load audio"
+                    self.lastTranscript = "Error loading audio: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -2874,6 +2911,15 @@ struct SessionDetailView: View {
                     Button("Reveal in Finder") {
                         model.revealSession(session)
                     }
+
+                    let isBusy = model.isTranscribing || model.isFinalizingStop
+                    let hasTranscript = session.transcriptURL != nil
+                    Button(hasTranscript ? "Re-transcribe" : "Transcribe") {
+                        model.retranscribeSession(session)
+                    }
+                    .disabled(isBusy)
+                    .buttonStyle(.borderedProminent)
+
                     Spacer()
                     Button("Save Changes") {
                         model.saveSelectedSessionEdits()
