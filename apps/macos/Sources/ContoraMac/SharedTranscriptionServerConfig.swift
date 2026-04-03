@@ -14,6 +14,11 @@ enum TranscriptionBackend: String, CaseIterable, Identifiable, Codable {
             return "MLX OpenAI HTTP"
         }
     }
+
+    init(from decoder: Decoder) throws {
+        let rawValue = try decoder.singleValueContainer().decode(String.self)
+        self = TranscriptionBackend(rawValue: rawValue) ?? .mlxOpenAIHTTP
+    }
 }
 
 struct SharedTranscriptionServerConfig: Codable {
@@ -29,7 +34,7 @@ struct SharedTranscriptionServerConfig: Codable {
             schemaVersion: "1.0",
             activeBackend: .mlxOpenAIHTTP,
             whisperTranscribeURL: "http://127.0.0.1:5500/transcribe",
-            mlxTranscribeURL: "http://127.0.0.1:8000/v1/audio/transcriptions",
+            mlxTranscribeURL: "http://127.0.0.1:8010/v1/audio/transcriptions",
             mlxModelID: "mlx-community/whisper-large-v3-turbo-asr-fp16",
             updatedAt: ISO8601DateFormatter().string(from: Date())
         )
