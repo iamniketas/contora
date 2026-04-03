@@ -1326,8 +1326,12 @@ final class AppModel: ObservableObject {
     }
 
     private func autoStartMLXServerIfNeeded() {
-        guard transcriptionBackend == .mlxOpenAIHTTP else { return }
-        startSharedMLXToolkitServer()
+        guard transcriptionBackend == .mlxOpenAIHTTP,
+              let toolkit = sharedMLXToolkitService.discoverToolkit() else { return }
+        let service = sharedMLXToolkitService
+        Task.detached(priority: .background) {
+            _ = try? service.runScript(at: toolkit.startScriptURL)
+        }
     }
 
     var selectedSession: ContoraSession? {
