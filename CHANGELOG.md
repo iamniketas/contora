@@ -5,6 +5,21 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-05-04
+
+### Added
+- **Audio device hot-plug**: the device list now updates automatically when headphones/microphones are connected or disconnected (Windows MMDevice notifications, 1-second debounce). No restart needed.
+- **Outline collection picker**: a dialog asks which collection to publish to on every new export. Pre-selects the default from Settings.
+- **Self-contained installer**: the Setup.exe now bundles Windows App Runtime (WinAppSDK) — users no longer need to install it separately.
+
+### Fixed
+- **App opens on launch instead of hiding to tray** — window shows immediately on startup; hides to tray only when closed or minimized.
+- **Segment playback no longer loops** — clicking a timestamp plays the segment once and stops. Click again to replay.
+- **Speaker name edits propagate instantly** — renaming a speaker updates all transcript segments in real time.
+- **Outline "Open in browser" links work** — Outline API returns relative paths (`/doc/…`); now converted to full absolute URLs.
+- **Audio device selection saved on change** — previously saved only when recording started.
+- **Startup NRE eliminated** — RadioButton Checked event fired before session store was ready.
+
 ## [0.5.0] - 2026-03-19
 
 ### Added

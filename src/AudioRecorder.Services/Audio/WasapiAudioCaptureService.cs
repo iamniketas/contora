@@ -2,6 +2,7 @@ using AudioRecorder.Core.Models;
 using AudioRecorder.Core.Services;
 using AudioRecorder.Services.Logging;
 using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using System.Diagnostics;
@@ -12,7 +13,7 @@ namespace AudioRecorder.Services.Audio;
 /// Надёжная реализация захвата аудио через WASAPI.
 /// Поддерживает множественные источники с правильной синхронизацией.
 /// </summary>
-public class WasapiAudioCaptureService : IAudioCaptureService, IDisposable
+public class WasapiAudioCaptureService : IAudioCaptureService, IMMNotificationClient, IDisposable
 {
     private readonly object _lock = new();
     private readonly List<IWaveIn> _captures = new();
@@ -24,15 +25,38 @@ public class WasapiAudioCaptureService : IAudioCaptureService, IDisposable
     private readonly Stopwatch _stopwatch = new();
     private RecordingInfo _currentInfo;
     private volatile bool _isPaused;
+    private readonly MMDeviceEnumerator _deviceEnumerator;
+    private DateTime _lastDeviceEventTime = DateTime.MinValue;
 
     // Выходной формат: 48kHz, 16-bit, stereo (стандарт для качественного аудио)
     private readonly WaveFormat _outputFormat = new(48000, 16, 2);
 
     public event EventHandler<RecordingInfo>? RecordingStateChanged;
+    public event EventHandler? DeviceListChanged;
 
     public WasapiAudioCaptureService()
     {
         _currentInfo = new RecordingInfo(RecordingState.Stopped, TimeSpan.Zero, 0);
+        _deviceEnumerator = new MMDeviceEnumerator();
+        _deviceEnumerator.RegisterEndpointNotificationCallback(this);
+    }
+
+    // ── IMMNotificationClient — device change notifications ─────────────────
+
+    void IMMNotificationClient.OnDeviceAdded(string pwstrDeviceId) => FireDeviceListChanged();
+    void IMMNotificationClient.OnDeviceRemoved(string deviceId) => FireDeviceListChanged();
+    void IMMNotificationClient.OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId) => FireDeviceListChanged();
+    void IMMNotificationClient.OnDeviceStateChanged(string deviceId, NAudio.CoreAudioApi.DeviceState newState) => FireDeviceListChanged();
+    void IMMNotificationClient.OnPropertyValueChanged(string pwstrDeviceId, NAudio.CoreAudioApi.PropertyKey key) { }
+
+    private void FireDeviceListChanged()
+    {
+        // Debounce: ignore events that arrive within 1 second of each other
+        var now = DateTime.UtcNow;
+        if ((now - _lastDeviceEventTime).TotalSeconds < 1.0)
+            return;
+        _lastDeviceEventTime = now;
+        DeviceListChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public Task<IReadOnlyList<AudioSource>> GetAvailableSourcesAsync()
@@ -381,6 +405,8 @@ public class WasapiAudioCaptureService : IAudioCaptureService, IDisposable
     {
         _cts?.Cancel();
         Cleanup();
+        try { _deviceEnumerator.UnregisterEndpointNotificationCallback(this); } catch { }
+        _deviceEnumerator.Dispose();
         GC.SuppressFinalize(this);
     }
 }

@@ -66,6 +66,26 @@ public sealed class OutlineService : IOutlineService
         return await PostAsync("documents.update", body, ct);
     }
 
+    public async Task<OutlineDocumentResult> UpdateDocumentAsync(
+        string documentId,
+        string title,
+        string text,
+        CancellationToken ct = default)
+    {
+        if (!IsConfigured)
+            return Fail("Outline not configured");
+
+        var body = new
+        {
+            id = documentId,
+            title,
+            text,
+            publish = _settings.AutoPublish,
+        };
+
+        return await PostAsync("documents.update", body, ct);
+    }
+
     // ── Private ─────────────────────────────────────────────────────────────
 
     private async Task<OutlineDocumentResult> PostAsync(string endpoint, object body, CancellationToken ct)
@@ -97,6 +117,10 @@ public sealed class OutlineService : IOutlineService
 
             var id = data.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
             var docUrl = data.TryGetProperty("url", out var urlEl) ? urlEl.GetString() : null;
+
+            // Outline returns relative paths like /doc/... — make them absolute
+            if (docUrl != null && docUrl.StartsWith('/'))
+                docUrl = baseUrl + docUrl;
 
             AppLogger.LogInfo($"Outline {endpoint}: doc {id} — {docUrl}");
             return new OutlineDocumentResult { Success = true, DocumentId = id, DocumentUrl = docUrl };

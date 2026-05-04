@@ -43,4 +43,9 @@ public interface IAudioCaptureService
     /// Событие изменения состояния записи
     /// </summary>
     event EventHandler<RecordingInfo>? RecordingStateChanged;
+
+    /// <summary>
+    /// Fires when the OS audio device list changes (device added, removed, or default changed).
+    /// </summary>
+    event EventHandler? DeviceListChanged;
 }

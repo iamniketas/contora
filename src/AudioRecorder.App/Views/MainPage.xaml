@@ -515,6 +515,7 @@
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
                                 <TextBlock
                                     Grid.Column="0"
@@ -539,6 +540,7 @@
                                     Click="OnSaveTranscriptionClicked"
                                     Visibility="Collapsed"
                                     Padding="8,4"
+                                    Margin="0,0,4,0"
                                     ToolTipService.ToolTip="Save changes">
                                     <StackPanel Orientation="Horizontal" Spacing="6">
                                         <Ellipse
@@ -551,6 +553,15 @@
                                             Glyph="&#xE74E;"
                                             FontSize="14" />
                                     </StackPanel>
+                                </Button>
+                                <Button
+                                    x:Name="ExportToOutlineButton"
+                                    Grid.Column="3"
+                                    Click="OnExportToOutlineClicked"
+                                    Visibility="Collapsed"
+                                    Padding="8,4"
+                                    ToolTipService.ToolTip="Export to Outline">
+                                    <FontIcon Glyph="&#xE898;" FontSize="14" />
                                 </Button>
                             </Grid>
 

@@ -251,6 +251,8 @@ Invoke-External -Command @(
     "-c", $Configuration,
     "-r", $Runtime,
     "-p:WindowsPackageType=None",
+    "-p:WindowsAppSDKSelfContained=true",
+    "-p:PublishTrimmed=false",
     "-o", $publishDir
 ) -Dry:$DryRun
 

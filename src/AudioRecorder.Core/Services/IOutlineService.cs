@@ -24,6 +24,15 @@ public interface IOutlineService
         CancellationToken ct = default);
 
     /// <summary>
+    /// Replaces the full content of an existing Outline document (title + body).
+    /// </summary>
+    Task<OutlineDocumentResult> UpdateDocumentAsync(
+        string documentId,
+        string title,
+        string text,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Returns all collections the authenticated user can publish to.
     /// </summary>
     Task<OutlineCollectionsResult> GetCollectionsAsync(CancellationToken ct = default);

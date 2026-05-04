@@ -10,6 +10,15 @@
         <EnableMsixTooling>true</EnableMsixTooling>
         <WindowsPackageType>None</WindowsPackageType>
 
+        <!--
+            Bundle Windows App Runtime into the published output.
+            Users do NOT need to install Windows App Runtime separately.
+            Only active when publishing with a RuntimeIdentifier (dotnet publish -r win-x64).
+            Trimming is incompatible with WindowsAppSDKSelfContained (MS limitation).
+        -->
+        <WindowsAppSDKSelfContained Condition="'$(RuntimeIdentifier)' != ''">true</WindowsAppSDKSelfContained>
+        <PublishTrimmed>false</PublishTrimmed>
+
         <!-- Project Options -->
         <Nullable>enable</Nullable>
 
@@ -19,7 +28,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <RootNamespace>AudioRecorder</RootNamespace>
         <AssemblyName>Contora</AssemblyName>
-        <Version>0.4.0</Version>
+        <Version>0.5.1</Version>
         <ApplicationIcon>Assets\Contora.ico</ApplicationIcon>
         <Product>Contora</Product>
         <FileDescription>Contora</FileDescription>

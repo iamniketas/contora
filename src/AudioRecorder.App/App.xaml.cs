@@ -27,6 +27,7 @@ namespace AudioRecorder
         private Forms.ToolStripMenuItem? _togglePauseMenuItem;
 
         private bool _isExitRequested;
+        private bool _windowReady;
         private nint _smallTitleBarIcon;
         private nint _bigTitleBarIcon;
 
@@ -103,7 +104,11 @@ namespace AudioRecorder
             InitializeTrayIcon();
 
             window.Activate();
-            _dispatcherQueue.TryEnqueue(() => ApplyWindowIcon(window));
+            _dispatcherQueue.TryEnqueue(() =>
+            {
+                ApplyWindowIcon(window);
+                _windowReady = true;
+            });
         }
 
         private static string BuildWindowTitle()
@@ -280,6 +285,8 @@ namespace AudioRecorder
 
         private void OnAppWindowChanged(AppWindow sender, AppWindowChangedEventArgs args)
         {
+            if (!_windowReady) return;
+            if (!args.DidPresenterChange) return;
             if (_appWindow?.Presenter is OverlappedPresenter presenter && presenter.State == OverlappedPresenterState.Minimized)
             {
                 HideToTray();

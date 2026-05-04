@@ -266,6 +266,7 @@ public sealed partial class MainPage : Page
 
         _audioCaptureService = new WasapiAudioCaptureService();
         _audioCaptureService.RecordingStateChanged += OnRecordingStateChanged;
+        _audioCaptureService.DeviceListChanged += OnAudioDeviceListChanged;
 
         _settingsService = new LocalSettingsService();
         _transcriptionMode = _settingsService.LoadTranscriptionMode();
@@ -1093,6 +1094,7 @@ public sealed partial class MainPage : Page
         }
         catch (Exception ex)
         {
+            AudioRecorder.Services.Logging.AppLogger.LogError($"LoadAudioSourcesAsync failed: {ex.Message}");
             await ShowErrorDialogAsync($"Failed to load devices: {ex.Message}");
         }
     }
@@ -1100,6 +1102,20 @@ public sealed partial class MainPage : Page
     private void OnSourceSelectionChanged(object sender, RoutedEventArgs e)
     {
         UpdateStartButtonState();
+        var selected = OutputSources.Concat(InputSources).Where(s => s.IsSelected).Select(s => s.Source.Id);
+        _settingsService.SaveSelectedSourceIds(selected);
+    }
+
+    private void OnAudioDeviceListChanged(object? sender, EventArgs e)
+    {
+        // Invoked on a background thread by IMMNotificationClient — marshal to UI thread
+        _dispatcherQueue?.TryEnqueue(async () =>
+        {
+            // Don't disrupt an active recording
+            if (_audioCaptureService.GetCurrentRecordingInfo().State != RecordingState.Stopped)
+                return;
+            await LoadAudioSourcesAsync();
+        });
     }
 
     private void UpdateStartButtonState()
@@ -1278,6 +1294,9 @@ public sealed partial class MainPage : Page
         {
             try
             {
+                // Importing a new file — detach from any previously recorded session
+                _currentSessionId = null;
+
                 if (AudioConverter.IsVideoFile(file.Path))
                 {
                     TranscriptionControlSection.Visibility = Visibility.Visible;
@@ -1342,6 +1361,7 @@ public sealed partial class MainPage : Page
         SpeakersPanel.Visibility = Visibility.Collapsed;
         SaveTranscriptionButton.Visibility = Visibility.Collapsed;
         CopyTranscriptButton.Visibility = Visibility.Collapsed;
+        ExportToOutlineButton.Visibility = Visibility.Collapsed;
 
         UpdateTranscriptionAvailabilityUi();
     }
@@ -1362,6 +1382,11 @@ public sealed partial class MainPage : Page
             await ShowErrorDialogAsync("Recording file not found");
             return;
         }
+
+        // For imported files there is no prior session — create one now before transcription starts.
+        // (Recordings create their session on stop, so _currentSessionId is already set in that case.)
+        if (_currentSessionId == null)
+            await CreateImportedFileSessionAsync(_lastRecordingPath);
 
         // Capture current values so a new recording started in parallel doesn't overwrite them
         var audioPath = _lastRecordingPath;
@@ -1447,10 +1472,6 @@ public sealed partial class MainPage : Page
 
                 _ = UpdateSessionAfterTranscriptionAsync(transcriptionSessionId, result.OutputPath, result.Segments, pipelineResult.GeneratedTitle, pipelineResult.StructuredOutput);
 
-                // Publish to Outline if configured (fire-and-forget)
-                if (_outlineService.IsConfigured && pipelineResult.TargetPath != null)
-                    _ = PublishToOutlineAsync(transcriptionSessionId, audioPath, pipelineResult.TargetPath, pipelineCt);
-
                 var fileName = Path.GetFileName(audioPath);
                 NotificationService.ShowTranscriptionCompleted(fileName, result.Segments.Count, result.OutputPath);
             }
@@ -1524,6 +1545,7 @@ public sealed partial class MainPage : Page
         SpeakersPanel.Visibility = Speakers.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
         SaveTranscriptionButton.Visibility = Visibility.Visible;
         CopyTranscriptButton.Visibility = Visibility.Visible;
+        ExportToOutlineButton.Visibility = _outlineService.IsConfigured ? Visibility.Visible : Visibility.Collapsed;
         SetUnsavedChanges(false);
 
         return Task.CompletedTask;
@@ -1558,6 +1580,7 @@ public sealed partial class MainPage : Page
         SpeakersPanel.Visibility = Speakers.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
         SaveTranscriptionButton.Visibility = Visibility.Visible;
         CopyTranscriptButton.Visibility = Visibility.Visible;
+        ExportToOutlineButton.Visibility = _outlineService.IsConfigured ? Visibility.Visible : Visibility.Collapsed;
         SetUnsavedChanges(false);
 
         return Task.CompletedTask;
@@ -1589,11 +1612,11 @@ public sealed partial class MainPage : Page
     {
         if (sender is TextBox textBox && textBox.DataContext is SpeakerViewModel speaker)
         {
+            var newName = textBox.Text; // use textBox.Text directly — binding updates on LostFocus, not on TextChanged
+            speaker.Name = newName;
             foreach (var segment in TranscriptionSegments.Where(s => s.SpeakerId == speaker.Id))
-            {
-                segment.SpeakerName = speaker.Name;
-            }
-            _speakerNameMap[speaker.Id] = speaker.Name;
+                segment.SpeakerName = newName;
+            _speakerNameMap[speaker.Id] = newName;
             SetUnsavedChanges(true);
         }
     }
@@ -1705,7 +1728,7 @@ public sealed partial class MainPage : Page
                 }
             }
 
-            _playbackService.PlaySegment(segment.Start, segment.End, loop: true);
+            _playbackService.PlaySegment(segment.Start, segment.End, loop: false);
             _playingSegment = segment;
         }
     }
@@ -1719,6 +1742,208 @@ public sealed partial class MainPage : Page
                 _playingSegment = null;
             }
         });
+    }
+
+    private async void OnExportToOutlineClicked(object sender, RoutedEventArgs e)
+    {
+        if (!_outlineService.IsConfigured)
+        {
+            await ShowErrorDialogAsync("Outline is not configured. Set the URL and API token in Settings → Integrations.");
+            return;
+        }
+
+        if (_currentSessionId == null)
+        {
+            await ShowErrorDialogAsync("No active session. Save the transcript first.");
+            return;
+        }
+
+        ExportToOutlineButton.IsEnabled = false;
+        var prevTooltip = ToolTipService.GetToolTip(ExportToOutlineButton)?.ToString() ?? "Export to Outline";
+        ToolTipService.SetToolTip(ExportToOutlineButton, "Exporting…");
+
+        try
+        {
+            var session = await _sessionStore.GetAsync(_currentSessionId.Value);
+            if (session == null) return;
+
+            var markdownText = BuildExportMarkdown();
+            var title = session.Title;
+
+            OutlineDocumentResult result;
+            if (session.OutlineDocumentId is { } existingId)
+            {
+                result = await _outlineService.UpdateDocumentAsync(existingId, title, markdownText);
+            }
+            else
+            {
+                // Ask user which collection to publish to
+                string? collectionId = await PickOutlineCollectionAsync();
+                if (collectionId == null)
+                {
+                    ToolTipService.SetToolTip(ExportToOutlineButton, prevTooltip);
+                    return; // user cancelled
+                }
+                result = await _outlineService.CreateDocumentAsync(title, markdownText, collectionId);
+            }
+
+            if (!result.Success)
+            {
+                await ShowErrorDialogAsync($"Outline export failed: {result.ErrorMessage}");
+                ToolTipService.SetToolTip(ExportToOutlineButton, prevTooltip);
+                return;
+            }
+
+            // Persist document ID/URL on the session
+            if (result.DocumentId != null)
+            {
+                session.OutlineDocumentId = result.DocumentId;
+                session.OutlineDocumentUrl = result.DocumentUrl;
+                session.State = SessionState.Exported;
+                await _sessionStore.UpdateAsync(session);
+                _ = LoadSessionsAsync();
+            }
+
+            ToolTipService.SetToolTip(ExportToOutlineButton, "Update in Outline");
+            TranscriptionStatusText.Text = prevTooltip == "Update in Outline"
+                ? "Updated in Outline ✓"
+                : "Exported to Outline ✓";
+
+            AudioRecorder.Services.Logging.AppLogger.LogInfo(
+                $"Outline export: {result.DocumentUrl ?? result.DocumentId}");
+        }
+        catch (Exception ex)
+        {
+            await ShowErrorDialogAsync($"Outline export error: {ex.Message}");
+            ToolTipService.SetToolTip(ExportToOutlineButton, prevTooltip);
+        }
+        finally
+        {
+            ExportToOutlineButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>
+    /// Builds the full Markdown export: AI analysis (if present) followed by
+    /// the transcript grouped by speaker (consecutive lines merged).
+    /// </summary>
+    /// <summary>
+    /// Shows a collection picker dialog. Returns the selected collection ID, or null if cancelled.
+    /// </summary>
+    private async Task<string?> PickOutlineCollectionAsync()
+    {
+        var collectionsResult = await _outlineService.GetCollectionsAsync();
+        if (!collectionsResult.Success || collectionsResult.Collections.Count == 0)
+        {
+            // Fall back to the default collection from settings
+            var fallback = _settingsService.LoadOutlineDefaultCollectionId();
+            if (fallback != null) return fallback;
+            await ShowErrorDialogAsync("Could not load Outline collections. Check your connection and API token.");
+            return null;
+        }
+
+        var listView = new ListView
+        {
+            ItemsSource = collectionsResult.Collections,
+            DisplayMemberPath = "Name",
+            SelectionMode = ListViewSelectionMode.Single,
+            Height = 300,
+        };
+
+        // Pre-select the default collection if configured
+        var defaultId = _settingsService.LoadOutlineDefaultCollectionId();
+        if (defaultId != null)
+        {
+            var defaultItem = collectionsResult.Collections.FirstOrDefault(c => c.Id == defaultId);
+            if (defaultItem != null) listView.SelectedItem = defaultItem;
+        }
+        if (listView.SelectedItem == null && collectionsResult.Collections.Count > 0)
+            listView.SelectedItem = collectionsResult.Collections[0];
+
+        var dialog = new ContentDialog
+        {
+            Title = "Choose Outline collection",
+            Content = listView,
+            PrimaryButtonText = "Export",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot,
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result != ContentDialogResult.Primary) return null;
+
+        return (listView.SelectedItem as AudioRecorder.Core.Models.OutlineCollection)?.Id;
+    }
+
+    private string BuildExportMarkdown()
+    {
+        var sb = new StringBuilder();
+
+        // ── AI analysis ──────────────────────────────────────────────────────
+        var summaryText = AnalysisSummaryText?.Text;
+        if (!string.IsNullOrWhiteSpace(summaryText))
+        {
+            sb.AppendLine("## Summary");
+            sb.AppendLine(summaryText);
+            sb.AppendLine();
+        }
+
+        if (AnalysisActionItems.Count > 0)
+        {
+            sb.AppendLine("## Action Items");
+            foreach (var item in AnalysisActionItems)
+                sb.AppendLine($"- [ ] {item}");
+            sb.AppendLine();
+        }
+
+        if (AnalysisDecisions.Count > 0)
+        {
+            sb.AppendLine("## Decisions");
+            foreach (var d in AnalysisDecisions)
+                sb.AppendLine($"- {d}");
+            sb.AppendLine();
+        }
+
+        // ── Transcript grouped by speaker ────────────────────────────────────
+        if (TranscriptionSegments.Count > 0)
+        {
+            sb.AppendLine("## Transcript");
+            sb.AppendLine();
+
+            string? lastSpeaker = null;
+            var chunk = new StringBuilder();
+
+            void FlushChunk()
+            {
+                if (lastSpeaker != null && chunk.Length > 0)
+                {
+                    sb.AppendLine($"**{lastSpeaker}:** {chunk.ToString().Trim()}");
+                    sb.AppendLine();
+                    chunk.Clear();
+                }
+            }
+
+            foreach (var seg in TranscriptionSegments)
+            {
+                var speakerName = _speakerNameMap.TryGetValue(seg.SpeakerId, out var mapped)
+                    ? mapped
+                    : seg.SpeakerName;
+
+                if (speakerName != lastSpeaker)
+                {
+                    FlushChunk();
+                    lastSpeaker = speakerName;
+                }
+
+                if (chunk.Length > 0) chunk.Append(' ');
+                chunk.Append(seg.Text.Trim());
+            }
+
+            FlushChunk();
+        }
+
+        return sb.ToString().TrimEnd();
     }
 
     private async void OnSaveTranscriptionClicked(object sender, RoutedEventArgs e)
@@ -1972,6 +2197,7 @@ public sealed partial class MainPage : Page
     private void OnSessionFilterChanged(object sender, RoutedEventArgs e)
     {
         if (sender is not RadioButton rb) return;
+        if (_semanticSearch == null) return; // fired during InitializeComponent before services are ready
         var tag = rb.Tag?.ToString() ?? string.Empty;
         _activeStateFilter = string.IsNullOrEmpty(tag)
             ? null
@@ -2431,6 +2657,33 @@ public sealed partial class MainPage : Page
     }
 
     // ── Session persistence ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates a session record for a file that was imported (not recorded by Contora).
+    /// Called at transcription start so the resulting transcript is linked to a real session.
+    /// </summary>
+    private async Task CreateImportedFileSessionAsync(string audioPath)
+    {
+        try
+        {
+            var session = new Session
+            {
+                Title = Path.GetFileNameWithoutExtension(audioPath),
+                RecordedAt = DateTime.Now,
+                DurationSeconds = 0, // unknown until transcription completes
+                AudioPath = audioPath,
+                State = SessionState.Recorded,
+            };
+            await _sessionStore.CreateAsync(session);
+            _currentSessionId = session.Id;
+            AudioRecorder.Services.Logging.AppLogger.LogInfo($"Import session created: {session.Id}");
+            _ = LoadSessionsAsync();
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogError($"Failed to create import session: {ex.Message}");
+        }
+    }
 
     private async Task SaveNewSessionAsync(string audioPath, TimeSpan duration)
     {
