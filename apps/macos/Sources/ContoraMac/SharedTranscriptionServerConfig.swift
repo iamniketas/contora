@@ -3,6 +3,7 @@ import Foundation
 enum TranscriptionBackend: String, CaseIterable, Identifiable, Codable {
     case whisperHTTP = "whisper_http"
     case mlxOpenAIHTTP = "mlx_openai_http"
+    case fasterWhisperProcess = "faster_whisper_process"
 
     var id: String { rawValue }
 
@@ -12,6 +13,8 @@ enum TranscriptionBackend: String, CaseIterable, Identifiable, Codable {
             return "Whisper HTTP"
         case .mlxOpenAIHTTP:
             return "MLX OpenAI HTTP"
+        case .fasterWhisperProcess:
+            return "Local Faster Whisper"
         }
     }
 
@@ -27,17 +30,64 @@ struct SharedTranscriptionServerConfig: Codable {
     var whisperTranscribeURL: String
     var mlxTranscribeURL: String
     var mlxModelID: String
+    var fasterWhisperModelName: String
+    var fasterWhisperDiarizationEnabled: Bool
     var updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case activeBackend
+        case whisperTranscribeURL
+        case mlxTranscribeURL
+        case mlxModelID
+        case fasterWhisperModelName
+        case fasterWhisperDiarizationEnabled
+        case updatedAt
+    }
 
     static func `default`() -> SharedTranscriptionServerConfig {
         SharedTranscriptionServerConfig(
             schemaVersion: "1.0",
-            activeBackend: .mlxOpenAIHTTP,
+            activeBackend: .fasterWhisperProcess,
             whisperTranscribeURL: "http://127.0.0.1:5500/transcribe",
             mlxTranscribeURL: "http://127.0.0.1:8010/v1/audio/transcriptions",
             mlxModelID: "mlx-community/whisper-large-v3-turbo-asr-fp16",
+            fasterWhisperModelName: "large-v2",
+            fasterWhisperDiarizationEnabled: true,
             updatedAt: ISO8601DateFormatter().string(from: Date())
         )
+    }
+
+    init(
+        schemaVersion: String,
+        activeBackend: TranscriptionBackend,
+        whisperTranscribeURL: String,
+        mlxTranscribeURL: String,
+        mlxModelID: String,
+        fasterWhisperModelName: String,
+        fasterWhisperDiarizationEnabled: Bool,
+        updatedAt: String
+    ) {
+        self.schemaVersion = schemaVersion
+        self.activeBackend = activeBackend
+        self.whisperTranscribeURL = whisperTranscribeURL
+        self.mlxTranscribeURL = mlxTranscribeURL
+        self.mlxModelID = mlxModelID
+        self.fasterWhisperModelName = fasterWhisperModelName
+        self.fasterWhisperDiarizationEnabled = fasterWhisperDiarizationEnabled
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decodeIfPresent(String.self, forKey: .schemaVersion) ?? "1.0"
+        activeBackend = try values.decodeIfPresent(TranscriptionBackend.self, forKey: .activeBackend) ?? .fasterWhisperProcess
+        whisperTranscribeURL = try values.decodeIfPresent(String.self, forKey: .whisperTranscribeURL) ?? "http://127.0.0.1:5500/transcribe"
+        mlxTranscribeURL = try values.decodeIfPresent(String.self, forKey: .mlxTranscribeURL) ?? "http://127.0.0.1:8010/v1/audio/transcriptions"
+        mlxModelID = try values.decodeIfPresent(String.self, forKey: .mlxModelID) ?? "mlx-community/whisper-large-v3-turbo-asr-fp16"
+        fasterWhisperModelName = try values.decodeIfPresent(String.self, forKey: .fasterWhisperModelName) ?? "large-v2"
+        fasterWhisperDiarizationEnabled = try values.decodeIfPresent(Bool.self, forKey: .fasterWhisperDiarizationEnabled) ?? true
+        updatedAt = try values.decodeIfPresent(String.self, forKey: .updatedAt) ?? ISO8601DateFormatter().string(from: Date())
     }
 }
 
@@ -94,7 +144,7 @@ final class SharedTranscriptionServerConfigStore {
             .appendingPathComponent("transcription-server.json")
     }
 
-    func probe(backend: TranscriptionBackend, whisperURL: String, mlxURL: String) async -> String {
+    func probe(backend: TranscriptionBackend, whisperURL: String, mlxURL: String, fasterWhisperModelName: String) async -> String {
         switch backend {
         case .whisperHTTP:
             guard let transcribeURL = URL(string: whisperURL),
@@ -133,6 +183,18 @@ final class SharedTranscriptionServerConfigStore {
             } catch {
                 return "MLX probe failed: \(error.localizedDescription)"
             }
+
+        case .fasterWhisperProcess:
+            let executableURL = SharedRuntimePaths.whisperExecutable()
+            guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+                return "Local Whisper: runtime missing"
+            }
+
+            if SharedRuntimePaths.isFasterWhisperModelInstalled(name: fasterWhisperModelName) {
+                return "Local Whisper: OK (\(fasterWhisperModelName))"
+            }
+
+            return "Local Whisper: model missing (\(fasterWhisperModelName))"
         }
     }
 }

@@ -135,8 +135,13 @@ final class SharedModelCatalogStore {
             return []
         }
 
-        return directories.map {
-            SharedModelCatalogEntry(
+        return directories.compactMap {
+            let name = $0.lastPathComponent.replacingOccurrences(of: "faster-whisper-", with: "")
+            guard SharedRuntimePaths.isFasterWhisperModelInstalled(name: name) else {
+                return nil
+            }
+
+            return SharedModelCatalogEntry(
                 id: "faster-whisper::\($0.lastPathComponent)",
                 provider: .fasterWhisper,
                 modelID: $0.lastPathComponent,

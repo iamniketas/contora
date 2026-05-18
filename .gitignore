@@ -80,6 +80,9 @@ nCrunchTemp_*
 .idea/
 
 # User-specific files
+.env
+.env.*
+!.env.example
 *.rsuser
 *.suo
 *.user
@@ -98,15 +101,26 @@ $RECYCLE.BIN/
 
 # Mac
 .DS_Store
+__pycache__/
 
 # Audio recordings (temporary)
 recordings/
 *.wav
 *.mp3
 *.flac
+artifacts/macos-pilot/
+artifacts/macos-whisper-runtime/
 
 # Tools (large binaries)
-tools/
+tools/*
+!tools/release/
+!tools/release/**
+!tools/macos-whisper-runtime/
+!tools/macos-whisper-runtime/**
+!tools/macos-release/
+!tools/macos-release/**
+**/__pycache__/
+**/*.pyc
 
 # Claude Code
 .claude/
@@ -114,3 +128,4 @@ conversation-*.txt
 
 # Misc
 nul
+fixtures/

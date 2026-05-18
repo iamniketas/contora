@@ -24,6 +24,7 @@ struct FasterWhisperProcessTranscriptionService {
     var executableURL: URL = SharedRuntimePaths.whisperExecutable()
     var modelName: String = "large-v2"
     var language: String = "ru"
+    var enableDiarization = true
 
     func transcribe(audioFileURL: URL, outputDirectory: URL) throws -> String {
         let fm = FileManager.default
@@ -44,14 +45,7 @@ struct FasterWhisperProcessTranscriptionService {
         let process = Process()
         process.executableURL = executableURL
         process.currentDirectoryURL = outputDirectory
-        process.arguments = [
-            "--model", modelName,
-            "--language", language,
-            "--task", "transcribe",
-            "--output_format", "txt",
-            "--output_dir", outputDirectory.path,
-            audioFileURL.path,
-        ]
+        process.arguments = makeArguments(audioFileURL: audioFileURL, outputDirectory: outputDirectory)
 
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -77,5 +71,28 @@ struct FasterWhisperProcessTranscriptionService {
     private func readText(pipe: Pipe) -> String {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func makeArguments(audioFileURL: URL, outputDirectory: URL) -> [String] {
+        var arguments = [
+            "-pp",
+            "-o", outputDirectory.path,
+            "--standard",
+            "-f", "txt",
+            "-m", modelName,
+            "--language", language,
+        ]
+
+        let modelsRoot = SharedRuntimePaths.modelsDirectory()
+        if FileManager.default.fileExists(atPath: modelsRoot.path) {
+            arguments.append(contentsOf: ["--model_dir", modelsRoot.path])
+        }
+
+        if enableDiarization {
+            arguments.append(contentsOf: ["--diarize", "pyannote_v3.1"])
+        }
+
+        arguments.append(audioFileURL.path)
+        return arguments
     }
 }

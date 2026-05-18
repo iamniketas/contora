@@ -47,6 +47,8 @@ Schema (v1.0):
   "whisperTranscribeURL": "http://127.0.0.1:5500/transcribe",
   "mlxTranscribeURL": "http://127.0.0.1:8000/v1/audio/transcriptions",
   "mlxModelID": "mlx-community/whisper-large-v3-turbo-asr-fp16",
+  "fasterWhisperModelName": "large-v2",
+  "fasterWhisperDiarizationEnabled": true,
   "updatedAt": "2026-02-24T00:00:00Z"
 }
 ```
@@ -94,6 +96,8 @@ It should also converge toward:
 - Contora batch transcription now uses the selected shared backend:
   - `whisper_http`
   - `mlx_openai_http`
+  - `faster_whisper_process`
+- The local Faster-Whisper process path stores downloaded model files under the shared runtime root and can run with `--diarize pyannote_v3.1` when the installed runtime supports it.
 - Transcript artifacts are saved next to the recording session.
 
 ## Dictator Alignment

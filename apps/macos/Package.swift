@@ -13,7 +13,9 @@ let package = Package(
         .executableTarget(
             name: "ContoraMac",
             path: "Sources/ContoraMac",
-            exclude: ["Resources"]
+            resources: [
+                .copy("Resources")
+            ]
         ),
     ]
 )

@@ -30,12 +30,40 @@ enum SharedRuntimePaths {
         return whisperRoot().appendingPathComponent("faster-whisper-xxl")
     }
 
+    static func whisperVenvPython() -> URL {
+        whisperRoot()
+            .appendingPathComponent("venv", isDirectory: true)
+            .appendingPathComponent("bin/python")
+    }
+
+    static func whisperBundledPython() -> URL {
+        whisperRoot()
+            .appendingPathComponent("python/Python.framework/Versions/3.12/bin/python3.12")
+    }
+
+    static func whisperTranscribeScript() -> URL {
+        whisperRoot()
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent("contora_fw_transcribe.py")
+    }
+
     static func modelsDirectory() -> URL {
         whisperRoot().appendingPathComponent("_models", isDirectory: true)
     }
 
     static func modelDirectory(name: String) -> URL {
         modelsDirectory().appendingPathComponent("faster-whisper-\(name)", isDirectory: true)
+    }
+
+    static func isFasterWhisperModelInstalled(name: String) -> Bool {
+        let directory = modelDirectory(name: name)
+        let requiredFiles = ["config.json", "tokenizer.json", "model.bin"]
+        let hasRequiredFiles = requiredFiles.allSatisfy {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+        }
+        let hasVocabulary = FileManager.default.fileExists(atPath: directory.appendingPathComponent("vocabulary.txt").path)
+            || FileManager.default.fileExists(atPath: directory.appendingPathComponent("vocabulary.json").path)
+        return hasRequiredFiles && hasVocabulary
     }
 
     static func whisperKitModelsRoot() -> URL {

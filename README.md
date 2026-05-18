@@ -105,9 +105,15 @@ Key messages:
 
 ## macOS (в разработке)
 
-- Базовый нативный skeleton: `apps/macos` (SwiftUI + AppKit).
-- Foundation для системного захвата аудио через `ScreenCaptureKit`.
-- MVP-запись на macOS: выбор источника (`System` / `Mic` / `System+Mic`) и сохранение WAV.
+- Нативный macOS-клиент: `apps/macos` (SwiftUI + AppKit).
+- Primary workspace с колонками захвата, записи/транскрибации и review.
+- Захват через `AVAudioEngine` и `ScreenCaptureKit`: `Microphone`, `System Audio`, `System + Microphone`.
+- Импорт аудио/видео регистрирует внешний файл без копирования медиа в хранилище Contora.
+- Записи, сделанные Contora, сохраняются в локальное session storage с WAV/M4A retention policy.
+- Фоновая очередь транскрибации через общий локальный Whisper/MLX backend, включая остановку активной транскрибации.
+- Segment-first transcript review: timestamp rows, inline editing, speaker rename, per-segment playback.
+- Поиск, фильтр и сортировка локальных сессий.
+- Реальный процент/ETA транскрибации требует progress events от shared backend; без них macOS UI показывает честный indeterminate status.
 - Общая стратегия shared runtime для моделей между Contora и Dictator:
   `docs/SHARED_RUNTIME_STRATEGY.md`.
 - Детали по системному аудиозахвату: `docs/MACOS_AUDIO_CAPTURE_ARCHITECTURE.md`.
@@ -116,6 +122,8 @@ Key messages:
   `docs/SHARED_TRANSCRIPTION_SERVER_INTEROP.md`.
 - Обновленный roadmap macOS на базе текущей Windows-версии:
   `docs/MACOS_ROADMAP_2026_03.md`.
+- Текущая точка отсчёта по macOS:
+  `docs/MACOS_HANDOFF_2026_05.md`.
 - Разбор полезных продуктовых паттернов из OpenOats:
   `docs/OPENOATS_REVIEW_2026_03.md`.
 

@@ -3,6 +3,7 @@ import AppKit
 @preconcurrency import AVFoundation
 import ApplicationServices
 import Combine
+import CoreAudio
 import Foundation
 import UniformTypeIdentifiers
 
@@ -44,6 +45,15 @@ enum RecordingStoragePolicy: String, CaseIterable, Identifiable, Codable {
     case m4aOnly = "M4A Only"
 
     var id: String { rawValue }
+}
+
+@MainActor
+private func openContoraSettingsWindow() {
+    NSApp.activate(ignoringOtherApps: true)
+    let didOpen = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    if !didOpen {
+        NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+    }
 }
 
 enum TranscriptionError: LocalizedError {
@@ -183,12 +193,76 @@ struct EditableSessionSegment: Identifiable, Hashable {
         let seconds = total % 60
         return String(format: "%02d:%02d", minutes, seconds)
     }
+
+    var timestampRangeDisplay: String {
+        "\(Self.formatTimestamp(startSeconds)) - \(Self.formatTimestamp(endSeconds))"
+    }
+
+    private static func formatTimestamp(_ seconds: Double) -> String {
+        let total = Int(seconds)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return String(format: "%01d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
+    }
+}
+
+enum TranscriptionJobState: String {
+    case queued = "Queued"
+    case preparing = "Preparing"
+    case transcribing = "Transcribing"
+    case completed = "Completed"
+    case failed = "Failed"
+    case cancelled = "Cancelled"
+}
+
+enum SessionSortMode: String, CaseIterable, Identifiable {
+    case newest = "Newest"
+    case oldest = "Oldest"
+    case title = "Title"
+    case duration = "Duration"
+
+    var id: String { rawValue }
+}
+
+enum SessionStatusFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case recordedOnly = "Audio Only"
+    case transcribed = "Transcribed"
+    case failed = "Failed"
+
+    var id: String { rawValue }
+}
+
+struct TranscriptionJob: Identifiable, Hashable {
+    let id: UUID
+    let sessionID: String
+    let sessionTitle: String
+    let recordingURL: URL
+    let createdAt: Date
+    var state: TranscriptionJobState
+    var audioSeconds: Double
+    var elapsedSeconds: Double
+    var remainingSeconds: Double?
+    var progress: Double?
+    var speedRatio: Double?
+    var statusText: String
+    var errorMessage: String?
+
+    var isActive: Bool {
+        state == .preparing || state == .transcribing
+    }
 }
 
 struct ContoraSessionManifest: Codable {
     struct Files: Codable {
         let recordingWAV: String?
         let recordingM4A: String?
+        let recordingMedia: String?
+        let recordingExternalURL: String?
         let transcriptTXT: String?
         let transcriptJSON: String?
     }
@@ -364,6 +438,20 @@ final class SessionLibraryService {
     }
 
     private func resolveRecordingURL(files: ContoraSessionManifest.Files, rootDirectory: URL) -> URL? {
+        if let externalPath = files.recordingExternalURL {
+            let externalURL = URL(fileURLWithPath: externalPath)
+            if fileManager.fileExists(atPath: externalURL.path) {
+                return externalURL
+            }
+        }
+
+        if let media = files.recordingMedia {
+            let mediaURL = rootDirectory.appendingPathComponent(media)
+            if fileManager.fileExists(atPath: mediaURL.path) {
+                return mediaURL
+            }
+        }
+
         if let wav = files.recordingWAV {
             let wavURL = rootDirectory.appendingPathComponent(wav)
             if fileManager.fileExists(atPath: wavURL.path) {
@@ -389,7 +477,7 @@ final class SessionLibraryService {
             return []
         }
 
-        return [manifest.files.recordingWAV, manifest.files.recordingM4A].compactMap { $0 }
+        return [manifest.files.recordingWAV, manifest.files.recordingM4A, manifest.files.recordingMedia].compactMap { $0 }
     }
 
     private func loadMetadata(from jsonURL: URL?) -> ContoraSession.Metadata {
@@ -579,6 +667,24 @@ final class RecordingArchiveService {
         return (SessionIdentity(sessionID: sessionID, title: sessionID, createdAt: createdAt), fileURL)
     }
 
+    func registerImportedMedia(fileURL: URL, sourceMode: String) throws -> (SessionIdentity, URL) {
+        let recordingsDirectory = try makeRecordingsDirectory()
+        let createdAt = Date()
+        let sessionID = "import-\(timestampString())-\(UUID().uuidString.prefix(8))"
+        let title = fileURL.deletingPathExtension().lastPathComponent
+        let identity = SessionIdentity(sessionID: sessionID, title: title, createdAt: createdAt)
+        _ = try saveSessionManifest(
+            sessionID: identity,
+            recordingFileURL: fileURL,
+            captureSourceMode: sourceMode,
+            audioSeconds: 0,
+            sampleRate: 0,
+            channels: 0,
+            manifestBaseURL: recordingsDirectory
+        )
+        return (identity, fileURL)
+    }
+
     func siblingCompressedURL(for recordingFileURL: URL) -> URL {
         recordingFileURL.deletingPathExtension().appendingPathExtension("m4a")
     }
@@ -593,10 +699,17 @@ final class RecordingArchiveService {
         recordingM4AURL: URL? = nil,
         transcriptTXT: URL? = nil,
         transcriptJSON: URL? = nil,
-        transcription: ContoraSessionManifest.Transcription? = nil
+        transcription: ContoraSessionManifest.Transcription? = nil,
+        manifestBaseURL: URL? = nil
     ) throws -> URL {
-        let manifestURL = recordingFileURL.deletingPathExtension().appendingPathExtension("session.json")
+        let manifestURL = manifestBaseURL?
+            .appendingPathComponent(sessionID.sessionID)
+            .appendingPathExtension("session.json")
+            ?? recordingFileURL.deletingPathExtension().appendingPathExtension("session.json")
         let formatter = ISO8601DateFormatter()
+        let manifestDirectory = manifestURL.deletingLastPathComponent().standardizedFileURL
+        let recordingDirectory = recordingFileURL.deletingLastPathComponent().standardizedFileURL
+        let isInternalRecording = recordingDirectory == manifestDirectory
         let manifest = ContoraSessionManifest(
             schemaVersion: "1.0",
             sessionID: sessionID.sessionID,
@@ -604,8 +717,10 @@ final class RecordingArchiveService {
             createdAt: formatter.string(from: sessionID.createdAt),
             updatedAt: formatter.string(from: Date()),
             files: .init(
-                recordingWAV: recordingFileURL.pathExtension.lowercased() == "wav" ? recordingFileURL.lastPathComponent : nil,
-                recordingM4A: recordingM4AURL?.lastPathComponent ?? (recordingFileURL.pathExtension.lowercased() == "m4a" ? recordingFileURL.lastPathComponent : nil),
+                recordingWAV: isInternalRecording && recordingFileURL.pathExtension.lowercased() == "wav" ? recordingFileURL.lastPathComponent : nil,
+                recordingM4A: isInternalRecording ? (recordingM4AURL?.lastPathComponent ?? (recordingFileURL.pathExtension.lowercased() == "m4a" ? recordingFileURL.lastPathComponent : nil)) : nil,
+                recordingMedia: isInternalRecording ? recordingFileURL.lastPathComponent : nil,
+                recordingExternalURL: isInternalRecording ? nil : recordingFileURL.path,
                 transcriptTXT: transcriptTXT?.lastPathComponent,
                 transcriptJSON: transcriptJSON?.lastPathComponent
             ),
@@ -624,6 +739,7 @@ final class RecordingArchiveService {
 
     func saveTranscriptJSON(
         for recordingFileURL: URL,
+        artifactBaseURL: URL? = nil,
         transcriptText: String,
         mode: String,
         language: String,
@@ -634,7 +750,7 @@ final class RecordingArchiveService {
         success: Bool,
         errorMessage: String?
     ) throws -> URL {
-        let jsonURL = recordingFileURL.deletingPathExtension().appendingPathExtension("json")
+        let jsonURL = artifactBaseURL?.appendingPathExtension("json") ?? recordingFileURL.deletingPathExtension().appendingPathExtension("json")
         let payload: [String: Any] = [
             "created_at": ISO8601DateFormatter().string(from: Date()),
             "recording_file": recordingFileURL.lastPathComponent,
@@ -653,14 +769,14 @@ final class RecordingArchiveService {
         return jsonURL
     }
 
-    func saveTranscriptText(for recordingFileURL: URL, transcriptText: String) throws -> URL {
-        let txtURL = recordingFileURL.deletingPathExtension().appendingPathExtension("txt")
+    func saveTranscriptText(for recordingFileURL: URL, artifactBaseURL: URL? = nil, transcriptText: String) throws -> URL {
+        let txtURL = artifactBaseURL?.appendingPathExtension("txt") ?? recordingFileURL.deletingPathExtension().appendingPathExtension("txt")
         try transcriptText.write(to: txtURL, atomically: true, encoding: .utf8)
         return txtURL
     }
 
-    func updateTranscriptJSONPreservingMetadata(for recordingFileURL: URL, transcriptText: String) throws -> URL {
-        let jsonURL = recordingFileURL.deletingPathExtension().appendingPathExtension("json")
+    func updateTranscriptJSONPreservingMetadata(for recordingFileURL: URL, artifactBaseURL: URL? = nil, transcriptText: String) throws -> URL {
+        let jsonURL = artifactBaseURL?.appendingPathExtension("json") ?? recordingFileURL.deletingPathExtension().appendingPathExtension("json")
         var payload: [String: Any] = [:]
         if
             FileManager.default.fileExists(atPath: jsonURL.path),
@@ -740,13 +856,14 @@ final class AudioCompressionService {
         exportSession.outputURL = outputURL
         exportSession.outputFileType = .m4a
 
+        nonisolated(unsafe) let unsafeExportSession = exportSession
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            exportSession.exportAsynchronously {
-                switch exportSession.status {
+            unsafeExportSession.exportAsynchronously {
+                switch unsafeExportSession.status {
                 case .completed:
                     continuation.resume()
                 case .failed:
-                    continuation.resume(throwing: exportSession.error ?? AudioImportError.readFailed)
+                    continuation.resume(throwing: unsafeExportSession.error ?? AudioImportError.readFailed)
                 case .cancelled:
                     continuation.resume(throwing: AudioImportError.readFailed)
                 default:
@@ -1254,19 +1371,30 @@ final class AppModel: ObservableObject {
     @Published var chunkSeconds = 8
     @Published var recordingStoragePolicy: RecordingStoragePolicy = .wavOnly
     @Published var transcriptionLanguage = "ru"
-    @Published var transcriptionBackend: TranscriptionBackend = .mlxOpenAIHTTP
+    @Published var transcriptionBackend: TranscriptionBackend = .fasterWhisperProcess
     @Published var transcriptionEndpoint = "http://127.0.0.1:5500/transcribe"
     @Published var mlxTranscriptionEndpoint = "http://127.0.0.1:8000/v1/audio/transcriptions"
     @Published var mlxModelID = "mlx-community/whisper-large-v3-turbo-asr-fp16"
+    @Published var fasterWhisperModelName = "large-v2"
+    @Published var fasterWhisperDiarizationEnabled = true
+    @Published var fasterWhisperDownloadStatus = "Not checked"
+    @Published var isDownloadingFasterWhisperModel = false
+    @Published var fasterWhisperRuntimeStatus = "Not checked"
+    @Published var isInstallingFasterWhisperRuntime = false
+    @Published var localWhisperSetupStatus = "Not configured"
+    @Published var isSettingUpLocalWhisper = false
 
     @Published var recordingSeconds: Double = 0
     @Published var lastCaptureSamples: Int = 0
     @Published var isTranscribing = false
+    @Published var isPreparingTranscription = false
     @Published var isStreamingChunkTranscribing = false
     @Published var isFinalizingStop = false
     @Published var isStreamingLoopActive = false
     @Published var streamingChunksProcessed = 0
     @Published var transcriptionElapsedSeconds: Double = 0
+    @Published var activeTranscriptionAudioSeconds: Double = 0
+    @Published var activeTranscriptionSessionTitle = ""
     @Published var lastAudioDurationSeconds: Double = 0
     @Published var lastTranscriptionDurationSeconds: Double = 0
     @Published var lastRealtimeSpeedRatio: Double = 0
@@ -1285,14 +1413,22 @@ final class AppModel: ObservableObject {
     @Published var backendProbeStatus = "Not checked"
     @Published var sessions: [ContoraSession] = []
     @Published var selectedSessionID: String?
+    @Published var sessionSearchText = ""
+    @Published var sessionSortMode: SessionSortMode = .newest
+    @Published var sessionStatusFilter: SessionStatusFilter = .all
     @Published var sessionLibraryStatus = "Not loaded"
     @Published var sessionEditorTranscriptDraft = ""
     @Published var sessionEditorSegments: [EditableSessionSegment] = []
     @Published var sessionEditorStatus = "No session selected"
+    @Published var sessionEditorHasUnsavedChanges = false
     @Published var storageStatus = "WAV only"
     @Published var diagnostics = RuntimeDiagnostics()
     @Published var sharedMLXToolkitActionStatus = "Idle"
     @Published var sharedModelCatalogEntries: [SharedModelCatalogEntry] = []
+    @Published var activeMicrophoneName = "Unknown microphone"
+    @Published var activeOutputDeviceName = "Unknown output"
+    @Published var playingSegmentID: String?
+    @Published var transcriptionJobs: [TranscriptionJob] = []
 
     let permissions = PermissionState()
 
@@ -1306,6 +1442,7 @@ final class AppModel: ObservableObject {
     private let recordingArchive = RecordingArchiveService()
     private let sharedMLXToolkitService = SharedMLXServerToolkitService()
     private let sharedModelCatalogStore = SharedModelCatalogStore.shared
+    private let fasterWhisperRuntimeInstaller = FasterWhisperRuntimeInstaller()
     private let sessionLibrary = SessionLibraryService()
     private var recordingTickerTask: Task<Void, Never>?
     private var transcriptionTickerTask: Task<Void, Never>?
@@ -1316,12 +1453,19 @@ final class AppModel: ObservableObject {
     private var postStopStartedAt: Date?
     private var currentRecordingFileURL: URL?
     private var currentSessionIdentity: RecordingArchiveService.SessionIdentity?
+    private var segmentPlayer: AVPlayer?
+    private var segmentPlaybackTask: Task<Void, Never>?
+    private var transcriptionQueue: [UUID] = []
+    private var transcriptionJobSessions: [UUID: ContoraSession] = [:]
+    private var activeTranscriptionJobID: UUID?
+    private var activeTranscriptionTask: Task<Void, Never>?
 
     private init() {
         sharedServerConfigPath = SharedTranscriptionServerConfigStore.shared.configFileURL().path
         loadSharedServerConfig()
         reloadSessions()
         refreshDiagnostics()
+        refreshAudioDeviceContext()
         autoStartMLXServerIfNeeded()
     }
 
@@ -1336,9 +1480,130 @@ final class AppModel: ObservableObject {
 
     var selectedSession: ContoraSession? {
         guard let selectedSessionID else {
-            return sessions.first
+            return visibleSessions.first
         }
-        return sessions.first(where: { $0.id == selectedSessionID }) ?? sessions.first
+        return sessions.first(where: { $0.id == selectedSessionID }) ?? visibleSessions.first
+    }
+
+    var visibleSessions: [ContoraSession] {
+        let query = sessionSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let filtered = sessions.filter { session in
+            let matchesStatus: Bool
+            switch sessionStatusFilter {
+            case .all:
+                matchesStatus = true
+            case .recordedOnly:
+                matchesStatus = session.transcriptURL == nil
+            case .transcribed:
+                matchesStatus = session.transcriptURL != nil && session.metadata.success != false
+            case .failed:
+                matchesStatus = session.metadata.success == false
+            }
+
+            guard matchesStatus else { return false }
+            guard !query.isEmpty else { return true }
+
+            return session.title.lowercased().contains(query)
+                || session.transcriptPreview.lowercased().contains(query)
+                || (session.metadata.mode?.lowercased().contains(query) ?? false)
+                || (session.metadata.endpoint?.lowercased().contains(query) ?? false)
+        }
+
+        switch sessionSortMode {
+        case .newest:
+            return filtered.sorted { $0.createdAt > $1.createdAt }
+        case .oldest:
+            return filtered.sorted { $0.createdAt < $1.createdAt }
+        case .title:
+            return filtered.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .duration:
+            return filtered.sorted { ($0.metadata.audioSeconds ?? 0) > ($1.metadata.audioSeconds ?? 0) }
+        }
+    }
+
+    var recordingsFolderPath: String {
+        (try? RecordingArchiveService.recordingsDirectoryURL().path) ?? "Recordings directory unavailable"
+    }
+
+    var isBusyWithOperation: Bool {
+        isRecording || isTranscribing || isStreamingChunkTranscribing || isFinalizingStop
+    }
+
+    var isTranscriptionBusy: Bool {
+        isPreparingTranscription || isTranscribing
+    }
+
+    var pendingTranscriptionJobsCount: Int {
+        transcriptionJobs.filter { $0.state == .queued }.count
+    }
+
+    var activeTranscriptionJob: TranscriptionJob? {
+        guard let activeTranscriptionJobID else { return nil }
+        return transcriptionJobs.first(where: { $0.id == activeTranscriptionJobID })
+    }
+
+    var canStartRecording: Bool {
+        !isRecording && !isFinalizingStop
+    }
+
+    var activeBackendDisplay: String {
+        switch transcriptionBackend {
+        case .whisperHTTP:
+            return "Whisper HTTP | \(transcriptionEndpoint)"
+        case .mlxOpenAIHTTP:
+            return "MLX OpenAI HTTP | \(mlxModelID)"
+        case .fasterWhisperProcess:
+            let diarization = fasterWhisperDiarizationEnabled ? "diarization on" : "diarization off"
+            return "Local Faster Whisper | \(fasterWhisperModelName), \(diarization)"
+        }
+    }
+
+    var isLocalWhisperBusy: Bool {
+        isSettingUpLocalWhisper || isInstallingFasterWhisperRuntime || isDownloadingFasterWhisperModel
+    }
+
+    var localWhisperPrimaryActionTitle: String {
+        let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
+        let runtimeInstalled = fasterWhisperRuntimeInstaller.status().isInstalled
+        let modelInstalled = SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName)
+        if runtimeInstalled && modelInstalled {
+            return "Repair Local Whisper"
+        }
+        if runtimeInstalled {
+            return "Download Model"
+        }
+        return "Set Up Local Whisper"
+    }
+
+    func selectTranscriptionBackend(_ backend: TranscriptionBackend) {
+        transcriptionBackend = backend
+        transcriptionEnabled = true
+        saveSharedServerConfig()
+        refreshDiagnostics()
+        probeSharedBackend()
+    }
+
+    func updateFasterWhisperModelName(_ modelName: String) {
+        fasterWhisperModelName = WhisperModelOption.normalizedName(modelName)
+        saveSharedServerConfig()
+        refreshDiagnostics()
+    }
+
+    func updateFasterWhisperDiarization(_ enabled: Bool) {
+        fasterWhisperDiarizationEnabled = enabled
+        saveSharedServerConfig()
+        refreshDiagnostics()
+    }
+
+    var captureScopeDescription: String {
+        switch captureSourceMode {
+        case .microphone:
+            return "Microphone only. System audio is not captured."
+        case .systemAudio:
+            return "System-wide audio only. Microphone is not included."
+        case .mixed:
+            return "System-wide audio plus the active microphone are mixed into one recording."
+        }
     }
 
     func loadSharedServerConfig() {
@@ -1348,6 +1613,8 @@ final class AppModel: ObservableObject {
             transcriptionEndpoint = config.whisperTranscribeURL
             mlxTranscriptionEndpoint = config.mlxTranscribeURL
             mlxModelID = config.mlxModelID
+            fasterWhisperModelName = WhisperModelOption.normalizedName(config.fasterWhisperModelName)
+            fasterWhisperDiarizationEnabled = config.fasterWhisperDiarizationEnabled
             sharedServerConfigStatus = "Loaded (\(config.schemaVersion))"
         } catch {
             sharedServerConfigStatus = "Load failed: \(error.localizedDescription)"
@@ -1361,6 +1628,8 @@ final class AppModel: ObservableObject {
             whisperTranscribeURL: transcriptionEndpoint,
             mlxTranscribeURL: mlxTranscriptionEndpoint,
             mlxModelID: mlxModelID,
+            fasterWhisperModelName: fasterWhisperModelName,
+            fasterWhisperDiarizationEnabled: fasterWhisperDiarizationEnabled,
             updatedAt: ISO8601DateFormatter().string(from: Date())
         )
         do {
@@ -1372,40 +1641,62 @@ final class AppModel: ObservableObject {
     }
 
     func retranscribeSession(_ session: ContoraSession) {
-        guard !isRecording, !isTranscribing, !isFinalizingStop else { return }
+        enqueueTranscription(for: session)
+    }
 
-        isFinalizingStop = true
-        statusMessage = "Loading audio..."
-        postStopStartedAt = Date()
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let result = try audioFileImportService.importAudioFile(from: session.recordingURL)
-                await MainActor.run {
-                    self.lastAudioDurationSeconds = result.durationSeconds
-                    self.lastCaptureSamples = result.samples16kMono.count
-                    self.currentRecordingFileURL = session.recordingURL
-                    self.currentSessionIdentity = RecordingArchiveService.SessionIdentity(
-                        sessionID: session.id,
-                        title: session.title,
-                        createdAt: session.createdAt
-                    )
-                    self.statusMessage = "Transcribing \(session.title)..."
-                    self.runTranscription(
-                        samples16k: result.samples16kMono,
-                        audioDurationSeconds: result.durationSeconds,
-                        mode: .normal
-                    )
-                }
-            } catch {
-                await MainActor.run {
-                    self.isFinalizingStop = false
-                    self.statusMessage = "Failed to load audio"
-                    self.lastTranscript = "Error loading audio: \(error.localizedDescription)"
-                }
-            }
+    func enqueueTranscription(for session: ContoraSession) {
+        let alreadyPending = transcriptionJobs.contains {
+            $0.sessionID == session.id && ($0.state == .queued || $0.state == .preparing || $0.state == .transcribing)
         }
+        guard !alreadyPending else {
+            statusMessage = "\(session.title) is already in the transcription queue"
+            return
+        }
+
+        let job = TranscriptionJob(
+            id: UUID(),
+            sessionID: session.id,
+            sessionTitle: session.title,
+            recordingURL: session.recordingURL,
+            createdAt: Date(),
+            state: .queued,
+            audioSeconds: session.metadata.audioSeconds ?? 0,
+            elapsedSeconds: 0,
+            remainingSeconds: nil,
+            progress: nil,
+            speedRatio: nil,
+            statusText: "Waiting",
+            errorMessage: nil
+        )
+
+        transcriptionJobs.insert(job, at: 0)
+        transcriptionQueue.append(job.id)
+        transcriptionJobSessions[job.id] = session
+        statusMessage = isTranscriptionBusy ? "Queued \(session.title)" : "Queued \(session.title), starting..."
+        processNextTranscriptionJobIfNeeded()
+    }
+
+    func cancelActiveTranscription() {
+        guard let jobID = activeTranscriptionJobID else {
+            statusMessage = "No active transcription to stop"
+            return
+        }
+
+        activeTranscriptionTask?.cancel()
+        transcriptionTickerTask?.cancel()
+        transcriptionTickerTask = nil
+        isPreparingTranscription = false
+        isTranscribing = false
+        activeTranscriptionJobID = nil
+        statusMessage = "Transcription stopped"
+        updateTranscriptionJob(jobID) { job in
+            job.state = .cancelled
+            job.statusText = "Stopped by user"
+            job.remainingSeconds = nil
+            job.progress = nil
+            job.errorMessage = nil
+        }
+        finishTranscriptionState()
     }
 
     func probeSharedBackend() {
@@ -1415,7 +1706,8 @@ final class AppModel: ObservableObject {
             let status = await SharedTranscriptionServerConfigStore.shared.probe(
                 backend: transcriptionBackend,
                 whisperURL: transcriptionEndpoint,
-                mlxURL: mlxTranscriptionEndpoint
+                mlxURL: mlxTranscriptionEndpoint,
+                fasterWhisperModelName: fasterWhisperModelName
             )
             await MainActor.run {
                 self.backendProbeStatus = status
@@ -1450,6 +1742,14 @@ final class AppModel: ObservableObject {
         diagnostics.modelsDirectoryStatus = fileManager.fileExists(atPath: diagnostics.modelsDirectoryPath, isDirectory: &isDirectory) && isDirectory.boolValue ? "Present" : "Missing"
         diagnostics.sharedConfigStatus = fileManager.fileExists(atPath: diagnostics.sharedConfigPath) ? "Present" : "Missing"
         diagnostics.sharedModelCatalogStatus = fileManager.fileExists(atPath: diagnostics.sharedModelCatalogPath) ? "Present" : "Missing"
+        fasterWhisperRuntimeStatus = fasterWhisperRuntimeInstaller.status().displayText
+        let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
+        fasterWhisperDownloadStatus = SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName)
+            ? "\(modelName) installed"
+            : "\(modelName) not installed"
+        localWhisperSetupStatus = fasterWhisperRuntimeInstaller.status().isInstalled && SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName)
+            ? "Ready with \(modelName)"
+            : "Needs setup"
 
         refreshFFmpegDiagnostics()
         refreshSharedModelCatalog()
@@ -1607,7 +1907,7 @@ final class AppModel: ObservableObject {
         do {
             sessions = try sessionLibrary.loadSessions()
             if selectedSessionID == nil || !sessions.contains(where: { $0.id == selectedSessionID }) {
-                selectedSessionID = sessions.first?.id
+                selectedSessionID = visibleSessions.first?.id ?? sessions.first?.id
             }
             loadEditorForSelectedSession()
             sessionLibraryStatus = "Loaded \(sessions.count) session(s)"
@@ -1625,12 +1925,257 @@ final class AppModel: ObservableObject {
         loadEditorForSelectedSession()
     }
 
+    func selectFirstVisibleSessionIfNeeded() {
+        if let selectedSessionID, visibleSessions.contains(where: { $0.id == selectedSessionID }) {
+            return
+        }
+        selectSession(visibleSessions.first?.id)
+    }
+
     func revealSession(_ session: ContoraSession) {
         NSWorkspace.shared.activateFileViewerSelecting([session.recordingURL])
     }
 
     func openURL(_ url: URL) {
         NSWorkspace.shared.open(url)
+    }
+
+    func openRecordingsFolder() {
+        do {
+            let directory = try RecordingArchiveService.recordingsDirectoryURL()
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(directory)
+        } catch {
+            statusMessage = "Failed to open recordings folder"
+        }
+    }
+
+    func openFasterWhisperRuntimeFolder() {
+        let root = SharedRuntimePaths.whisperRoot()
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(root)
+    }
+
+    func openFasterWhisperRuntimeReleases() {
+        if let url = URL(string: "https://github.com/iamniketas/contora/releases") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func installFasterWhisperRuntime() {
+        guard !isInstallingFasterWhisperRuntime else { return }
+
+        isInstallingFasterWhisperRuntime = true
+        fasterWhisperRuntimeStatus = "Starting runtime install..."
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let status = try await self.fasterWhisperRuntimeInstaller.install { message in
+                    Task { @MainActor in
+                        self.fasterWhisperRuntimeStatus = message
+                    }
+                }
+                await MainActor.run {
+                    self.isInstallingFasterWhisperRuntime = false
+                    self.fasterWhisperRuntimeStatus = status.displayText
+                    self.refreshDiagnostics()
+                    self.probeSharedBackend()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isInstallingFasterWhisperRuntime = false
+                    self.fasterWhisperRuntimeStatus = "Install failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func setUpLocalWhisper() {
+        guard !isSettingUpLocalWhisper else { return }
+
+        let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
+        fasterWhisperModelName = modelName
+        transcriptionEnabled = true
+        transcriptionBackend = .fasterWhisperProcess
+
+        let runtimeStatus = fasterWhisperRuntimeInstaller.status()
+        if runtimeStatus.isInstalled && SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName) {
+            fasterWhisperRuntimeStatus = runtimeStatus.displayText
+            fasterWhisperDownloadStatus = "\(modelName) installed"
+            localWhisperSetupStatus = "Ready with \(modelName)"
+            saveSharedServerConfig()
+            refreshDiagnostics()
+            probeSharedBackend()
+            return
+        }
+
+        isSettingUpLocalWhisper = true
+        isInstallingFasterWhisperRuntime = true
+        localWhisperSetupStatus = "Preparing Local Whisper..."
+        fasterWhisperRuntimeStatus = "Checking runtime..."
+        fasterWhisperDownloadStatus = "Checking \(modelName)..."
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let runtimeStatus = self.fasterWhisperRuntimeInstaller.status()
+                if runtimeStatus.isInstalled {
+                    await MainActor.run {
+                        self.isInstallingFasterWhisperRuntime = false
+                        self.fasterWhisperRuntimeStatus = runtimeStatus.displayText
+                        self.localWhisperSetupStatus = "Runtime already installed"
+                    }
+                } else {
+                    _ = try await self.fasterWhisperRuntimeInstaller.install { message in
+                        Task { @MainActor in
+                            self.fasterWhisperRuntimeStatus = message
+                            self.localWhisperSetupStatus = message
+                        }
+                    }
+                    await MainActor.run {
+                        self.isInstallingFasterWhisperRuntime = false
+                    }
+                }
+
+                if SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName) {
+                    await MainActor.run {
+                        self.fasterWhisperDownloadStatus = "\(modelName) installed"
+                        self.localWhisperSetupStatus = "Model already installed"
+                    }
+                } else {
+                    await MainActor.run {
+                        self.isDownloadingFasterWhisperModel = true
+                        self.fasterWhisperDownloadStatus = "Preparing \(modelName)..."
+                        self.localWhisperSetupStatus = "Downloading \(modelName)..."
+                    }
+                    let modelService = FasterWhisperModelDownloadService(modelName: modelName)
+                    try await modelService.download { progress in
+                        Task { @MainActor in
+                            let total = progress.totalBytes > 0 ? " / \(Self.formatBytes(progress.totalBytes))" : ""
+                            let message = "\(modelName): \(progress.percent)% \(Self.formatBytes(progress.downloadedBytes))\(total)"
+                            self.fasterWhisperDownloadStatus = "\(message) (\(progress.currentFile))"
+                            self.localWhisperSetupStatus = message
+                        }
+                    }
+                }
+
+                await MainActor.run {
+                    self.isDownloadingFasterWhisperModel = false
+                    self.isInstallingFasterWhisperRuntime = false
+                    self.isSettingUpLocalWhisper = false
+                    self.fasterWhisperDownloadStatus = "\(modelName) installed"
+                    self.localWhisperSetupStatus = "Ready with \(modelName)"
+                    self.saveSharedServerConfig()
+                    self.refreshDiagnostics()
+                    self.refreshSharedModelCatalog()
+                    self.probeSharedBackend()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isDownloadingFasterWhisperModel = false
+                    self.isInstallingFasterWhisperRuntime = false
+                    self.isSettingUpLocalWhisper = false
+                    self.fasterWhisperRuntimeStatus = self.fasterWhisperRuntimeInstaller.status().displayText
+                    self.localWhisperSetupStatus = "Setup failed: \(error.localizedDescription)"
+                    self.backendProbeStatus = "Local Whisper setup failed"
+                }
+            }
+        }
+    }
+
+    func resetLocalWhisperRuntime(preservingModels: Bool = true) {
+        guard !isLocalWhisperBusy else { return }
+
+        do {
+            try fasterWhisperRuntimeInstaller.resetRuntime(preservingModels: preservingModels)
+            refreshDiagnostics()
+            let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
+            fasterWhisperDownloadStatus = SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName)
+                ? "\(modelName) installed"
+                : "\(modelName) not installed"
+            localWhisperSetupStatus = preservingModels ? "Runtime reset; press Set Up Local Whisper" : "Local Whisper deleted"
+            backendProbeStatus = "Local Whisper reset"
+        } catch {
+            localWhisperSetupStatus = "Reset failed: \(error.localizedDescription)"
+        }
+    }
+
+    func downloadSelectedFasterWhisperModel() {
+        guard !isDownloadingFasterWhisperModel else { return }
+
+        let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
+        fasterWhisperModelName = modelName
+        isDownloadingFasterWhisperModel = true
+        fasterWhisperDownloadStatus = "Preparing \(modelName)..."
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let service = FasterWhisperModelDownloadService(modelName: modelName)
+                try await service.download { progress in
+                    Task { @MainActor in
+                        let total = progress.totalBytes > 0 ? " / \(Self.formatBytes(progress.totalBytes))" : ""
+                        self.fasterWhisperDownloadStatus = "\(modelName): \(progress.percent)% \(Self.formatBytes(progress.downloadedBytes))\(total) (\(progress.currentFile))"
+                    }
+                }
+                await MainActor.run {
+                    self.isDownloadingFasterWhisperModel = false
+                    self.fasterWhisperDownloadStatus = "\(modelName) installed"
+                    self.refreshSharedModelCatalog()
+                    self.probeSharedBackend()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isDownloadingFasterWhisperModel = false
+                    self.fasterWhisperDownloadStatus = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func refreshAudioDeviceContext() {
+        activeMicrophoneName = AVCaptureDevice.default(for: .audio)?.localizedName ?? "No active microphone detected"
+        activeOutputDeviceName = currentDefaultOutputDeviceName() ?? "Default output unavailable"
+        permissions.refresh()
+    }
+
+    func playSegment(_ segment: EditableSessionSegment, in session: ContoraSession) {
+        if playingSegmentID == segment.id {
+            stopSegmentPlayback()
+            return
+        }
+
+        stopSegmentPlayback()
+
+        let player = AVPlayer(url: session.recordingURL)
+        let startTime = CMTime(seconds: max(0, segment.startSeconds), preferredTimescale: 600)
+        let playbackSeconds = max(0.25, segment.endSeconds - segment.startSeconds)
+        segmentPlayer = player
+        playingSegmentID = segment.id
+
+        player.seek(to: startTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            Task { @MainActor in
+                guard self?.playingSegmentID == segment.id else { return }
+                player.play()
+            }
+        }
+
+        segmentPlaybackTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(playbackSeconds * 1000)))
+            await MainActor.run {
+                guard self?.playingSegmentID == segment.id else { return }
+                self?.stopSegmentPlayback()
+            }
+        }
+    }
+
+    func stopSegmentPlayback() {
+        segmentPlaybackTask?.cancel()
+        segmentPlaybackTask = nil
+        segmentPlayer?.pause()
+        segmentPlayer = nil
+        playingSegmentID = nil
     }
 
     func saveSelectedSessionEdits() {
@@ -1669,8 +2214,9 @@ final class AppModel: ObservableObject {
                 segments = parsed.segments
             }
 
-            let txtURL = try recordingArchive.saveTranscriptText(for: session.recordingURL, transcriptText: transcriptText)
-            let jsonURL = try recordingArchive.updateTranscriptJSONPreservingMetadata(for: session.recordingURL, transcriptText: transcriptText)
+            let artifactBaseURL = artifactBaseURL(for: session.id, recordingURL: session.recordingURL)
+            let txtURL = try recordingArchive.saveTranscriptText(for: session.recordingURL, artifactBaseURL: artifactBaseURL, transcriptText: transcriptText)
+            let jsonURL = try recordingArchive.updateTranscriptJSONPreservingMetadata(for: session.recordingURL, artifactBaseURL: artifactBaseURL, transcriptText: transcriptText)
             let createdAt = ISO8601DateFormatter().date(from: session.metadata.createdAt ?? "") ?? session.createdAt
             let siblingM4A = existingSiblingM4A(for: session.recordingURL)
             _ = try recordingArchive.saveSessionManifest(
@@ -1699,9 +2245,11 @@ final class AppModel: ObservableObject {
                             text: $0.text
                         )
                     }
-                )
+                ),
+                manifestBaseURL: artifactBaseURL?.deletingLastPathComponent()
             )
             sessionEditorStatus = "Saved"
+            sessionEditorHasUnsavedChanges = false
             reloadSessions()
         } catch {
             sessionEditorStatus = "Save failed: \(error.localizedDescription)"
@@ -1712,6 +2260,17 @@ final class AppModel: ObservableObject {
         for index in sessionEditorSegments.indices where sessionEditorSegments[index].speakerID == speakerID {
             sessionEditorSegments[index].speakerName = newName
         }
+        sessionEditorHasUnsavedChanges = true
+        sessionEditorStatus = "Unsaved changes"
+    }
+
+    func updateSegmentText(segmentID: String, newText: String) {
+        guard let index = sessionEditorSegments.firstIndex(where: { $0.id == segmentID }) else {
+            return
+        }
+        sessionEditorSegments[index].text = newText
+        sessionEditorHasUnsavedChanges = true
+        sessionEditorStatus = "Unsaved changes"
     }
 
     private func loadEditorForSelectedSession() {
@@ -1719,6 +2278,7 @@ final class AppModel: ObservableObject {
             sessionEditorTranscriptDraft = ""
             sessionEditorSegments = []
             sessionEditorStatus = "No session selected"
+            sessionEditorHasUnsavedChanges = false
             return
         }
 
@@ -1741,6 +2301,7 @@ final class AppModel: ObservableObject {
             )
         }
         sessionEditorStatus = "Loaded"
+        sessionEditorHasUnsavedChanges = false
     }
 
     private func formatTranscriptTime(_ seconds: Double) -> String {
@@ -1749,6 +2310,49 @@ final class AppModel: ObservableObject {
         let wholeSeconds = Int(seconds) % 60
         let milliseconds = Int((seconds - floor(seconds)) * 1000)
         return String(format: "%02d:%02d:%02d.%03d", hours, minutes, wholeSeconds, milliseconds)
+    }
+
+    private func currentDefaultOutputDeviceName() -> String? {
+        var deviceAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(0)
+        var deviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let deviceStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &deviceAddress,
+            0,
+            nil,
+            &deviceIDSize,
+            &deviceID
+        )
+
+        guard deviceStatus == noErr, deviceID != AudioDeviceID(kAudioObjectUnknown) else {
+            return nil
+        }
+
+        var nameAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceName = [CChar](repeating: 0, count: 256)
+        var nameSize = UInt32(deviceName.count)
+        let nameStatus = AudioObjectGetPropertyData(
+            deviceID,
+            &nameAddress,
+            0,
+            nil,
+            &nameSize,
+            &deviceName
+        )
+
+        guard nameStatus == noErr else {
+            return nil
+        }
+        return String(cString: deviceName)
     }
 
     private func applyStoragePolicy(to wavURL: URL) async -> URL {
@@ -1786,8 +2390,19 @@ final class AppModel: ObservableObject {
         return recordingURL.pathExtension.lowercased() == "m4a" ? recordingURL : nil
     }
 
+    private func artifactBaseURL(for sessionID: String, recordingURL: URL) -> URL? {
+        guard let recordingsDirectory = try? RecordingArchiveService.recordingsDirectoryURL() else {
+            return nil
+        }
+        let recordingDirectory = recordingURL.deletingLastPathComponent().standardizedFileURL
+        if recordingDirectory == recordingsDirectory.standardizedFileURL {
+            return nil
+        }
+        return recordingsDirectory.appendingPathComponent(sessionID)
+    }
+
     func importAudioFile(from fileURL: URL) {
-        guard !isRecording, !isTranscribing, !isFinalizingStop else {
+        guard !isRecording, !isFinalizingStop else {
             statusMessage = "Finish the current operation before importing audio"
             return
         }
@@ -1798,7 +2413,7 @@ final class AppModel: ObservableObject {
     }
 
     func importVideoFile(from fileURL: URL) {
-        guard !isRecording, !isTranscribing, !isFinalizingStop else {
+        guard !isRecording, !isFinalizingStop else {
             statusMessage = "Finish the current operation before importing video"
             return
         }
@@ -1818,7 +2433,7 @@ final class AppModel: ObservableObject {
                 await self?.stopRecordingFlow()
             }
         } else {
-            if isTranscribing || isStreamingChunkTranscribing || isFinalizingStop {
+            if isFinalizingStop {
                 return
             }
             Task { [weak self] in
@@ -1829,6 +2444,7 @@ final class AppModel: ObservableObject {
 
     private func startRecordingFlow() async {
         do {
+            refreshAudioDeviceContext()
             if requiresMicrophoneCapture() {
                 try audioCapture.startCapture(keepNativeBufferForStreaming: streamingEnabled && transcriptionEnabled && captureSourceMode != .systemAudio)
             }
@@ -1837,17 +2453,14 @@ final class AppModel: ObservableObject {
             }
 
             isRecording = true
-            isTranscribing = false
             isStreamingChunkTranscribing = false
             isStreamingLoopActive = false
             recordingSeconds = 0
-            transcriptionElapsedSeconds = 0
             postStopWaitSeconds = 0
             lastPostStopWaitSeconds = 0
             lastStreamingSpeedupVsNormal = 0
             lastCaptureSamples = 0
             streamingChunksProcessed = 0
-            lastRealtimeSpeedRatio = 0
             streamProcessedNativeIndex = 0
             streamingAccumulatedTranscript = ""
             currentRecordingFileURL = nil
@@ -1873,39 +2486,25 @@ final class AppModel: ObservableObject {
 
     private func importAudioFileFlow(from fileURL: URL) async {
         isFinalizingStop = true
-        statusMessage = "Importing audio..."
-        lastTranscript = "Preparing imported audio..."
+        statusMessage = "Importing audio reference..."
+        lastTranscript = "Registering selected audio. Audio processing starts only when you press Start Transcribing."
         postStopStartedAt = Date()
         startPostStopTicker()
 
         do {
-            let result = try audioFileImportService.importAudioFile(from: fileURL)
-            lastAudioDurationSeconds = result.durationSeconds
-            lastCaptureSamples = result.samples16kMono.count
-            let archive = try recordingArchive.saveRecording(samples16kMono: result.samples16kMono)
-            let storedRecordingURL = await applyStoragePolicy(to: archive.1)
+            let archive = try await registerImportedMediaInBackground(fileURL: fileURL, sourceMode: "Imported Audio")
+            let storedRecordingURL = archive.1
+            lastAudioDurationSeconds = 0
+            lastCaptureSamples = 0
             lastSavedRecordingPath = storedRecordingURL.path
             currentRecordingFileURL = storedRecordingURL
             currentSessionIdentity = archive.0
-            _ = try? recordingArchive.saveSessionManifest(
-                sessionID: archive.0,
-                recordingFileURL: storedRecordingURL,
-                captureSourceMode: "Imported Audio",
-                audioSeconds: result.durationSeconds,
-                recordingM4AURL: existingSiblingM4A(for: storedRecordingURL)
-            )
+            selectedSessionID = archive.0.sessionID
             reloadSessions()
-
-            if transcriptionEnabled {
-                statusMessage = "Imported audio ready, transcribing..."
-                lastTranscript = "Imported \(fileURL.lastPathComponent), \(formatSeconds(result.durationSeconds))."
-                runTranscription(samples16k: result.samples16kMono, audioDurationSeconds: result.durationSeconds, mode: .normal)
-            } else {
-                completePostStopMeasurement(mode: .normal)
-                statusMessage = "Imported audio saved"
-                lastTranscript = "Imported \(fileURL.lastPathComponent) as session WAV."
-                finishProcessingState()
-            }
+            completePostStopMeasurement(mode: .normal)
+            statusMessage = "Imported audio ready"
+            lastTranscript = "Imported \(fileURL.lastPathComponent). Press Start Transcribing to decode and transcribe it."
+            finishProcessingState()
         } catch {
             finishProcessingState()
             statusMessage = "Import failed"
@@ -1915,39 +2514,25 @@ final class AppModel: ObservableObject {
 
     private func importVideoFileFlow(from fileURL: URL) async {
         isFinalizingStop = true
-        statusMessage = "Importing video..."
-        lastTranscript = "Extracting audio from video..."
+        statusMessage = "Importing video reference..."
+        lastTranscript = "Registering selected video. Audio extraction starts only when you press Start Transcribing."
         postStopStartedAt = Date()
         startPostStopTicker()
 
         do {
-            let result = try videoFileImportService.importVideoFile(from: fileURL)
-            lastAudioDurationSeconds = result.durationSeconds
-            lastCaptureSamples = result.samples16kMono.count
-            let archive = try recordingArchive.saveRecording(samples16kMono: result.samples16kMono)
-            let storedRecordingURL = await applyStoragePolicy(to: archive.1)
+            let archive = try await registerImportedMediaInBackground(fileURL: fileURL, sourceMode: "Imported Video")
+            let storedRecordingURL = archive.1
+            lastAudioDurationSeconds = 0
+            lastCaptureSamples = 0
             lastSavedRecordingPath = storedRecordingURL.path
             currentRecordingFileURL = storedRecordingURL
             currentSessionIdentity = archive.0
-            _ = try? recordingArchive.saveSessionManifest(
-                sessionID: archive.0,
-                recordingFileURL: storedRecordingURL,
-                captureSourceMode: "Imported Video",
-                audioSeconds: result.durationSeconds,
-                recordingM4AURL: existingSiblingM4A(for: storedRecordingURL)
-            )
+            selectedSessionID = archive.0.sessionID
             reloadSessions()
-
-            if transcriptionEnabled {
-                statusMessage = "Video audio ready, transcribing..."
-                lastTranscript = "Imported \(fileURL.lastPathComponent), \(formatSeconds(result.durationSeconds))."
-                runTranscription(samples16k: result.samples16kMono, audioDurationSeconds: result.durationSeconds, mode: .normal)
-            } else {
-                completePostStopMeasurement(mode: .normal)
-                statusMessage = "Video audio saved"
-                lastTranscript = "Imported \(fileURL.lastPathComponent) as session WAV."
-                finishProcessingState()
-            }
+            completePostStopMeasurement(mode: .normal)
+            statusMessage = "Imported video ready"
+            lastTranscript = "Imported \(fileURL.lastPathComponent). Press Start Transcribing to extract audio and transcribe it."
+            finishProcessingState()
         } catch {
             finishProcessingState()
             statusMessage = "Video import failed"
@@ -1964,6 +2549,8 @@ final class AppModel: ObservableObject {
         lastTranscript = "Finalizing recording..."
         postStopStartedAt = Date()
         startPostStopTicker()
+        var savedRecordingURL: URL?
+        var savedSessionIdentity: RecordingArchiveService.SessionIdentity?
 
         do {
             if streamingEnabled && transcriptionEnabled {
@@ -2005,6 +2592,8 @@ final class AppModel: ObservableObject {
                 lastSavedRecordingPath = storedRecordingURL.path
                 currentRecordingFileURL = storedRecordingURL
                 currentSessionIdentity = archive.0
+                savedRecordingURL = storedRecordingURL
+                savedSessionIdentity = archive.0
                 _ = try? recordingArchive.saveSessionManifest(
                     sessionID: archive.0,
                     recordingFileURL: storedRecordingURL,
@@ -2012,36 +2601,44 @@ final class AppModel: ObservableObject {
                     audioSeconds: result.durationSeconds,
                     recordingM4AURL: existingSiblingM4A(for: storedRecordingURL)
                 )
+                selectedSessionID = archive.0.sessionID
                 reloadSessions()
             } catch {
                 statusMessage = "Recording saved in memory only (archive error)."
             }
 
-            if transcriptionEnabled {
-                if streamingEnabled {
+            if transcriptionEnabled && streamingEnabled {
                     let trimmed = streamingAccumulatedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
                     if trimmed.isEmpty {
-                        statusMessage = "Streaming returned no text, running full transcription fallback..."
-                        lastTranscript = "Streaming fallback: running full transcription..."
-                        runTranscription(samples16k: result.samples16kMono, audioDurationSeconds: result.durationSeconds, mode: .streamingFallback)
+                        completePostStopMeasurement(mode: .normal)
+                        statusMessage = "Recording saved"
+                        lastTranscript = "Streaming returned no text. Saved \(formatSeconds(result.durationSeconds)); start transcription manually."
+                        finishProcessingState()
                     } else {
                         lastTranscriptionDurationSeconds = Date().timeIntervalSince(postStopStartedAt ?? Date())
                         lastRealtimeSpeedRatio = lastTranscriptionDurationSeconds > 0 ? result.durationSeconds / lastTranscriptionDurationSeconds : 0
                         completePostStopMeasurement(mode: .streaming)
                         statusMessage = "Streaming transcription complete (wait \(formatSeconds(lastPostStopWaitSeconds)))"
                         lastTranscript = trimmed
-                        persistTranscript(text: trimmed, mode: .streaming, success: true, errorMessage: nil)
+                        if let savedRecordingURL, let savedSessionIdentity {
+                            persistTranscript(
+                                text: trimmed,
+                                mode: .streaming,
+                                success: true,
+                                errorMessage: nil,
+                                recordingURL: savedRecordingURL,
+                                sessionIdentity: savedSessionIdentity,
+                                captureSourceModeString: captureSourceMode.rawValue,
+                                audioDurationSeconds: result.durationSeconds,
+                                transcriptionDurationSeconds: lastTranscriptionDurationSeconds
+                            )
+                        }
                         finishProcessingState()
                     }
-                } else {
-                    statusMessage = "Capture complete, transcribing..."
-                    lastTranscript = "Captured \(Int(result.durationSeconds * 10) / 10)s, \(result.samples16kMono.count) samples (16k mono)."
-                    runTranscription(samples16k: result.samples16kMono, audioDurationSeconds: result.durationSeconds, mode: .normal)
-                }
             } else {
                 completePostStopMeasurement(mode: .normal)
                 statusMessage = "Recording saved"
-                lastTranscript = "Saved \(formatSeconds(result.durationSeconds)) (\(result.samples16kMono.count) samples)."
+                lastTranscript = "Saved \(formatSeconds(result.durationSeconds)) (\(result.samples16kMono.count) samples). Ready to transcribe."
                 finishProcessingState()
             }
         } catch {
@@ -2099,6 +2696,8 @@ final class AppModel: ObservableObject {
             return transcriptionEndpoint
         case .mlxOpenAIHTTP:
             return mlxTranscriptionEndpoint
+        case .fasterWhisperProcess:
+            return SharedRuntimePaths.whisperExecutable().path
         }
     }
 
@@ -2124,7 +2723,271 @@ final class AppModel: ObservableObject {
                 endpointURL: endpointURL,
                 modelID: mlxModelID
             )
+
+        case .fasterWhisperProcess:
+            let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
+            let language = transcriptionLanguage
+            let enableDiarization = fasterWhisperDiarizationEnabled
+            let wavData = WAVEncoder.makeWAVData(samples: samples16k, sampleRate: 16_000)
+            return try await Task.detached(priority: .userInitiated) {
+                let workDirectory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("contora-faster-whisper-\(UUID().uuidString)", isDirectory: true)
+                try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: workDirectory) }
+
+                let audioURL = workDirectory.appendingPathComponent("audio.wav")
+                try wavData.write(to: audioURL, options: .atomic)
+
+                let service = FasterWhisperProcessTranscriptionService(
+                    modelName: modelName,
+                    language: language,
+                    enableDiarization: enableDiarization
+                )
+                return try service.transcribe(audioFileURL: audioURL, outputDirectory: workDirectory)
+            }.value
         }
+    }
+
+    private func importAudioInBackground(from fileURL: URL) async throws -> AudioCaptureResult {
+        try await Task.detached(priority: .userInitiated) {
+            try AudioFileImportService().importAudioFile(from: fileURL)
+        }.value
+    }
+
+    private func importVideoInBackground(from fileURL: URL) async throws -> AudioCaptureResult {
+        try await Task.detached(priority: .userInitiated) {
+            try VideoFileImportService().importVideoFile(from: fileURL)
+        }.value
+    }
+
+    private func prepareMediaForTranscriptionInBackground(session: ContoraSession) async throws -> AudioCaptureResult {
+        let recordingURL = session.recordingURL
+        let mode = session.metadata.mode ?? ""
+        return try await Task.detached(priority: .userInitiated) {
+            if Self.isVideoMedia(recordingURL) || mode == "Imported Video" {
+                return try VideoFileImportService().importVideoFile(from: recordingURL)
+            }
+            return try AudioFileImportService().importAudioFile(from: recordingURL)
+        }.value
+    }
+
+    private func saveRecordingInBackground(samples16kMono: [Float]) async throws -> (RecordingArchiveService.SessionIdentity, URL) {
+        try await Task.detached(priority: .userInitiated) {
+            try RecordingArchiveService().saveRecording(samples16kMono: samples16kMono)
+        }.value
+    }
+
+    private func registerImportedMediaInBackground(fileURL: URL, sourceMode: String) async throws -> (RecordingArchiveService.SessionIdentity, URL) {
+        try await Task.detached(priority: .userInitiated) {
+            try RecordingArchiveService().registerImportedMedia(fileURL: fileURL, sourceMode: sourceMode)
+        }.value
+    }
+
+    private nonisolated static func isVideoMedia(_ url: URL) -> Bool {
+        ["mp4", "m4v", "mov", "avi", "mkv", "webm", "wmv"].contains(url.pathExtension.lowercased())
+    }
+
+    private func processNextTranscriptionJobIfNeeded() {
+        guard activeTranscriptionJobID == nil else { return }
+        guard !transcriptionQueue.isEmpty else {
+            isPreparingTranscription = false
+            isTranscribing = false
+            activeTranscriptionAudioSeconds = 0
+            activeTranscriptionSessionTitle = ""
+            return
+        }
+
+        let jobID = transcriptionQueue.removeFirst()
+        guard let session = transcriptionJobSessions[jobID] else {
+            updateTranscriptionJob(jobID) { job in
+                job.state = .failed
+                job.statusText = "Session unavailable"
+                job.errorMessage = "Session was removed before transcription started."
+            }
+            processNextTranscriptionJobIfNeeded()
+            return
+        }
+
+        activeTranscriptionJobID = jobID
+        isPreparingTranscription = true
+        isTranscribing = false
+        activeTranscriptionSessionTitle = session.title
+        activeTranscriptionAudioSeconds = session.metadata.audioSeconds ?? 0
+        transcriptionElapsedSeconds = 0
+        statusMessage = "Preparing audio for \(session.title)..."
+        updateTranscriptionJob(jobID) { job in
+            job.state = .preparing
+            job.statusText = "Decoding and resampling audio"
+            job.elapsedSeconds = 0
+            job.remainingSeconds = nil
+            job.progress = nil
+            job.errorMessage = nil
+        }
+        startTranscriptionTicker(from: Date(), jobID: jobID, statusText: "Decoding and resampling audio")
+
+        activeTranscriptionTask = Task { [weak self] in
+            guard let self else { return }
+            await self.executeTranscriptionJob(jobID: jobID, session: session)
+        }
+    }
+
+    private func executeTranscriptionJob(jobID: UUID, session: ContoraSession) async {
+        do {
+            let result = try await prepareMediaForTranscriptionInBackground(session: session)
+            try Task.checkCancellation()
+            let sessionIdentity = RecordingArchiveService.SessionIdentity(
+                sessionID: session.id,
+                title: session.title,
+                createdAt: session.createdAt
+            )
+            let transcribeStartedAt = Date()
+
+            isPreparingTranscription = false
+            isTranscribing = true
+            transcriptionElapsedSeconds = 0
+            activeTranscriptionAudioSeconds = result.durationSeconds
+            activeTranscriptionSessionTitle = session.title
+            lastAudioDurationSeconds = result.durationSeconds
+            lastCaptureSamples = result.samples16kMono.count
+            statusMessage = "Transcribing \(session.title)..."
+            updateTranscriptionJob(jobID) { job in
+                job.state = .transcribing
+                job.audioSeconds = result.durationSeconds
+                job.statusText = "Transcribing"
+                job.speedRatio = nil
+            }
+            startTranscriptionTicker(from: transcribeStartedAt, jobID: jobID, statusText: "Transcribing")
+
+            do {
+                let text = try await transcribeWithSelectedBackend(samples16k: result.samples16kMono)
+                try Task.checkCancellation()
+                transcriptionTickerTask?.cancel()
+                transcriptionTickerTask = nil
+                isTranscribing = false
+                lastTranscriptionDurationSeconds = Date().timeIntervalSince(transcribeStartedAt)
+                if lastTranscriptionDurationSeconds > 0 {
+                    lastRealtimeSpeedRatio = result.durationSeconds / lastTranscriptionDurationSeconds
+                }
+                statusMessage = "Transcription complete"
+                lastTranscript = text.isEmpty ? "[Empty transcription]" : text
+                persistTranscript(
+                    text: lastTranscript,
+                    mode: .normal,
+                    success: true,
+                    errorMessage: nil,
+                    recordingURL: session.recordingURL,
+                    sessionIdentity: sessionIdentity,
+                    captureSourceModeString: session.metadata.mode ?? "Imported Audio",
+                    audioDurationSeconds: result.durationSeconds,
+                    transcriptionDurationSeconds: lastTranscriptionDurationSeconds > 0 ? lastTranscriptionDurationSeconds : nil
+                )
+                updateTranscriptionJob(jobID) { job in
+                    job.state = .completed
+                    job.progress = 1
+                    job.elapsedSeconds = lastTranscriptionDurationSeconds
+                    job.remainingSeconds = 0
+                    job.speedRatio = lastRealtimeSpeedRatio
+                    job.statusText = "Completed"
+                    job.errorMessage = nil
+                }
+            } catch {
+                transcriptionTickerTask?.cancel()
+                transcriptionTickerTask = nil
+                isTranscribing = false
+                if isCancellationError(error) || Task.isCancelled {
+                    statusMessage = "Transcription stopped"
+                    updateTranscriptionJob(jobID) { job in
+                        job.state = .cancelled
+                        job.elapsedSeconds = Date().timeIntervalSince(transcribeStartedAt)
+                        job.remainingSeconds = nil
+                        job.progress = nil
+                        job.speedRatio = nil
+                        job.statusText = "Stopped by user"
+                        job.errorMessage = nil
+                    }
+                    finishTranscriptionJob(jobID)
+                    return
+                }
+                lastTranscriptionDurationSeconds = Date().timeIntervalSince(transcribeStartedAt)
+                if lastTranscriptionDurationSeconds > 0 {
+                    lastRealtimeSpeedRatio = result.durationSeconds / lastTranscriptionDurationSeconds
+                }
+                statusMessage = "Transcription failed"
+                lastTranscript = "Transcription error (\(activeTranscriptionEndpointString())): \(error.localizedDescription)"
+                persistTranscript(
+                    text: lastTranscript,
+                    mode: .normal,
+                    success: false,
+                    errorMessage: error.localizedDescription,
+                    recordingURL: session.recordingURL,
+                    sessionIdentity: sessionIdentity,
+                    captureSourceModeString: session.metadata.mode ?? "Imported Audio",
+                    audioDurationSeconds: result.durationSeconds,
+                    transcriptionDurationSeconds: lastTranscriptionDurationSeconds > 0 ? lastTranscriptionDurationSeconds : nil
+                )
+                updateTranscriptionJob(jobID) { job in
+                    job.state = .failed
+                    job.elapsedSeconds = lastTranscriptionDurationSeconds
+                    job.remainingSeconds = nil
+                    job.progress = nil
+                    job.speedRatio = lastRealtimeSpeedRatio > 0 ? lastRealtimeSpeedRatio : nil
+                    job.statusText = "Failed"
+                    job.errorMessage = error.localizedDescription
+                }
+            }
+        } catch {
+            isPreparingTranscription = false
+            isTranscribing = false
+            if isCancellationError(error) || Task.isCancelled {
+                statusMessage = "Transcription stopped"
+                updateTranscriptionJob(jobID) { job in
+                    job.state = .cancelled
+                    job.statusText = "Stopped by user"
+                    job.errorMessage = nil
+                }
+                finishTranscriptionJob(jobID)
+                return
+            }
+            statusMessage = "Failed to load audio"
+            lastTranscript = "Error loading audio: \(error.localizedDescription)"
+            updateTranscriptionJob(jobID) { job in
+                job.state = .failed
+                job.statusText = "Failed to load audio"
+                job.errorMessage = error.localizedDescription
+            }
+        }
+
+        finishTranscriptionJob(jobID)
+    }
+
+    private func finishTranscriptionJob(_ jobID: UUID) {
+        if activeTranscriptionJobID == jobID {
+            activeTranscriptionJobID = nil
+        }
+        activeTranscriptionTask = nil
+        transcriptionJobSessions[jobID] = nil
+        finishTranscriptionState()
+        processNextTranscriptionJobIfNeeded()
+    }
+
+    private func isCancellationError(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return true
+        }
+        return false
+    }
+
+    private func updateTranscriptionJob(_ jobID: UUID, update: (inout TranscriptionJob) -> Void) {
+        guard let index = transcriptionJobs.firstIndex(where: { $0.id == jobID }) else {
+            return
+        }
+        guard transcriptionJobs[index].state != .cancelled else {
+            return
+        }
+        update(&transcriptionJobs[index])
     }
 
     private func mix16kMono(_ lhs: [Float], _ rhs: [Float]) -> [Float] {
@@ -2148,57 +3011,17 @@ final class AppModel: ObservableObject {
         case streamingFallback
     }
 
-    private func runTranscription(samples16k: [Float], audioDurationSeconds: Double, mode: TranscriptionMode) {
-        isTranscribing = true
-        isStreamingChunkTranscribing = false
-        transcriptionElapsedSeconds = 0
-
-        let transcribeStartedAt = Date()
-        startTranscriptionTicker(from: transcribeStartedAt)
-
-        Task { [weak self] in
-            guard let self else {
-                return
-            }
-            do {
-                let text = try await self.transcribeWithSelectedBackend(samples16k: samples16k)
-                await MainActor.run {
-                    self.transcriptionTickerTask?.cancel()
-                    self.transcriptionTickerTask = nil
-                    self.isTranscribing = false
-                    self.lastTranscriptionDurationSeconds = Date().timeIntervalSince(transcribeStartedAt)
-                    if self.lastTranscriptionDurationSeconds > 0 {
-                        self.lastRealtimeSpeedRatio = audioDurationSeconds / self.lastTranscriptionDurationSeconds
-                    }
-                    self.completePostStopMeasurement(mode: mode)
-                    self.statusMessage = "Transcription complete (wait \(self.formatSeconds(self.lastPostStopWaitSeconds)))"
-                    self.lastTranscript = text.isEmpty ? "[Empty transcription]" : text
-                    self.persistTranscript(text: self.lastTranscript, mode: mode, success: true, errorMessage: nil)
-                    self.finishProcessingState()
-                }
-            } catch {
-                await MainActor.run {
-                    self.transcriptionTickerTask?.cancel()
-                    self.transcriptionTickerTask = nil
-                    self.isTranscribing = false
-                    self.lastTranscriptionDurationSeconds = Date().timeIntervalSince(transcribeStartedAt)
-                    if self.lastTranscriptionDurationSeconds > 0 {
-                        self.lastRealtimeSpeedRatio = audioDurationSeconds / self.lastTranscriptionDurationSeconds
-                    }
-                    self.completePostStopMeasurement(mode: mode)
-                    self.statusMessage = "Transcription failed"
-                    self.lastTranscript = "Transcription error (\(self.transcriptionEndpoint)): \(error.localizedDescription)"
-                    self.persistTranscript(text: self.lastTranscript, mode: mode, success: false, errorMessage: error.localizedDescription)
-                    self.finishProcessingState()
-                }
-            }
-        }
-    }
-
-    private func persistTranscript(text: String, mode: TranscriptionMode, success: Bool, errorMessage: String?) {
-        guard let recordingURL = currentRecordingFileURL, let sessionIdentity = currentSessionIdentity else {
-            return
-        }
+    private func persistTranscript(
+        text: String,
+        mode: TranscriptionMode,
+        success: Bool,
+        errorMessage: String?,
+        recordingURL: URL,
+        sessionIdentity: RecordingArchiveService.SessionIdentity,
+        captureSourceModeString: String,
+        audioDurationSeconds: Double,
+        transcriptionDurationSeconds: Double?
+    ) {
         do {
             let modeString: String
             switch mode {
@@ -2210,16 +3033,18 @@ final class AppModel: ObservableObject {
                 modeString = "streaming_fallback"
             }
             let parsed = TranscriptSegmentParser().parseSpeakersAndSegments(from: text)
-            let txtURL = try recordingArchive.saveTranscriptText(for: recordingURL, transcriptText: text)
+            let artifactBaseURL = artifactBaseURL(for: sessionIdentity.sessionID, recordingURL: recordingURL)
+            let txtURL = try recordingArchive.saveTranscriptText(for: recordingURL, artifactBaseURL: artifactBaseURL, transcriptText: text)
             let jsonURL = try recordingArchive.saveTranscriptJSON(
                 for: recordingURL,
+                artifactBaseURL: artifactBaseURL,
                 transcriptText: text,
                 mode: modeString,
                 language: transcriptionLanguage,
                 endpoint: activeTranscriptionEndpointString(),
-                audioSeconds: lastAudioDurationSeconds,
+                audioSeconds: audioDurationSeconds,
                 postStopWaitSeconds: lastPostStopWaitSeconds,
-                transcriptionSeconds: lastTranscriptionDurationSeconds > 0 ? lastTranscriptionDurationSeconds : nil,
+                transcriptionSeconds: transcriptionDurationSeconds,
                 success: success,
                 errorMessage: errorMessage
             )
@@ -2228,8 +3053,8 @@ final class AppModel: ObservableObject {
             _ = try? recordingArchive.saveSessionManifest(
                 sessionID: sessionIdentity,
                 recordingFileURL: recordingURL,
-                captureSourceMode: captureSourceMode.rawValue,
-                audioSeconds: lastAudioDurationSeconds,
+                captureSourceMode: captureSourceModeString,
+                audioSeconds: audioDurationSeconds,
                 recordingM4AURL: siblingM4A,
                 transcriptTXT: txtURL,
                 transcriptJSON: jsonURL,
@@ -2239,7 +3064,7 @@ final class AppModel: ObservableObject {
                     endpoint: activeTranscriptionEndpointString(),
                     language: transcriptionLanguage,
                     mode: modeString,
-                    durationSeconds: lastTranscriptionDurationSeconds > 0 ? lastTranscriptionDurationSeconds : nil,
+                    durationSeconds: transcriptionDurationSeconds,
                     errorMessage: errorMessage,
                     speakers: parsed.speakers.map { .init(id: $0.id, displayName: $0.displayName) },
                     segments: parsed.segments.map {
@@ -2251,7 +3076,8 @@ final class AppModel: ObservableObject {
                             text: $0.text
                         )
                     }
-                )
+                ),
+                manifestBaseURL: artifactBaseURL?.deletingLastPathComponent()
             )
             lastSavedTranscriptPath = txtURL.path
             reloadSessions()
@@ -2262,11 +3088,21 @@ final class AppModel: ObservableObject {
 
     private func finishProcessingState() {
         isFinalizingStop = false
-        isTranscribing = false
         isStreamingChunkTranscribing = false
         isStreamingLoopActive = false
         stopPostStopTicker()
         currentSessionIdentity = nil
+        if !isTranscribing && !isPreparingTranscription {
+            activeTranscriptionAudioSeconds = 0
+            activeTranscriptionSessionTitle = ""
+        }
+    }
+
+    private func finishTranscriptionState() {
+        isPreparingTranscription = false
+        isTranscribing = false
+        activeTranscriptionAudioSeconds = 0
+        activeTranscriptionSessionTitle = ""
     }
 
     private func completePostStopMeasurement(mode: TranscriptionMode) {
@@ -2385,11 +3221,19 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startTranscriptionTicker(from startDate: Date) {
+    private func startTranscriptionTicker(from startDate: Date, jobID: UUID, statusText: String) {
         transcriptionTickerTask?.cancel()
         transcriptionTickerTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                self.transcriptionElapsedSeconds = Date().timeIntervalSince(startDate)
+                let elapsed = Date().timeIntervalSince(startDate)
+                self.transcriptionElapsedSeconds = elapsed
+                self.updateTranscriptionJob(jobID) { job in
+                    job.elapsedSeconds = elapsed
+                    job.progress = nil
+                    job.remainingSeconds = nil
+                    job.speedRatio = nil
+                    job.statusText = statusText
+                }
                 try? await Task.sleep(for: .milliseconds(200))
             }
         }
@@ -2425,6 +3269,17 @@ final class AppModel: ObservableObject {
         let rounded = Int(max(0, value) * 10) / 10
         return "\(rounded)s"
     }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        let units = ["B", "KB", "MB", "GB"]
+        var value = Double(max(0, bytes))
+        var unitIndex = 0
+        while value >= 1024, unitIndex < units.count - 1 {
+            value /= 1024
+            unitIndex += 1
+        }
+        return String(format: "%.1f %@", value, units[unitIndex])
+    }
 }
 
 @MainActor
@@ -2442,18 +3297,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var chunk8Item: NSMenuItem?
     private var chunk15Item: NSMenuItem?
     private var cancellables = Set<AnyCancellable>()
-    private var didConfigureTickerWindow = false
-    private var libraryWindow: NSWindow?
+    private var primaryWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
         buildStatusItem()
         bindState()
         model.permissions.refresh()
-        DispatchQueue.main.async { [weak self] in
-            self?.configureTickerWindowIfNeeded()
-            self?.updateTickerWindowVisibility()
-        }
     }
 
     private func buildStatusItem() {
@@ -2468,9 +3318,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         summary.isEnabled = false
         menu.addItem(summary)
 
-        let openItem = NSMenuItem(title: "Open Contora Panel", action: #selector(openDashboard), keyEquivalent: "")
+        let openItem = NSMenuItem(title: "Open Contora Workspace", action: #selector(openDashboard), keyEquivalent: "")
         openItem.target = self
         menu.addItem(openItem)
+
+        let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
 
         let openRecordingsItem = NSMenuItem(title: "Open Recordings Folder", action: #selector(openRecordingsFolder), keyEquivalent: "")
         openRecordingsItem.target = self
@@ -2577,7 +3431,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             shortState = model.statusMessage
         }
         statusSummaryItem?.title = "Status: \(shortState)"
-        updateTickerWindowVisibility()
     }
 
     private func statusIconImage(isRecording: Bool, isProcessing: Bool) -> NSImage? {
@@ -2618,66 +3471,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    private func tickerWindow() -> NSWindow? {
-        NSApp.windows.first
-    }
-
-    private func configureTickerWindowIfNeeded() {
-        guard !didConfigureTickerWindow, let window = tickerWindow() else {
-            return
-        }
-        didConfigureTickerWindow = true
-
-        window.styleMask = [.borderless]
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.isMovableByWindowBackground = true
-        window.level = .floating
-        window.collectionBehavior.insert(.canJoinAllSpaces)
-        window.collectionBehavior.insert(.fullScreenAuxiliary)
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = true
-        window.setContentSize(NSSize(width: 320, height: 36))
-    }
-
-    private func updateTickerWindowVisibility() {
-        configureTickerWindowIfNeeded()
-        guard let window = tickerWindow() else {
-            return
-        }
-        let shouldShow = model.isRecording || model.isFinalizingStop || model.isTranscribing || model.isStreamingChunkTranscribing
-        if shouldShow {
-            positionTickerWindow(window)
-            window.orderFront(nil)
-        } else {
-            window.orderOut(nil)
-        }
-    }
-
-    private func positionTickerWindow(_ window: NSWindow) {
-        guard let screen = NSScreen.main ?? window.screen else {
-            return
-        }
-        let visible = screen.visibleFrame
-        let size = window.frame.size
-        let x = visible.maxX - size.width - 20
-        let y = visible.maxY - size.height - 6
-        window.setFrameOrigin(NSPoint(x: x, y: y))
-    }
-
     @objc private func openDashboard() {
-        openLibraryWindow()
+        openPrimaryWindow()
+    }
+
+    @objc private func openSettings() {
+        openContoraSettingsWindow()
     }
 
     @objc private func openRecordingsFolder() {
-        do {
-            let directory = try RecordingArchiveService.recordingsDirectoryURL()
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            NSWorkspace.shared.open(directory)
-        } catch {
-            model.statusMessage = "Failed to open recordings folder"
-        }
+        model.openRecordingsFolder()
     }
 
     @objc private func importAudioFile() {
@@ -2743,20 +3546,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    private func openLibraryWindow() {
+    private func openPrimaryWindow() {
         let window: NSWindow
-        if let existing = libraryWindow {
+        if let existing = primaryWindow ?? NSApp.windows.first(where: { $0.title == "Contora" }) {
             window = existing
         } else {
-            let contentView = SessionLibraryView(model: model)
+            let contentView = PrimaryWorkspaceView(model: model)
             let hostingController = NSHostingController(rootView: contentView)
             let created = NSWindow(contentViewController: hostingController)
-            created.title = "Contora Library"
-            created.setContentSize(NSSize(width: 1120, height: 720))
+            created.title = "Contora"
+            created.setContentSize(NSSize(width: 1240, height: 760))
             created.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             created.isReleasedWhenClosed = false
             created.center()
-            libraryWindow = created
+            primaryWindow = created
             window = created
         }
 
@@ -2766,44 +3569,652 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-struct DashboardView: View {
+struct PrimaryWorkspaceView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(model.isRecording ? Color.red : Color.secondary.opacity(0.35))
-                .frame(width: 8, height: 8)
+        HStack(alignment: .top, spacing: 0) {
+            CaptureWorkspacePanel(model: model)
+                .frame(width: 290)
+                .frame(maxHeight: .infinity, alignment: .top)
 
-            Text(tickerText)
-                .font(.system(size: 14, weight: .medium, design: .rounded))
-                .lineLimit(1)
-                .truncationMode(.head)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-                .textSelection(.enabled)
+            Divider()
+
+            RecordingWorkspacePanel(model: model)
+                .frame(width: 330)
+                .frame(maxHeight: .infinity, alignment: .top)
+
+            Divider()
+
+            ReviewWorkspacePanel(model: model)
+                .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .frame(width: 320, height: 36)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(minWidth: 1120, minHeight: 680, alignment: .top)
+        .onAppear {
+            model.reloadSessions()
+            model.refreshAudioDeviceContext()
+        }
+    }
+}
+
+struct CaptureWorkspacePanel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                Text("Capture")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button {
+                    openContoraSettingsWindow()
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.borderless)
+                .help("Settings")
+            }
+
+            Picker("Capture Scope", selection: $model.captureSourceMode) {
+                ForEach(CaptureSourceMode.allCases, id: \.self) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.radioGroup)
+            .disabled(model.isRecording)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Active Sources")
+                    .font(.headline)
+                WorkspaceMetricRow(label: "Scope", value: model.captureScopeDescription)
+                WorkspaceMetricRow(label: "Microphone", value: model.activeMicrophoneName)
+                WorkspaceMetricRow(label: "System output", value: model.activeOutputDeviceName)
+            }
+
+            Button {
+                model.refreshAudioDeviceContext()
+            } label: {
+                Label("Refresh Devices", systemImage: "arrow.clockwise")
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Destination")
+                    .font(.headline)
+                Text(model.recordingsFolderPath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+                Button {
+                    model.openRecordingsFolder()
+                } label: {
+                    Label("Open Folder", systemImage: "folder")
+                }
+            }
+
+            Spacer()
+        }
+        .padding(20)
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+}
+
+struct RecordingWorkspacePanel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Recording")
+                            .font(.title2.weight(.semibold))
+                        Text(model.statusMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    Spacer()
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 12, height: 12)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(elapsedTitle)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(formatSeconds(elapsedSeconds))
+                        .font(.system(size: 42, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }
+
+                Button {
+                    model.toggleRecording()
+                } label: {
+                    Label(model.isRecording ? "Stop Recording" : "Start Recording", systemImage: model.isRecording ? "stop.fill" : "record.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(model.isRecording ? model.isFinalizingStop : !model.canStartRecording)
+
+                HStack {
+                    Button {
+                        presentAudioImportPanel()
+                    } label: {
+                        Label("Import Audio", systemImage: "waveform")
+                    }
+                    .disabled(model.isRecording || model.isFinalizingStop)
+
+                    Button {
+                        presentVideoImportPanel()
+                    } label: {
+                        Label("Import Video", systemImage: "film")
+                    }
+                    .disabled(model.isRecording || model.isFinalizingStop)
+                }
+
+                if let selectedSession = model.selectedSession {
+                    Button {
+                        model.retranscribeSession(selectedSession)
+                    } label: {
+                        Label(transcriptionButtonTitle(for: selectedSession), systemImage: "text.bubble")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle("Streaming transcription", isOn: $model.streamingEnabled)
+                        .disabled(model.captureSourceMode == .systemAudio || model.isRecording || model.isFinalizingStop)
+                    Picker("Storage", selection: $model.recordingStoragePolicy) {
+                        ForEach(RecordingStoragePolicy.allCases) { policy in
+                            Text(policy.rawValue).tag(policy)
+                        }
+                    }
+                    .disabled(model.isRecording || model.isFinalizingStop)
+                }
+
+                TranscriptionProgressPanel(model: model)
+
+                BackendWorkspacePanel(model: model)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Current Session")
+                        .font(.headline)
+                    WorkspaceMetricRow(label: "Saved file", value: model.lastSavedRecordingPath.isEmpty ? "Not saved yet" : model.lastSavedRecordingPath)
+                    WorkspaceMetricRow(label: "Transcript", value: model.lastSavedTranscriptPath.isEmpty ? "Not saved yet" : model.lastSavedTranscriptPath)
+                    if model.isStreamingLoopActive || model.streamingChunksProcessed > 0 {
+                        WorkspaceMetricRow(label: "Streaming", value: "\(model.streamingChunksProcessed) chunk(s)")
+                    }
+                }
+
+                Divider()
+
+                MiniSessionList(model: model)
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
-    private var tickerText: String {
-        if model.isRecording && !model.lastTranscript.isEmpty && model.lastTranscript != "Recording in progress..." {
-            return model.lastTranscript.replacingOccurrences(of: "\n", with: " ")
+    private var statusColor: Color {
+        if model.isRecording { return .red }
+        if model.isTranscriptionBusy || model.isStreamingChunkTranscribing || model.isFinalizingStop { return .orange }
+        return .secondary.opacity(0.45)
+    }
+
+    private var elapsedTitle: String {
+        if model.isRecording { return "Recording elapsed" }
+        if model.isFinalizingStop { return "Processing wait" }
+        return "Last audio duration"
+    }
+
+    private var elapsedSeconds: Double {
+        if model.isRecording { return model.recordingSeconds }
+        if model.isFinalizingStop { return model.postStopWaitSeconds }
+        return model.lastAudioDurationSeconds
+    }
+
+    private func transcriptionButtonTitle(for session: ContoraSession) -> String {
+        if model.isTranscriptionBusy || model.pendingTranscriptionJobsCount > 0 {
+            return "Queue Transcription"
         }
-        if model.isRecording {
-            return "Recording..."
+        return session.transcriptURL == nil ? "Start Transcribing" : "Re-transcribe Session"
+    }
+
+    private func formatSeconds(_ value: Double) -> String {
+        let total = Int(max(0, value))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        return hours > 0
+            ? String(format: "%01d:%02d:%02d", hours, minutes, seconds)
+            : String(format: "%02d:%02d", minutes, seconds)
+    }
+
+    private func presentAudioImportPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [
+            .audio,
+            UTType(filenameExtension: "opus") ?? .audio
+        ]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.importAudioFile(from: url)
+    }
+
+    private func presentVideoImportPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [
+            .movie,
+            UTType(filenameExtension: "mkv") ?? .movie,
+            UTType(filenameExtension: "webm") ?? .movie
+        ]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.importVideoFile(from: url)
+    }
+}
+
+struct MiniSessionList: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Recent Sessions")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    model.reloadSessions()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Reload sessions")
+            }
+
+            Text(model.sessionLibraryStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            SessionLibraryControls(model: model)
+
+            List(selection: $model.selectedSessionID) {
+                ForEach(model.visibleSessions.prefix(8)) { session in
+                    SessionRowView(session: session)
+                        .tag(session.id)
+                }
+            }
+            .frame(minHeight: 160)
+            .onChange(of: model.selectedSessionID) { _, newValue in
+                model.selectSession(newValue)
+            }
         }
-        if model.isFinalizingStop || model.isTranscribing || model.isStreamingChunkTranscribing {
-            let waited = Int(model.postStopWaitSeconds * 10) / 10
-            let action = model.transcriptionEnabled ? "Transcribing" : "Processing"
-            return "\(action)... \(waited)s"
+    }
+}
+
+struct SessionLibraryControls: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("Search sessions", text: $model.sessionSearchText)
+                .textFieldStyle(.roundedBorder)
+                .onChange(of: model.sessionSearchText) { _, _ in
+                    model.selectFirstVisibleSessionIfNeeded()
+                }
+
+            HStack(spacing: 8) {
+                Picker("Filter", selection: $model.sessionStatusFilter) {
+                    ForEach(SessionStatusFilter.allCases) { filter in
+                        Text(filter.rawValue).tag(filter)
+                    }
+                }
+                .labelsHidden()
+                .onChange(of: model.sessionStatusFilter) { _, _ in
+                    model.selectFirstVisibleSessionIfNeeded()
+                }
+
+                Picker("Sort", selection: $model.sessionSortMode) {
+                    ForEach(SessionSortMode.allCases) { sortMode in
+                        Text(sortMode.rawValue).tag(sortMode)
+                    }
+                }
+                .labelsHidden()
+                .onChange(of: model.sessionSortMode) { _, _ in
+                    model.selectFirstVisibleSessionIfNeeded()
+                }
+            }
         }
-        if model.lastTranscript.isEmpty || model.lastTranscript == "No transcript yet." {
-            return model.statusMessage
+    }
+}
+
+struct TranscriptionProgressPanel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Transcription")
+                    .font(.headline)
+                Spacer()
+                if model.pendingTranscriptionJobsCount > 0 {
+                    Text("\(model.pendingTranscriptionJobsCount) queued")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let activeJob = model.activeTranscriptionJob {
+                ProgressView()
+                    .controlSize(.small)
+
+                WorkspaceMetricRow(label: "Active", value: activeJob.sessionTitle)
+                WorkspaceMetricRow(label: "Status", value: activeJob.statusText)
+                WorkspaceMetricRow(label: "Audio length", value: activeJob.audioSeconds > 0 ? formatDuration(activeJob.audioSeconds) : "Detecting during preparation")
+                WorkspaceMetricRow(label: "Elapsed", value: formatDuration(activeJob.elapsedSeconds))
+                WorkspaceMetricRow(label: "Progress", value: "Waiting for backend progress events")
+
+                Button(role: .destructive) {
+                    model.cancelActiveTranscription()
+                } label: {
+                    Label("Stop Transcription", systemImage: "stop.fill")
+                        .frame(maxWidth: .infinity)
+                }
+            } else {
+                WorkspaceMetricRow(label: "Status", value: model.selectedSession == nil ? "No session selected" : "Ready")
+                if model.lastRealtimeSpeedRatio > 0 {
+                    WorkspaceMetricRow(label: "Last speed", value: "\(formatRatio(model.lastRealtimeSpeedRatio)) realtime")
+                }
+            }
+
+            let visibleJobs = model.transcriptionJobs
+                .filter { $0.state == .queued || $0.state == .completed || $0.state == .failed || $0.state == .cancelled }
+                .prefix(4)
+            if !visibleJobs.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(visibleJobs)) { job in
+                        TranscriptionJobRow(job: job)
+                    }
+                }
+            }
         }
-        return model.lastTranscript.replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private func formatDuration(_ value: Double) -> String {
+        let total = Int(max(0, value))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return String(format: "%dh %02dm %02ds", hours, minutes, seconds)
+        }
+        if minutes > 0 {
+            return String(format: "%dm %02ds", minutes, seconds)
+        }
+        return "\(seconds)s"
+    }
+
+    private func formatRatio(_ value: Double) -> String {
+        let rounded = Double(Int(value * 100)) / 100
+        return String(format: "%.2fx", rounded)
+    }
+}
+
+struct TranscriptionJobRow: View {
+    let job: TranscriptionJob
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: iconName)
+                .foregroundStyle(iconColor)
+                .frame(width: 14)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.sessionTitle)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text(detailText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+        }
+    }
+
+    private var iconName: String {
+        switch job.state {
+        case .queued:
+            return "clock"
+        case .preparing:
+            return "arrow.triangle.2.circlepath"
+        case .transcribing:
+            return "waveform"
+        case .completed:
+            return "checkmark.circle.fill"
+        case .failed:
+            return "exclamationmark.triangle.fill"
+        case .cancelled:
+            return "stop.circle.fill"
+        }
+    }
+
+    private var iconColor: Color {
+        switch job.state {
+        case .queued:
+            return .secondary
+        case .preparing, .transcribing:
+            return .orange
+        case .completed:
+            return .green
+        case .failed:
+            return .red
+        case .cancelled:
+            return .secondary
+        }
+    }
+
+    private var detailText: String {
+        if let errorMessage = job.errorMessage, job.state == .failed {
+            return errorMessage
+        }
+        if job.state == .completed, let speedRatio = job.speedRatio {
+            return "\(job.state.rawValue) at \(String(format: "%.2fx", speedRatio)) realtime"
+        }
+        return job.state.rawValue
+    }
+}
+
+struct BackendWorkspacePanel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Backend")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    openContoraSettingsWindow()
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.borderless)
+                .help("Settings")
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+            }
+
+            Picker("Engine", selection: backendBinding) {
+                Text("Local Whisper").tag(TranscriptionBackend.fasterWhisperProcess)
+            }
+            .labelsHidden()
+            .disabled(model.isLocalWhisperBusy || model.isRecording || model.isTranscriptionBusy)
+
+            HStack(spacing: 8) {
+                Button {
+                    model.probeSharedBackend()
+                } label: {
+                    Label("Check", systemImage: "stethoscope")
+                }
+                .disabled(model.isLocalWhisperBusy)
+            }
+
+            localWhisperControls
+        }
+        .onAppear {
+            if model.transcriptionBackend != .fasterWhisperProcess {
+                model.selectTranscriptionBackend(.fasterWhisperProcess)
+            }
+        }
+    }
+
+    private var backendBinding: Binding<TranscriptionBackend> {
+        Binding(
+            get: { model.transcriptionBackend },
+            set: { model.selectTranscriptionBackend($0) }
+        )
+    }
+
+    private var modelBinding: Binding<String> {
+        Binding(
+            get: { model.fasterWhisperModelName },
+            set: { model.updateFasterWhisperModelName($0) }
+        )
+    }
+
+    private var diarizationBinding: Binding<Bool> {
+        Binding(
+            get: { model.fasterWhisperDiarizationEnabled },
+            set: { model.updateFasterWhisperDiarization($0) }
+        )
+    }
+
+    @ViewBuilder
+    private var localWhisperControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Picker("Model", selection: modelBinding) {
+                    ForEach(WhisperModelOption.fasterWhisperOptions) { option in
+                        Text(option.displayName).tag(option.name)
+                    }
+                }
+                .frame(maxWidth: 150)
+                .disabled(model.isLocalWhisperBusy)
+
+                Toggle("Diarization", isOn: diarizationBinding)
+                    .toggleStyle(.checkbox)
+                    .disabled(model.isLocalWhisperBusy)
+            }
+
+            Button {
+                model.setUpLocalWhisper()
+            } label: {
+                Label(model.localWhisperPrimaryActionTitle, systemImage: "arrow.down.circle")
+            }
+            .disabled(model.isLocalWhisperBusy)
+
+            if model.isLocalWhisperBusy {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            WorkspaceMetricRow(label: "Setup", value: model.localWhisperSetupStatus)
+            WorkspaceMetricRow(label: "Runtime", value: model.fasterWhisperRuntimeStatus)
+            WorkspaceMetricRow(label: "Model", value: model.fasterWhisperDownloadStatus)
+            WorkspaceMetricRow(label: "Probe", value: model.backendProbeStatus)
+
+            HStack(spacing: 8) {
+                Button {
+                    model.openFasterWhisperRuntimeFolder()
+                } label: {
+                    Label("Runtime Folder", systemImage: "folder")
+                }
+
+                Menu {
+                    Button("Repair Runtime") { model.resetLocalWhisperRuntime(preservingModels: true) }
+                    Button("Delete Runtime and Models") { model.resetLocalWhisperRuntime(preservingModels: false) }
+                    Button("Runtime Releases") { model.openFasterWhisperRuntimeReleases() }
+                } label: {
+                    Label("Repair", systemImage: "wrench.and.screwdriver")
+                }
+            }
+            .disabled(model.isLocalWhisperBusy)
+        }
+    }
+
+    private var statusColor: Color {
+        let status = model.backendProbeStatus.lowercased()
+        if status.contains("ok") || status.contains("reachable") || status.contains("ready") {
+            return .green
+        }
+        if status.contains("probing") || status.contains("warming") {
+            return .orange
+        }
+        if status == "not checked" {
+            return .secondary.opacity(0.5)
+        }
+        return .red
+    }
+}
+
+struct ReviewWorkspacePanel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Group {
+            if let session = model.selectedSession {
+                SessionDetailView(model: model, session: session)
+            } else {
+                EmptyReviewPlaceholder()
+            }
+        }
+    }
+}
+
+struct EmptyReviewPlaceholder: View {
+    var body: some View {
+        ContentUnavailableView(
+            "No Active Session",
+            systemImage: "text.bubble",
+            description: Text("Record or import audio, then the transcript review workspace will appear here.")
+        )
+    }
+}
+
+struct WorkspaceMetricRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value.isEmpty ? "Not available" : value)
+                .font(.caption)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(value.isEmpty ? "Not available" : value)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -2826,8 +4237,10 @@ struct SessionLibraryView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                SessionLibraryControls(model: model)
+
                 List(selection: $model.selectedSessionID) {
-                    ForEach(model.sessions) { session in
+                    ForEach(model.visibleSessions) { session in
                         SessionRowView(session: session)
                             .tag(session.id)
                     }
@@ -2894,35 +4307,46 @@ struct SessionDetailView: View {
                 Text(session.title)
                     .font(.title2.weight(.semibold))
 
-                HStack(spacing: 12) {
-                    Button("Open WAV") {
-                        model.openURL(session.recordingURL)
-                    }
-                    if let transcriptURL = session.transcriptURL {
-                        Button("Open TXT") {
-                            model.openURL(transcriptURL)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Button {
+                            model.openURL(session.recordingURL)
+                        } label: {
+                            Label("Audio", systemImage: "play.circle")
                         }
-                    }
-                    if let jsonURL = session.jsonURL {
-                        Button("Open JSON") {
-                            model.openURL(jsonURL)
+
+                        Button {
+                            model.revealSession(session)
+                        } label: {
+                            Label("Reveal", systemImage: "folder")
                         }
-                    }
-                    Button("Reveal in Finder") {
-                        model.revealSession(session)
+
+                        Menu {
+                            if let transcriptURL = session.transcriptURL {
+                                Button("Open TXT") { model.openURL(transcriptURL) }
+                            }
+                            if let jsonURL = session.jsonURL {
+                                Button("Open JSON") { model.openURL(jsonURL) }
+                            }
+                        } label: {
+                            Label("Artifacts", systemImage: "doc.on.doc")
+                        }
+                        .disabled(session.transcriptURL == nil && session.jsonURL == nil)
+
+                        Spacer()
                     }
 
-                    let isBusy = model.isTranscribing || model.isFinalizingStop
-                    let hasTranscript = session.transcriptURL != nil
-                    Button(hasTranscript ? "Re-transcribe" : "Transcribe") {
-                        model.retranscribeSession(session)
-                    }
-                    .disabled(isBusy)
-                    .buttonStyle(.borderedProminent)
+                    HStack(spacing: 10) {
+                        Button("Save Changes") {
+                            model.saveSelectedSessionEdits()
+                        }
+                        .disabled(!model.sessionEditorHasUnsavedChanges)
 
-                    Spacer()
-                    Button("Save Changes") {
-                        model.saveSelectedSessionEdits()
+                        if model.sessionEditorHasUnsavedChanges {
+                            Text("Unsaved")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.orange)
+                        }
                     }
                 }
 
@@ -2960,44 +4384,22 @@ struct SessionDetailView: View {
                         Text("Segments")
                             .font(.headline)
                         ForEach($model.sessionEditorSegments) { $segment in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(spacing: 8) {
-                                    Text(segment.timestampDisplay)
-                                        .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                    Text(segment.speakerID)
-                                        .font(.caption.weight(.semibold))
-                                    TextField("Speaker", text: $segment.speakerName)
-                                        .textFieldStyle(.roundedBorder)
-                                }
-                                TextEditor(text: $segment.text)
-                                    .font(.body)
-                                    .frame(minHeight: 72)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .stroke(Color.secondary.opacity(0.15))
-                                    )
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(12)
-                            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            SegmentReviewRowView(model: model, session: session, segment: $segment)
                         }
                     }
-
-                    Divider()
-                }
-
-                Text("Transcript")
-                    .font(.headline)
-
-                TextEditor(text: $model.sessionEditorTranscriptDraft)
-                    .font(.body.monospaced())
-                    .frame(minHeight: 220)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .stroke(Color.secondary.opacity(0.15))
+                } else if !model.sessionEditorTranscriptDraft.isEmpty {
+                    ContentUnavailableView(
+                        "Segment Rows Unavailable",
+                        systemImage: "text.alignleft",
+                        description: Text("This transcript does not contain parseable timestamped segments. Re-transcribe the session to create row-based review data.")
                     )
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ContentUnavailableView(
+                        "No Transcript Yet",
+                        systemImage: "waveform",
+                        description: Text("Transcribe this session to review timestamped segments.")
+                    )
+                }
             }
             .padding(20)
         }
@@ -3015,6 +4417,55 @@ struct SessionDetailView: View {
             }
         }
         return result.sorted { $0.id < $1.id }
+    }
+}
+
+struct SegmentReviewRowView: View {
+    @ObservedObject var model: AppModel
+    let session: ContoraSession
+    @Binding var segment: EditableSessionSegment
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Button {
+                    model.playSegment(segment, in: session)
+                } label: {
+                    Image(systemName: model.playingSegmentID == segment.id ? "stop.fill" : "play.fill")
+                }
+                .help(model.playingSegmentID == segment.id ? "Stop segment playback" : "Play this segment")
+
+                Text(segment.timestampRangeDisplay)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 104, alignment: .leading)
+
+                Text(segment.speakerID)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 86, alignment: .leading)
+
+                TextField("Speaker", text: Binding(
+                    get: { segment.speakerName },
+                    set: { model.updateSpeakerName(speakerID: segment.speakerID, newName: $0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+            }
+
+            TextEditor(text: Binding(
+                get: { segment.text },
+                set: { model.updateSegmentText(segmentID: segment.id, newText: $0) }
+            ))
+                .font(.body)
+                .frame(minHeight: 72)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.secondary.opacity(0.15))
+                )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -3063,7 +4514,8 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Form {
+        ScrollView {
+            Form {
             Picker("Capture Source", selection: $model.captureSourceMode) {
                 ForEach(CaptureSourceMode.allCases, id: \.self) { mode in
                     Text(mode.rawValue).tag(mode)
@@ -3102,6 +4554,40 @@ struct SettingsView: View {
                 .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .mlxOpenAIHTTP)
             TextField("MLX model ID", text: $model.mlxModelID)
                 .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .mlxOpenAIHTTP)
+            Picker("Whisper model", selection: $model.fasterWhisperModelName) {
+                ForEach(WhisperModelOption.fasterWhisperOptions) { option in
+                    Text("\(option.displayName) - \(option.detail)").tag(option.name)
+                }
+            }
+            .disabled(!model.transcriptionEnabled || model.isSettingUpLocalWhisper)
+            Toggle("Whisper diarization", isOn: $model.fasterWhisperDiarizationEnabled)
+                .disabled(!model.transcriptionEnabled || model.isSettingUpLocalWhisper)
+            HStack {
+                Text("Local Whisper: \(model.localWhisperSetupStatus)")
+                    .lineLimit(2)
+                Spacer()
+                Button("Set Up Local Whisper") { model.setUpLocalWhisper() }
+                    .disabled(model.isSettingUpLocalWhisper)
+            }
+            .disabled(!model.transcriptionEnabled)
+            HStack {
+                Text("Runtime: \(model.fasterWhisperRuntimeStatus)")
+                    .lineLimit(2)
+                Spacer()
+                Button("Install Runtime") { model.installFasterWhisperRuntime() }
+                    .disabled(model.isInstallingFasterWhisperRuntime || model.isSettingUpLocalWhisper)
+                Button("Runtime Folder") { model.openFasterWhisperRuntimeFolder() }
+            }
+            .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .fasterWhisperProcess)
+            HStack {
+                Text("Model: \(model.fasterWhisperDownloadStatus)")
+                    .lineLimit(2)
+                Spacer()
+                Button("Download Model") { model.downloadSelectedFasterWhisperModel() }
+                    .disabled(model.isDownloadingFasterWhisperModel || model.isInstallingFasterWhisperRuntime || model.isSettingUpLocalWhisper)
+                Button("Runtime Releases") { model.openFasterWhisperRuntimeReleases() }
+            }
+            .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .fasterWhisperProcess)
             TextField("Transcription language", text: $model.transcriptionLanguage)
                 .disabled(!model.transcriptionEnabled)
 
@@ -3235,9 +4721,11 @@ struct SettingsView: View {
 
             Text("MVP mode: recording/transcription are local-first. Storage policy controls whether sessions keep WAV, add M4A, or switch to M4A only.")
                 .foregroundStyle(.secondary)
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .padding(20)
-        .frame(width: 460)
+        .frame(minWidth: 760, minHeight: 620)
     }
 
     @ViewBuilder
@@ -3248,7 +4736,9 @@ struct SettingsView: View {
             Text(value.isEmpty ? "Not available" : value)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(value.isEmpty ? "Not available" : value)
         }
     }
 }
@@ -3282,15 +4772,15 @@ struct ContoraMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup("Contora", id: "dashboard") {
-            DashboardView(model: AppModel.shared)
+        WindowGroup("Contora", id: "workspace") {
+            PrimaryWorkspaceView(model: AppModel.shared)
         }
-        .windowResizability(.contentSize)
-        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentMinSize)
 
         Settings {
             SettingsView(model: AppModel.shared)
         }
+        .defaultSize(width: 820, height: 680)
     }
 }
 

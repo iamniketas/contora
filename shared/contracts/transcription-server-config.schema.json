@@ -10,6 +10,8 @@
     "whisperTranscribeURL",
     "mlxTranscribeURL",
     "mlxModelID",
+    "fasterWhisperModelName",
+    "fasterWhisperDiarizationEnabled",
     "updatedAt"
   ],
   "properties": {
@@ -21,7 +23,8 @@
       "type": "string",
       "enum": [
         "whisper_http",
-        "mlx_openai_http"
+        "mlx_openai_http",
+        "faster_whisper_process"
       ]
     },
     "whisperTranscribeURL": {
@@ -35,6 +38,13 @@
     "mlxModelID": {
       "type": "string",
       "minLength": 1
+    },
+    "fasterWhisperModelName": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fasterWhisperDiarizationEnabled": {
+      "type": "boolean"
     },
     "updatedAt": {
       "type": "string",

@@ -1,0 +1,6 @@
+faster-whisper
+huggingface_hub
+torch==2.4.1
+torchaudio==2.4.1
+pyannote.audio==3.4.0
+soundfile
