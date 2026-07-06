@@ -177,6 +177,13 @@ public static class WhisperPaths
         return Environment.GetEnvironmentVariable(legacyKey);
     }
 
+    /// <summary>
+    /// Public entry point for the shared models root discovery (own SharedWhisperModels config,
+    /// then Dictator's AudioModels config/folder). Used by GGML model resolution, which has no
+    /// "whisperPath" of its own to derive a fallback from.
+    /// </summary>
+    public static string GetSharedModelsRootOrDefault() => GetSharedModelsRoot();
+
     private static string GetSharedModelsRoot()
     {
         var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);

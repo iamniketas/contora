@@ -1,5 +1,6 @@
 using NAudio.Lame;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using AudioRecorder.Services.Transcription;
 using System.Diagnostics;
 
@@ -45,6 +46,69 @@ public static class AudioConverter
         }
 
         return mp3Path;
+    }
+
+    /// <summary>
+    /// Декодирует любой поддерживаемый аудиофайл (wav/mp3/...) в 16kHz mono float32 PCM
+    /// для скармливания Whisper.net (whisper.cpp ожидает ровно такой формат).
+    /// Не влияет на хранение записей (WAV→MP3 конвертация для диска) — это отдельный шаг только для ASR.
+    /// </summary>
+    public static async Task<float[]> ToWhisperPcmAsync(string audioPath, CancellationToken ct = default)
+    {
+        if (!File.Exists(audioPath))
+            throw new FileNotFoundException("Аудиофайл не найден", audioPath);
+
+        return await Task.Run(() =>
+        {
+            using var reader = new AudioFileReader(audioPath);
+            var channels = reader.WaveFormat.Channels;
+
+            ISampleProvider sampleProvider = reader;
+            if (reader.WaveFormat.SampleRate != 16000)
+                sampleProvider = new WdlResamplingSampleProvider(sampleProvider, 16000);
+
+            var interleaved = ReadAllSamples(sampleProvider, ct);
+            return channels <= 1 ? interleaved : DownmixToMono(interleaved, channels);
+        }, ct);
+    }
+
+    private static float[] ReadAllSamples(ISampleProvider sampleProvider, CancellationToken ct)
+    {
+        var chunks = new List<float[]>();
+        var totalRead = 0;
+        var buffer = new float[16000 * sampleProvider.WaveFormat.Channels];
+
+        int samplesRead;
+        while ((samplesRead = sampleProvider.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            var chunk = new float[samplesRead];
+            Array.Copy(buffer, chunk, samplesRead);
+            chunks.Add(chunk);
+            totalRead += samplesRead;
+        }
+
+        var result = new float[totalRead];
+        var offset = 0;
+        foreach (var chunk in chunks)
+        {
+            Array.Copy(chunk, 0, result, offset, chunk.Length);
+            offset += chunk.Length;
+        }
+        return result;
+    }
+
+    private static float[] DownmixToMono(float[] interleaved, int channels)
+    {
+        var mono = new float[interleaved.Length / channels];
+        for (var i = 0; i < mono.Length; i++)
+        {
+            float sum = 0f;
+            for (var c = 0; c < channels; c++)
+                sum += interleaved[(i * channels) + c];
+            mono[i] = sum / channels;
+        }
+        return mono;
     }
 
     /// <summary>

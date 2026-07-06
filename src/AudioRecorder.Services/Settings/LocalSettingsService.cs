@@ -225,6 +225,39 @@ public class LocalSettingsService : ISettingsService
         }
     }
 
+    public void SaveTranscriptionEngine(string engine)
+    {
+        try
+        {
+            var normalized = string.Equals(engine, "whisper-net", StringComparison.OrdinalIgnoreCase)
+                ? "whisper-net"
+                : "legacy-fwx";
+            var settings = LoadSettings();
+            settings.TranscriptionEngine = normalized;
+            SaveSettings(settings);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Failed to save transcription engine: {ex.Message}");
+        }
+    }
+
+    public string LoadTranscriptionEngine()
+    {
+        try
+        {
+            var settings = LoadSettings();
+            return string.Equals(settings.TranscriptionEngine, "whisper-net", StringComparison.OrdinalIgnoreCase)
+                ? "whisper-net"
+                : "legacy-fwx";
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Failed to load transcription engine: {ex.Message}");
+            return "legacy-fwx";
+        }
+    }
+
     public void SaveOutlineBaseUrl(string url)
     {
         var settings = LoadSettings();
@@ -285,6 +318,7 @@ public class LocalSettingsService : ISettingsService
         public string WhisperModel { get; set; } = "large-v2";
         public string DeviceMode { get; set; } = "auto";
         public string? InstallRootPath { get; set; }
+        public string TranscriptionEngine { get; set; } = "whisper-net";
         public string? OutlineBaseUrl { get; set; }
         public string? OutlineApiToken { get; set; }
         public string? OutlineDefaultCollectionId { get; set; }

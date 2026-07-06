@@ -28,7 +28,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <RootNamespace>AudioRecorder</RootNamespace>
         <AssemblyName>Contora</AssemblyName>
-        <Version>0.5.1</Version>
+        <Version>0.6.0</Version>
         <ApplicationIcon>Assets\Contora.ico</ApplicationIcon>
         <Product>Contora</Product>
         <FileDescription>Contora</FileDescription>
@@ -56,6 +56,13 @@
         <Content Include="Assets\TrayIcon16.png" />
         <Content Include="Assets\TrayIcon32.png" />
         <Content Include="Assets\Wide310x150Logo.scale-200.png" />
+
+        <!-- Sortformer diarization server script — must sit next to Contora.exe so
+             DiarizationServerBackend.FindScript() locates it in installed builds. -->
+        <Content Include="..\..\tools\sortformer-server\sortformer_server.py" Link="sortformer_server.py">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+            <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+        </Content>
     </ItemGroup>
 
     <ItemGroup>

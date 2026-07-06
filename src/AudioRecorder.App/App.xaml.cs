@@ -69,6 +69,38 @@ namespace AudioRecorder
             // Required for Velopack install/update hooks.
             VelopackApp.Build().Run();
             InitializeComponent();
+
+            // Log otherwise-silent crashes (WinUI surfaces unhandled UI-thread exceptions as
+            // opaque 0xc000027b faults with nothing in app.log) so failures stay diagnosable.
+            UnhandledException += (_, ex) =>
+            {
+                try
+                {
+                    AudioRecorder.Services.Logging.AppLogger.LogError(
+                        $"UNHANDLED: {ex.Exception}");
+                }
+                catch { }
+            };
+
+            AppDomain.CurrentDomain.UnhandledException += (_, ex) =>
+            {
+                try
+                {
+                    AudioRecorder.Services.Logging.AppLogger.LogError(
+                        $"UNHANDLED (domain): {ex.ExceptionObject}");
+                }
+                catch { }
+            };
+
+            System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, ex) =>
+            {
+                try
+                {
+                    AudioRecorder.Services.Logging.AppLogger.LogError(
+                        $"UNOBSERVED TASK: {ex.Exception}");
+                }
+                catch { }
+            };
         }
 
         /// <summary>

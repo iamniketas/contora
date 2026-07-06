@@ -180,8 +180,8 @@ public sealed class SharedModelConfigService
             }
         }
 
-        // Remove models whose directories no longer exist
-        var removed = config.InstalledModels.RemoveAll(m => !Directory.Exists(m.DirectoryPath));
+        // Remove models whose files/directories no longer exist (GGML models are single files).
+        var removed = config.InstalledModels.RemoveAll(m => !File.Exists(m.DirectoryPath) && !Directory.Exists(m.DirectoryPath));
         if (removed > 0) changed = true;
 
         if (changed)
@@ -298,14 +298,24 @@ public sealed class SharedModelConfigService
 
     private static long CalculateDirectorySize(string? path)
     {
-        if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
+        if (string.IsNullOrEmpty(path))
             return 0;
 
         try
         {
-            return new DirectoryInfo(path)
-                .EnumerateFiles("*", SearchOption.AllDirectories)
-                .Sum(f => f.Length);
+            // GGML-модели регистрируются по пути к одиночному файлу (ggml-{name}.bin),
+            // а не к директории — в отличие от 4-файлового CTranslate2-формата.
+            if (File.Exists(path))
+                return new FileInfo(path).Length;
+
+            if (Directory.Exists(path))
+            {
+                return new DirectoryInfo(path)
+                    .EnumerateFiles("*", SearchOption.AllDirectories)
+                    .Sum(f => f.Length);
+            }
+
+            return 0;
         }
         catch
         {

@@ -49,6 +49,26 @@
                     <StackPanel x:Name="EnginesSection" Spacing="16" Visibility="Visible">
                         <TextBlock Text="Engines" FontSize="24" FontWeight="SemiBold" />
 
+                        <!-- Transcription engine selector -->
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="8">
+                                <TextBlock Text="Transcription engine" FontSize="14" FontWeight="Medium" />
+                                <ComboBox x:Name="EngineSelectorCombo" HorizontalAlignment="Stretch"
+                                          SelectionChanged="OnEngineSelectionChanged">
+                                    <ComboBoxItem Content="Whisper.net (in-process, recommended)" Tag="whisper-net" />
+                                    <ComboBoxItem Content="Legacy (faster-whisper-xxl.exe)" Tag="legacy-fwx" />
+                                </ComboBox>
+                                <TextBlock FontSize="11" TextWrapping="Wrap"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                           Text="Whisper.net uses the same whisper.cpp engine as Dictator: CUDA + Flash Attention + greedy decoding, running in-process with no external exe. Legacy is the previous faster-whisper-xxl.exe, kept as a rollback option." />
+                            </StackPanel>
+                        </Border>
+
                         <!-- Hardware info card -->
                         <Border
                             x:Name="HardwareCard"
@@ -93,8 +113,9 @@
                             </StackPanel>
                         </Border>
 
-                        <!-- Faster Whisper XXL card -->
+                        <!-- Faster Whisper XXL card (only relevant for the legacy engine) -->
                         <Border
+                            x:Name="FasterWhisperCard"
                             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1"
@@ -309,6 +330,41 @@
                                     Visibility="Collapsed" />
                                 <TextBlock
                                     x:Name="ModelProgressText"
+                                    FontSize="11"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    TextWrapping="Wrap"
+                                    Visibility="Collapsed" />
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Diarization models (sherpa-onnx: pyannote-segmentation + CAM++), Whisper.net only -->
+                        <Border
+                            x:Name="DiarizationModelsCard"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16"
+                            Visibility="Collapsed">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Diarization models" FontSize="14" FontWeight="Medium" />
+                                <TextBlock FontSize="11" TextWrapping="Wrap"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                           Text="Fallback speaker diarization (sherpa-onnx: pyannote-segmentation-3.0 + CAM++, ONNX, no Python required), used automatically when NeMo Sortformer / Dictator's Python venv is unavailable. Downloaded once, shared by all model sizes." />
+                                <TextBlock x:Name="DiarizationModelsStatusText" FontSize="12" />
+
+                                <Button
+                                    x:Name="DownloadDiarizationModelsBtn"
+                                    Content="Download diarization models (~35 MB)"
+                                    Click="OnDownloadDiarizationModelsClicked"
+                                    Style="{StaticResource AccentButtonStyle}" />
+
+                                <ProgressBar
+                                    x:Name="DiarizationProgressBar"
+                                    Minimum="0" Maximum="100" Height="4"
+                                    Visibility="Collapsed" />
+                                <TextBlock
+                                    x:Name="DiarizationProgressText"
                                     FontSize="11"
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                     TextWrapping="Wrap"

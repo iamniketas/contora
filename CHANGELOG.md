@@ -5,6 +5,22 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-07-06
+
+### Added
+- **In-process transcription engine (Whisper.net)**: a new ASR engine built on whisper.cpp (the same core Dictator uses), running inside the app with no external `faster-whisper-xxl.exe` process. Uses CUDA + Flash Attention + greedy decoding + no-context, and keeps the model resident in memory. Measured ~13–17x realtime on large-v3 (RTX 3090). Selectable in **Settings → Engines**; the previous faster-whisper-xxl engine remains available as **Legacy** for rollback. New installs default to Whisper.net.
+- **GGML model management**: download official ggerganov/whisper.cpp GGML models (`tiny`, `base`, `small`, `medium`, `large-v2`, `large-v3`, `large-v3-turbo`) directly. Models are a single `.bin` file and are **shared with Dictator** — if Dictator already has a model (e.g. `ggml-large-v3.bin`), Contora reuses it with no re-download.
+- **Speaker diarization for the new engine**: NVIDIA NeMo **Sortformer** (streaming, up to 4 speakers) as the primary backend when Dictator's Python runtime is available — noticeably better automatic speaker-count estimation. Falls back to fully in-process **sherpa-onnx** (pyannote-segmentation-3.0 + CAM++, ONNX, no Python) when Python isn't present. Diarization models download from Settings → Models.
+- **Transcription timing stats**: results now show elapsed time, audio duration, and realtime speed factor (e.g. `Time: 3:38 for 50:12 of audio · 13.8x realtime`), mirrored to the log.
+- **Global crash logging**: unhandled exceptions are now written to the app log, so failures are diagnosable instead of silent.
+
+### Fixed
+- **`large-v3-turbo` download**: the previous engine pointed at a non-existent CTranslate2 repository (401/404); the GGML path uses the official ggerganov conversion, which works.
+- **UI no longer stalls on model change** for the in-process engine (skips a slow User-scoped environment-variable write that only the legacy engine needs).
+
+### Changed
+- Local dev launch scripts (`run-debug.bat`, `run-release.bat`, `build-and-run.ps1`) now build/run **x64** — the Whisper.net and sherpa-onnx native runtimes ship x64-only binaries.
+
 ## [0.5.1] - 2026-05-04
 
 ### Added

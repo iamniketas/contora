@@ -241,6 +241,7 @@ public sealed partial class MainPage : Page
     private string _whisperModel = "large-v2";
     private string _deviceMode = "auto";
     private bool _isTranscribing = false;
+    private TimeSpan? _lastTranscriptionAudioDuration; // last known audio duration from progress events
     private string? _pendingAudioPath;
     private readonly Dictionary<string, string> _speakerNameMap = new();
 
@@ -272,6 +273,13 @@ public sealed partial class MainPage : Page
         _transcriptionMode = _settingsService.LoadTranscriptionMode();
         _whisperModel = _settingsService.LoadWhisperModel();
         _deviceMode = _settingsService.LoadDeviceMode();
+
+        // Must exist before CreateTranscriptionService: the whisper-net branch resolves the
+        // diarization backend via _dictatorStoreService, so it has to be constructed first.
+        _sharedConfigService = new SharedModelConfigService();
+        _dictatorStoreService = new DictatorSharedStoreService();
+        _ = _dictatorStoreService.LoadStoreAsync(); // warm up async, non-blocking
+
         _transcriptionService = CreateTranscriptionService(_transcriptionMode);
         _transcriptionService.ProgressChanged += OnTranscriptionProgressChanged;
 
@@ -285,9 +293,6 @@ public sealed partial class MainPage : Page
         _runtimeInstallerService = new WhisperRuntimeInstallerService(customInstallRoot);
         _modelDownloadService = new WhisperModelDownloadService(_whisperModel);
         _ffmpegInstallerService = new FfmpegInstallerService();
-        _sharedConfigService = new SharedModelConfigService();
-        _dictatorStoreService = new DictatorSharedStoreService();
-        _ = _dictatorStoreService.LoadStoreAsync(); // warm up async, non-blocking
         _embeddingService = new OllamaEmbeddingService();
         _semanticSearch = new SemanticSearchService(_sessionStore, _embeddingService);
 
@@ -329,7 +334,10 @@ public sealed partial class MainPage : Page
         // Once done, rebuild the transcription service with the right device.
         _ = InitializeDiagnosticsAsync();
 
-        if (_runtimeInstallerService.IsRuntimeInstalled())
+        // Legacy-engine-only: these env vars point faster-whisper-xxl at its runtime/model dirs.
+        // Skipped for Whisper.net to avoid the slow User-scoped env var write on the UI thread.
+        if (_settingsService.LoadTranscriptionEngine() != "whisper-net"
+            && _runtimeInstallerService.IsRuntimeInstalled())
         {
             WhisperPaths.RegisterEnvironmentVariables(_runtimeInstallerService.GetRuntimeExePath(), _whisperModel);
         }
@@ -344,11 +352,45 @@ public sealed partial class MainPage : Page
     {
         bool enableDiarization = !string.Equals(mode, "light", StringComparison.OrdinalIgnoreCase);
         var effectiveDevice = ResolveEffectiveDevice();
-        return new WhisperTranscriptionService(
-            modelName: _whisperModel,
+
+        if (_settingsService.LoadTranscriptionEngine() != "whisper-net")
+        {
+            return new WhisperTranscriptionService(
+                modelName: _whisperModel,
+                enableDiarization: enableDiarization,
+                deviceMode: effectiveDevice,
+                dictatorStore: _dictatorStoreService);
+        }
+
+        var ggmlModelPath = GgmlModelPaths.ResolveInstalledModelPath(_whisperModel, _dictatorStoreService);
+
+        return new WhisperNetTranscriptionService(
+            modelPath: ggmlModelPath ?? GgmlModelPaths.GetGgmlModelPath(GgmlModelPaths.GetGgmlModelsRoot(), _whisperModel),
             enableDiarization: enableDiarization,
             deviceMode: effectiveDevice,
-            dictatorStore: _dictatorStoreService);
+            diarizationService: CreateDiarizationService());
+    }
+
+    /// <summary>
+    /// Sortformer (NeMo, до 4 спикеров) точнее автоопределения числа спикеров у sherpa-onnx
+    /// (эмпирически: 4 вместо 3 реальных на тестовой записи против 14 у sherpa-onnx с порогом
+    /// по умолчанию), поэтому используется как основной бэкенд, когда доступен python-asr venv
+    /// Dictator. Если venv не установлен — фолбэк на sherpa-onnx (полностью in-process, без Python).
+    /// </summary>
+    private IDiarizationService CreateDiarizationService()
+    {
+        var pythonExe = _dictatorStoreService?.GetPythonVenvPath();
+        var sortformerScript = DiarizationServerBackend.FindScript();
+
+        if (pythonExe is not null && sortformerScript is not null)
+        {
+            return new SortformerDiarizationService(pythonExe, sortformerScript);
+        }
+
+        var diarizationRoot = DiarizationModelPaths.GetDiarizationModelsRoot();
+        return new SherpaOnnxDiarizationService(
+            DiarizationModelPaths.GetSegmentationModelPath(diarizationRoot),
+            DiarizationModelPaths.GetEmbeddingModelPath(diarizationRoot));
     }
 
     /// <summary>
@@ -423,6 +465,15 @@ public sealed partial class MainPage : Page
                 WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = name, Tag = name });
         }
 
+        // Safety net: the active model must always be selectable, even if it's missing from the
+        // installed-models registry (e.g. a stale/partial registration) — otherwise the dropdown
+        // shows empty while the rest of the UI still reports this model as active.
+        var hasActiveModelItem = WhisperModelComboBox.Items
+            .OfType<ComboBoxItem>()
+            .Any(i => string.Equals(i.Tag?.ToString(), activeModel, StringComparison.OrdinalIgnoreCase));
+        if (!hasActiveModelItem)
+            WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = activeModel, Tag = activeModel });
+
         // Select the active model
         for (int i = 0; i < WhisperModelComboBox.Items.Count; i++)
         {
@@ -494,7 +545,11 @@ public sealed partial class MainPage : Page
 
         _modelDownloadService = new WhisperModelDownloadService(_whisperModel);
 
-        if (_runtimeInstallerService.IsRuntimeInstalled())
+        // RegisterEnvironmentVariables writes User-scoped env vars, which broadcasts a system
+        // settings-change message and can stall the UI thread for seconds. These vars only matter
+        // for the legacy faster-whisper-xxl engine, so skip the cost entirely for Whisper.net.
+        if (_settingsService.LoadTranscriptionEngine() != "whisper-net"
+            && _runtimeInstallerService.IsRuntimeInstalled())
         {
             WhisperPaths.RegisterEnvironmentVariables(_runtimeInstallerService.GetRuntimeExePath(), _whisperModel);
         }
@@ -602,8 +657,6 @@ public sealed partial class MainPage : Page
 
     private void UpdateTranscriptionAvailabilityUi()
     {
-        var whisperAvailable = _transcriptionService.IsWhisperAvailable;
-        var modelInstalled = _modelDownloadService.IsModelInstalled();
         var ffmpegInstalled = _ffmpegInstallerService.IsInstalled();
 
         RuntimeOutdatedBar.IsOpen = false;
@@ -620,6 +673,30 @@ public sealed partial class MainPage : Page
         CancelFfmpegDownloadButton.Visibility = Visibility.Collapsed;
         FfmpegDownloadProgressBar.Visibility = Visibility.Collapsed;
         FfmpegDownloadStatusText.Visibility = Visibility.Collapsed;
+
+        // Whisper.net has no separate "runtime" to install and no CTranslate2-style model
+        // directory check — _transcriptionService.IsWhisperAvailable already reflects GGML
+        // file presence (including models shared from Dictator), so that single check is enough.
+        if (_settingsService.LoadTranscriptionEngine() == "whisper-net")
+        {
+            if (!_transcriptionService.IsWhisperAvailable)
+            {
+                WhisperWarningBar.Title = "Whisper model is missing";
+                WhisperWarningBar.Message = $"Download model '{_whisperModel}' (GGML) via Settings → Models, or select an existing model already shared with Dictator.";
+                WhisperWarningBar.IsOpen = true;
+                TranscribeButton.IsEnabled = false;
+                UpdateFfmpegUi(ffmpegInstalled);
+                return;
+            }
+
+            WhisperWarningBar.IsOpen = false;
+            TranscribeButton.IsEnabled = true;
+            UpdateFfmpegUi(ffmpegInstalled);
+            return;
+        }
+
+        var whisperAvailable = _transcriptionService.IsWhisperAvailable;
+        var modelInstalled = _modelDownloadService.IsModelInstalled();
 
         if (!whisperAvailable)
         {
@@ -1400,13 +1477,29 @@ public sealed partial class MainPage : Page
         TranscriptionStatsPanel.Visibility = Visibility.Collapsed;
 
         _transcriptionCts = new CancellationTokenSource();
+        _lastTranscriptionAudioDuration = null;
+        var transcriptionStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
         try
         {
             var result = await _transcriptionService.TranscribeAsync(audioPath, _transcriptionCts.Token);
+            transcriptionStopwatch.Stop();
 
             if (result.Success)
             {
+                var elapsed = transcriptionStopwatch.Elapsed;
+                var audioDuration = _lastTranscriptionAudioDuration;
+                var speedFactor = audioDuration is { TotalSeconds: > 0 } && elapsed.TotalSeconds > 0
+                    ? audioDuration.Value.TotalSeconds / elapsed.TotalSeconds
+                    : (double?)null;
+
+                AudioRecorder.Services.Logging.AppLogger.LogInfo(
+                    $"Transcription completed: {result.Segments.Count} segments, "
+                    + $"audio {(audioDuration.HasValue ? FormatTimeSpan(audioDuration.Value) : "?")}, "
+                    + $"elapsed {FormatTimeSpan(elapsed)}"
+                    + (speedFactor.HasValue ? $", {speedFactor.Value:F1}x realtime" : "")
+                    + $", model {_whisperModel}, engine {_settingsService.LoadTranscriptionEngine()}");
+
                 _lastTranscriptionPath = result.OutputPath;
                 TranscriptionStatusText.Text = $"Done! {result.Segments.Count} segments";
                 TranscriptionProgressBar.IsIndeterminate = false;
@@ -1425,6 +1518,14 @@ public sealed partial class MainPage : Page
                         var fileSizeKB = fileInfo.Length / 1024.0;
 
                         var statsText = $"Characters: {charCount:N0}  Words: {wordCount:N0}  File size: {fileSizeKB:F1} KB";
+
+                        var timeText = $"Time: {FormatTimeSpan(elapsed)}";
+                        if (audioDuration.HasValue)
+                            timeText += $" for {FormatTimeSpan(audioDuration.Value)} of audio";
+                        if (speedFactor.HasValue)
+                            timeText += $"  ·  {speedFactor.Value:F1}x realtime";
+                        statsText += $"\n{timeText}";
+
                         TranscriptionStatsText.Text = statsText;
                         TranscriptionStatsPanel.Visibility = Visibility.Visible;
                     }
@@ -2055,6 +2156,11 @@ public sealed partial class MainPage : Page
 
     private void OnTranscriptionProgressChanged(object? sender, TranscriptionProgress progress)
     {
+        // Both engines report the full audio duration in their progress events; capture it so the
+        // final stats can show the realtime speed factor (audio duration / wall-clock elapsed).
+        if (progress.TotalDuration is { TotalSeconds: > 0 })
+            _lastTranscriptionAudioDuration = progress.TotalDuration;
+
         _dispatcherQueue.TryEnqueue(() =>
         {
             TranscriptionStatusText.Text = progress.StatusMessage ?? progress.State.ToString();

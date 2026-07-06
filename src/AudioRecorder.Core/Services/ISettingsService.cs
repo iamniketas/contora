@@ -28,6 +28,11 @@ public interface ISettingsService
 
     string? LoadInstallRootPath();
 
+    /// <summary>Транскрипционный движок: "whisper-net" (in-process, рекомендуется) или "legacy-fwx" (faster-whisper-xxl.exe).</summary>
+    void SaveTranscriptionEngine(string engine);
+
+    string LoadTranscriptionEngine();
+
     // ── Outline integration ──────────────────────────────────────────────────
 
     void SaveOutlineBaseUrl(string url);

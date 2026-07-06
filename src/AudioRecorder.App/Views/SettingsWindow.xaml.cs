@@ -145,8 +145,42 @@ public sealed partial class SettingsWindow : Window
 
     // ─── Engines ───
 
+    private bool _isLoadingEngineSelector;
+
+    private void LoadEngineSelectorData()
+    {
+        _isLoadingEngineSelector = true;
+        try
+        {
+            var engine = _settingsService.LoadTranscriptionEngine();
+            EngineSelectorCombo.SelectedIndex = engine == "whisper-net" ? 0 : 1;
+            FasterWhisperCard.Visibility = engine == "whisper-net" ? Visibility.Collapsed : Visibility.Visible;
+            DiarizationModelsCard.Visibility = engine == "whisper-net" ? Visibility.Visible : Visibility.Collapsed;
+            UpdateDiarizationModelsStatus();
+        }
+        finally
+        {
+            _isLoadingEngineSelector = false;
+        }
+    }
+
+    private async void OnEngineSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isLoadingEngineSelector) return;
+        if (EngineSelectorCombo.SelectedItem is not ComboBoxItem item) return;
+
+        var engine = item.Tag?.ToString() ?? "legacy-fwx";
+        _settingsService.SaveTranscriptionEngine(engine);
+        FasterWhisperCard.Visibility = engine == "whisper-net" ? Visibility.Collapsed : Visibility.Visible;
+        _onSettingsChanged?.Invoke();
+
+        await LoadModelsDataAsync();
+    }
+
     private async Task LoadEnginesDataAsync()
     {
+        LoadEngineSelectorData();
+
         var installed = _runtimeInstaller.IsRuntimeInstalled();
         RuntimeStatusText.Text = installed ? "Installed" : "Not installed";
         RuntimePathText.Text = installed ? _runtimeInstaller.GetRuntimeExePath() : "—";
@@ -362,6 +396,22 @@ public sealed partial class SettingsWindow : Window
                 });
             }
 
+            if (model.RuntimeId == "whisper-net-ggml")
+            {
+                nameLine.Children.Add(new Border
+                {
+                    Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["CardStrokeColorDefaultBrush"],
+                    CornerRadius = new CornerRadius(3),
+                    Padding = new Thickness(4, 1, 4, 1),
+                    Child = new TextBlock
+                    {
+                        Text = "GGML · Whisper.net",
+                        FontSize = 10,
+                        VerticalAlignment = VerticalAlignment.Center
+                    }
+                });
+            }
+
             var source = GetModelSource(model.DirectoryPath);
             if (source != null)
             {
@@ -454,12 +504,18 @@ public sealed partial class SettingsWindow : Window
             });
 
             var hasPythonVenv = _dictatorStore.IsPythonVenvAvailable();
+            var isWhisperNetEngine = _settingsService.LoadTranscriptionEngine() == "whisper-net";
 
             foreach (var dm in dictatorStore.InstalledModels)
             {
                 var isGgml = DictatorSharedStoreService.IsGgmlModel(dm);
-                var isActive = string.Equals(dm.Id, activeModelName, StringComparison.OrdinalIgnoreCase);
-                var isUsable = !isGgml && hasPythonVenv;
+                // Whisper.net использует GGML напрямую (тот же формат, что у Dictator) — модель
+                // становится доступной, как только выбран этот движок, а не через Dictator-специфичный id.
+                var ggmlShortName = isGgml ? GgmlShortNameFromPath(dm.DirectoryPath) : null;
+                var isActive = isGgml
+                    ? string.Equals(ggmlShortName, activeModelName, StringComparison.OrdinalIgnoreCase)
+                    : string.Equals(dm.Id, activeModelName, StringComparison.OrdinalIgnoreCase);
+                var isUsable = isGgml ? isWhisperNetEngine : hasPythonVenv;
 
                 var card = new Border
                 {
@@ -522,9 +578,11 @@ public sealed partial class SettingsWindow : Window
                     ? FormatFileSize(dm.SizeBytes.Value)
                     : "—";
                 var statusNote = isGgml
-                    ? "Только для Dictator (GGML). В Contora не поддерживается."
+                    ? (isWhisperNetEngine
+                        ? dm.DirectoryPath
+                        : "GGML — requires the Whisper.net engine (Engines tab).")
                     : (!hasPythonVenv
-                        ? "Python venv не найден — установите Dictator для использования."
+                        ? "Python venv not found — install Dictator to use this model."
                         : dm.DirectoryPath);
 
                 info.Children.Add(nameLine);
@@ -542,13 +600,25 @@ public sealed partial class SettingsWindow : Window
                 if (isUsable && !isActive)
                 {
                     var useBtn = new Button { Content = "Use", Padding = new Thickness(8, 4, 8, 4) };
-                    var capturedId = dm.Id;
+                    // GGML-модели идентифицируются в Contora по короткому имени (для GgmlModelPaths),
+                    // а не по внутреннему id Dictator (например "whisper-ggml-large-v3").
+                    var capturedName = isGgml ? ggmlShortName! : dm.Id;
+                    var capturedPath = dm.DirectoryPath;
                     useBtn.Click += async (_, _) =>
                     {
-                        var cfg = await _sharedConfigService.LoadAsync();
-                        cfg.ActiveModelName = capturedId;
-                        await _sharedConfigService.SaveAsync(cfg);
-                        _settingsService.SaveWhisperModel(capturedId);
+                        if (isGgml)
+                        {
+                            // Регистрируем как полноценную InstalledModel (не только ActiveModelName),
+                            // иначе MainPage не найдёт её в своём списке моделей (SharedModelConfig.InstalledModels).
+                            await _sharedConfigService.RegisterModelAsync(capturedName, "whisper-net-ggml", capturedPath, isDefault: true);
+                        }
+                        else
+                        {
+                            var cfg = await _sharedConfigService.LoadAsync();
+                            cfg.ActiveModelName = capturedName;
+                            await _sharedConfigService.SaveAsync(cfg);
+                        }
+                        _settingsService.SaveWhisperModel(capturedName);
                         _onSettingsChanged?.Invoke();
                         await LoadModelsDataAsync();
                     };
@@ -571,7 +641,9 @@ public sealed partial class SettingsWindow : Window
         if (ModelSelectorCombo.SelectedItem is not ComboBoxItem item) return;
         var modelName = item.Tag?.ToString() ?? "large-v2";
 
-        if (!_runtimeInstaller.IsRuntimeInstalled())
+        var useWhisperNet = _settingsService.LoadTranscriptionEngine() == "whisper-net";
+
+        if (!useWhisperNet && !_runtimeInstaller.IsRuntimeInstalled())
         {
             ModelProgressText.Visibility = Visibility.Visible;
             ModelProgressText.Text = "Install runtime first before downloading models.";
@@ -588,45 +660,15 @@ public sealed partial class SettingsWindow : Window
         ModelProgressText.Visibility = Visibility.Visible;
         ModelProgressText.Text = $"Downloading model '{modelName}'...";
 
-        var svc = new WhisperModelDownloadService(modelName);
-
         try
         {
-            var result = await svc.DownloadModelAsync(
-                progress =>
-                {
-                    _dispatcherQueue.TryEnqueue(() =>
-                    {
-                        ModelProgressBar.Value = progress.Percent;
-                        var dlMb = progress.DownloadedBytes / (1024.0 * 1024.0);
-                        var totMb = progress.TotalBytes > 0 ? progress.TotalBytes / (1024.0 * 1024.0) : 0;
-                        var speedMb = progress.SpeedBytesPerSecond / (1024.0 * 1024.0);
-
-                        string text;
-                        if (progress.TotalBytes > 0)
-                        {
-                            text = $"{dlMb:F1}/{totMb:F1} МБ";
-                            if (speedMb > 0) text += $" — {speedMb:F1} МБ/с";
-                            if (progress.Eta.HasValue) text += $" — осталось {FormatEta(progress.Eta.Value)}";
-                            text += $" — {progress.CurrentFile}";
-                        }
-                        else
-                        {
-                            text = $"Скачиваем {progress.CurrentFile}...";
-                        }
-                        ModelProgressText.Text = text;
-                    });
-                },
-                _modelDownloadCts.Token);
-
-            ModelProgressText.Text = result.StatusMessage;
-
-            if (result.Success)
+            if (useWhisperNet)
             {
-                await _sharedConfigService.RegisterModelAsync(
-                    modelName, "faster-whisper-xxl", svc.GetModelDirectory());
-                WhisperPaths.RegisterEnvironmentVariables(svc.GetWhisperPath(), modelName);
-                _onSettingsChanged?.Invoke();
+                await DownloadGgmlModelAsync(modelName, _modelDownloadCts.Token);
+            }
+            else
+            {
+                await DownloadCtranslate2ModelAsync(modelName, _modelDownloadCts.Token);
             }
         }
         finally
@@ -642,9 +684,119 @@ public sealed partial class SettingsWindow : Window
         }
     }
 
+    private async Task DownloadCtranslate2ModelAsync(string modelName, CancellationToken ct)
+    {
+        var svc = new WhisperModelDownloadService(modelName);
+
+        var result = await svc.DownloadModelAsync(
+            progress => _dispatcherQueue.TryEnqueue(() => RenderDownloadProgress(progress.Percent, progress.DownloadedBytes, progress.TotalBytes, progress.SpeedBytesPerSecond, progress.Eta, progress.CurrentFile, ModelProgressBar, ModelProgressText)),
+            ct);
+
+        ModelProgressText.Text = result.StatusMessage;
+
+        if (result.Success)
+        {
+            await _sharedConfigService.RegisterModelAsync(
+                modelName, "faster-whisper-xxl", svc.GetModelDirectory());
+            WhisperPaths.RegisterEnvironmentVariables(svc.GetWhisperPath(), modelName);
+            _onSettingsChanged?.Invoke();
+        }
+    }
+
+    private async Task DownloadGgmlModelAsync(string modelName, CancellationToken ct)
+    {
+        var svc = new GgmlModelDownloadService(modelName);
+
+        var result = await svc.DownloadModelAsync(
+            progress => _dispatcherQueue.TryEnqueue(() => RenderDownloadProgress(progress.Percent, progress.DownloadedBytes, progress.TotalBytes, progress.SpeedBytesPerSecond, progress.Eta, progress.CurrentFile, ModelProgressBar, ModelProgressText)),
+            ct);
+
+        ModelProgressText.Text = result.StatusMessage;
+
+        if (result.Success)
+        {
+            await _sharedConfigService.RegisterModelAsync(
+                modelName, "whisper-net-ggml", svc.GetModelPath());
+            _onSettingsChanged?.Invoke();
+        }
+    }
+
+    private void RenderDownloadProgress(int percent, long downloadedBytes, long totalBytes, double speedBytesPerSecond, TimeSpan? eta, string currentFile, ProgressBar progressBar, TextBlock progressText)
+    {
+        progressBar.Value = percent;
+        var dlMb = downloadedBytes / (1024.0 * 1024.0);
+        var totMb = totalBytes > 0 ? totalBytes / (1024.0 * 1024.0) : 0;
+        var speedMb = speedBytesPerSecond / (1024.0 * 1024.0);
+
+        string text;
+        if (totalBytes > 0)
+        {
+            text = $"{dlMb:F1}/{totMb:F1} MB";
+            if (speedMb > 0) text += $" — {speedMb:F1} MB/s";
+            if (eta.HasValue) text += $" — {FormatEta(eta.Value)} remaining";
+            text += $" — {currentFile}";
+        }
+        else
+        {
+            text = $"Downloading {currentFile}...";
+        }
+        progressText.Text = text;
+    }
+
     private void OnCancelModelClicked(object sender, RoutedEventArgs e)
     {
         _modelDownloadCts?.Cancel();
+    }
+
+    private void UpdateDiarizationModelsStatus()
+    {
+        var root = DiarizationModelPaths.GetDiarizationModelsRoot();
+        var installed = DiarizationModelPaths.IsInstalled(root);
+        DiarizationModelsStatusText.Text = installed ? "Installed" : "Not installed";
+        DiarizationModelsStatusText.Foreground = installed
+            ? (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["SystemFillColorSuccessBrush"]
+            : (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+        DownloadDiarizationModelsBtn.Content = installed ? "Re-download diarization models" : "Download diarization models (~35 MB)";
+    }
+
+    private bool _isDiarizationModelsDownloading;
+    private CancellationTokenSource? _diarizationModelsDownloadCts;
+
+    private async void OnDownloadDiarizationModelsClicked(object sender, RoutedEventArgs e)
+    {
+        if (_isDiarizationModelsDownloading) return;
+
+        _isDiarizationModelsDownloading = true;
+        _diarizationModelsDownloadCts = new CancellationTokenSource();
+
+        DownloadDiarizationModelsBtn.IsEnabled = false;
+        DiarizationProgressBar.Visibility = Visibility.Visible;
+        DiarizationProgressBar.Value = 0;
+        DiarizationProgressText.Visibility = Visibility.Visible;
+        DiarizationProgressText.Text = "Downloading diarization models...";
+
+        try
+        {
+            var svc = new DiarizationModelDownloadService();
+            var result = await svc.DownloadModelsAsync(
+                progress => _dispatcherQueue.TryEnqueue(() => RenderDownloadProgress(
+                    progress.Percent, progress.DownloadedBytes, progress.TotalBytes,
+                    progress.SpeedBytesPerSecond, progress.Eta, progress.CurrentFile,
+                    DiarizationProgressBar, DiarizationProgressText)),
+                _diarizationModelsDownloadCts.Token);
+
+            DiarizationProgressText.Text = result.StatusMessage;
+        }
+        finally
+        {
+            _diarizationModelsDownloadCts?.Dispose();
+            _diarizationModelsDownloadCts = null;
+            _isDiarizationModelsDownloading = false;
+            DownloadDiarizationModelsBtn.IsEnabled = true;
+            DiarizationProgressBar.Visibility = Visibility.Collapsed;
+            UpdateDiarizationModelsStatus();
+            LoadStorageData();
+        }
     }
 
     // ─── Shared Models Folder ───
@@ -704,6 +856,16 @@ public sealed partial class SettingsWindow : Window
     }
 
     /// <summary>Returns a short source label if the model path belongs to a known location.</summary>
+    // "ggml-large-v3.bin" -> "large-v3" (matches GgmlModelPaths.GetFileName's convention).
+    private static string GgmlShortNameFromPath(string path)
+    {
+        var fileName = Path.GetFileNameWithoutExtension(path); // "ggml-large-v3"
+        const string prefix = "ggml-";
+        return fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? fileName[prefix.Length..]
+            : fileName;
+    }
+
     private static string? GetModelSource(string directoryPath)
     {
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);

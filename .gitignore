@@ -111,7 +111,8 @@ recordings/
 artifacts/macos-pilot/
 artifacts/macos-whisper-runtime/
 
-# Tools (large binaries)
+# Tools (large binaries) — ignore contents but keep the small versioned script folders.
+# Use tools/* (not tools/) so git still descends into the folder and the negations below apply.
 tools/*
 !tools/release/
 !tools/release/**
@@ -119,6 +120,7 @@ tools/*
 !tools/macos-whisper-runtime/**
 !tools/macos-release/
 !tools/macos-release/**
+!tools/sortformer-server/
 **/__pycache__/
 **/*.pyc
 
