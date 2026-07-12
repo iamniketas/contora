@@ -22,8 +22,62 @@ public static class GgmlModelPaths
     public static string GetGgmlModelPath(string modelsRoot, string modelName)
         => Path.Combine(modelsRoot, GetFileName(modelName));
 
+    // Silero VAD model for whisper.cpp — used to skip non-speech so the ASR doesn't hallucinate
+    // ("Продолжение следует…", etc.) over silence/music. Tiny (~0.9 MB), auto-downloaded on demand.
+    public const string VadModelFileName = "ggml-silero-v5.1.2.bin";
+    public const string VadModelUrl =
+        "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
+
+    public static string GetVadModelPath() => Path.Combine(GetGgmlModelsRoot(), VadModelFileName);
+
     public static bool IsGgmlModelInstalled(string modelsRoot, string modelName)
         => File.Exists(GetGgmlModelPath(modelsRoot, modelName));
+
+    /// <summary>
+    /// Short model name from a ggml file path, e.g. "…/ggml-large-v3.bin" → "large-v3".
+    /// Returns null if the file isn't a ggml-*.bin.
+    /// </summary>
+    public static string? ModelNameFromFile(string path)
+    {
+        var fileName = Path.GetFileName(path);
+        if (!fileName.StartsWith(FilePrefix, StringComparison.OrdinalIgnoreCase) ||
+            !fileName.EndsWith(FileSuffix, StringComparison.OrdinalIgnoreCase))
+            return null;
+        return fileName[FilePrefix.Length..^FileSuffix.Length];
+    }
+
+    /// <summary>
+    /// Enumerates GGML models usable by the Whisper.net engine: every ggml-*.bin in the shared
+    /// root plus any GGML model registered in Dictator's store. Returns distinct short names.
+    /// </summary>
+    public static IReadOnlyList<string> EnumerateInstalledModelNames(DictatorSharedStoreService? dictatorStore)
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var root = GetGgmlModelsRoot();
+        if (Directory.Exists(root))
+        {
+            foreach (var file in Directory.EnumerateFiles(root, $"{FilePrefix}*{FileSuffix}"))
+            {
+                var name = ModelNameFromFile(file);
+                if (name is not null) names.Add(name);
+            }
+        }
+
+        var dictatorModels = dictatorStore?.GetCached()?.InstalledModels;
+        if (dictatorModels is not null)
+        {
+            foreach (var m in dictatorModels)
+            {
+                if (!DictatorSharedStoreService.IsGgmlModel(m) || m.Health != "ok") continue;
+                if (!File.Exists(m.DirectoryPath)) continue;
+                var name = ModelNameFromFile(m.DirectoryPath);
+                if (name is not null) names.Add(name);
+            }
+        }
+
+        return names.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+    }
 
     /// <summary>
     /// Resolves the path to a GGML model file, preferring an existing Dictator installation

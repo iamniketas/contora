@@ -19,6 +19,25 @@ from flask import Flask, request, jsonify
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- Windows temp-cleanup hardening -------------------------------------------------
+# NeMo's diarize() runs inference inside `with tempfile.TemporaryDirectory() as tmpdir:`
+# and yields results from within that block. On Windows the temp manifest.json is often
+# still held (lazy DataLoader/AV handle) when the block exits, so shutil.rmtree raises
+# [WinError 32] and masks the already-computed diarization result. Defaulting
+# ignore_cleanup_errors=True (Python 3.10+) lets cleanup fail quietly — the temp dir is
+# left for the OS to reap, and the result is returned normally.
+_OrigTemporaryDirectory = tempfile.TemporaryDirectory
+
+
+class _QuietTemporaryDirectory(_OrigTemporaryDirectory):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("ignore_cleanup_errors", True)
+        super().__init__(*args, **kwargs)
+
+
+tempfile.TemporaryDirectory = _QuietTemporaryDirectory
+# ------------------------------------------------------------------------------------
+
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 

@@ -14,6 +14,8 @@ public sealed class DiarizationServerBackend : IDisposable
 {
     private const int Port = 5002;
     private static readonly string BaseUrl = $"http://127.0.0.1:{Port}";
+    private static readonly string PidFilePath =
+        Path.Combine(Path.GetTempPath(), "contora_sortformer_server.pid");
 
     private readonly string _pythonExe;
     private readonly string _scriptPath;
@@ -39,6 +41,12 @@ public sealed class DiarizationServerBackend : IDisposable
         if (_serverProcess is not null)
             await StopAsync();
 
+        // Guard against orphaned servers from a previous run/crash still squatting on Port:
+        // without this, the health check below talks to that stale (possibly wedged) process
+        // instead of the one we're about to start, and DiarizeAsync hangs against it for up to
+        // its 600s timeout with no visible error.
+        KillOrphanedServers();
+
         var psi = new ProcessStartInfo
         {
             FileName = _pythonExe,
@@ -59,6 +67,7 @@ public sealed class DiarizationServerBackend : IDisposable
 
         _serverProcess = Process.Start(psi);
         if (_serverProcess is null) return false;
+        WriteOwnPid(_serverProcess.Id);
 
         _ = Task.Run(() => DrainStream(_serverProcess.StandardOutput), CancellationToken.None);
         _ = Task.Run(() => DrainStream(_serverProcess.StandardError), CancellationToken.None);
@@ -86,6 +95,42 @@ public sealed class DiarizationServerBackend : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Kills the sortformer_server.py process left over from a previous run (crashed app,
+    /// force-killed debugger session, etc.) so a stale process on Port never gets mistaken for
+    /// a live one. Tracked via a PID file since Port is fixed and shared across app instances.
+    /// </summary>
+    private static void KillOrphanedServers()
+    {
+        try
+        {
+            if (!File.Exists(PidFilePath)) return;
+            if (!int.TryParse(File.ReadAllText(PidFilePath).Trim(), out var pid)) return;
+
+            using var process = Process.GetProcessById(pid);
+            if (!string.Equals(process.ProcessName, "python", StringComparison.OrdinalIgnoreCase)) return;
+
+            process.Kill(entireProcessTree: true);
+            process.WaitForExit(5000);
+        }
+        catch (ArgumentException) { /* no such process — nothing to clean up */ }
+        catch { /* best-effort cleanup */ }
+        finally
+        {
+            try { File.Delete(PidFilePath); } catch { }
+        }
+    }
+
+    private static void WriteOwnPid(int pid)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(PidFilePath)!);
+            File.WriteAllText(PidFilePath, pid.ToString());
+        }
+        catch { /* best-effort */ }
+    }
+
     private static async Task DrainStream(StreamReader reader)
     {
         try
@@ -110,6 +155,7 @@ public sealed class DiarizationServerBackend : IDisposable
             _serverProcess?.Dispose();
             _serverProcess = null;
             _isLoaded = false;
+            try { File.Delete(PidFilePath); } catch { }
         }
     }
 

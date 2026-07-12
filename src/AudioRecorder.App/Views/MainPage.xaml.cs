@@ -317,6 +317,8 @@ public sealed partial class MainPage : Page
             _ffmpegDownloadCts?.Dispose();
             _ffmpegDownloadCts = null;
             _appUpdateService.Dispose();
+            _transcriptionService.ProgressChanged -= OnTranscriptionProgressChanged;
+            (_transcriptionService as IDisposable)?.Dispose();
         };
     }
 
@@ -346,6 +348,20 @@ public sealed partial class MainPage : Page
         UpdateTranscriptionAvailabilityUi();
         _ = TryAutoSetupWhisperAsync();
         _ = CheckRuntimeVersionAsync();
+    }
+
+    /// <summary>
+    /// Swaps in a freshly-built transcription service, disposing the outgoing one first.
+    /// Without this, every model/mode switch orphaned the previous WhisperNet factory and — for
+    /// whisper-net with diarization — its Sortformer python server process (fixed port 5002),
+    /// leaking a GPU-resident process per switch for the lifetime of the app.
+    /// </summary>
+    private void ReplaceTranscriptionService(string mode)
+    {
+        _transcriptionService.ProgressChanged -= OnTranscriptionProgressChanged;
+        (_transcriptionService as IDisposable)?.Dispose();
+        _transcriptionService = CreateTranscriptionService(mode);
+        _transcriptionService.ProgressChanged += OnTranscriptionProgressChanged;
     }
 
     private ITranscriptionService CreateTranscriptionService(string mode)
@@ -414,9 +430,7 @@ public sealed partial class MainPage : Page
         if (string.Equals(_transcriptionMode, normalized, StringComparison.OrdinalIgnoreCase))
             return;
 
-        _transcriptionService.ProgressChanged -= OnTranscriptionProgressChanged;
-        _transcriptionService = CreateTranscriptionService(normalized);
-        _transcriptionService.ProgressChanged += OnTranscriptionProgressChanged;
+        ReplaceTranscriptionService(normalized);
         _transcriptionMode = normalized;
 
         if (save)
@@ -440,56 +454,70 @@ public sealed partial class MainPage : Page
 
     private void LoadWhisperModelSetting() => _ = LoadWhisperModelSettingAsync();
 
+    // One selectable model in the main dropdown. Each model carries the engine that can run it, so
+    // picking a model transparently switches the engine — the user never has to think about engines.
+    private sealed record ModelChoice(string Model, string Engine);
+
     private async Task LoadWhisperModelSettingAsync()
     {
-        var savedModel = _settingsService.LoadWhisperModel();
         var config = await _sharedConfigService.LoadAsync();
-
-        // SharedModelConfig.ActiveModelName is the canonical source; fall back to saved setting
+        var currentEngine = _settingsService.LoadTranscriptionEngine();
         var activeModel = !string.IsNullOrWhiteSpace(config.ActiveModelName)
-            ? config.ActiveModelName
-            : WhisperModelDownloadService.NormalizeModelName(savedModel);
+            ? config.ActiveModelName!
+            : _settingsService.LoadWhisperModel();
 
-        // Populate ComboBox from installed models; fall back to 4 defaults if nothing installed
+        // Build a single list of everything Contora can actually run, across both engines:
+        //  - GGML files  → Whisper.net (in-process)
+        //  - CTranslate2 → legacy faster-whisper-xxl
+        var choices = new List<(ModelChoice Choice, string Label)>();
+
+        foreach (var name in GgmlModelPaths.EnumerateInstalledModelNames(_dictatorStoreService))
+            choices.Add((new ModelChoice(name, "whisper-net"), $"{name}  ·  Whisper.net"));
+
+        foreach (var m in config.InstalledModels.Where(m => m.RuntimeId != "whisper-net-ggml"))
+        {
+            // Skip a CTranslate2 entry if a GGML model of the same name is already listed to avoid
+            // two confusingly-identical rows; the GGML/Whisper.net one is preferred.
+            if (choices.Any(c => string.Equals(c.Choice.Model, m.Name, StringComparison.OrdinalIgnoreCase)))
+                continue;
+            choices.Add((new ModelChoice(m.Name, "legacy-fwx"), $"{m.Name}  ·  faster-whisper"));
+        }
+
         WhisperModelComboBox.SelectionChanged -= OnWhisperModelChanged;
         WhisperModelComboBox.Items.Clear();
+        foreach (var (choice, label) in choices)
+            WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = label, Tag = choice });
 
-        if (config.InstalledModels.Count > 0)
-        {
-            foreach (var m in config.InstalledModels)
-                WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = m.Name, Tag = m.Name });
-        }
-        else
-        {
-            foreach (var name in new[] { "tiny", "small", "medium", "large-v2" })
-                WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = name, Tag = name });
-        }
+        // Prefer the persisted (engine, model) pair; else the same model under any engine; else first.
+        var selectedIndex = choices.FindIndex(c =>
+            string.Equals(c.Choice.Model, activeModel, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(c.Choice.Engine, currentEngine, StringComparison.OrdinalIgnoreCase));
+        if (selectedIndex < 0)
+            selectedIndex = choices.FindIndex(c => string.Equals(c.Choice.Model, activeModel, StringComparison.OrdinalIgnoreCase));
+        if (selectedIndex < 0 && choices.Count > 0)
+            selectedIndex = 0;
 
-        // Safety net: the active model must always be selectable, even if it's missing from the
-        // installed-models registry (e.g. a stale/partial registration) — otherwise the dropdown
-        // shows empty while the rest of the UI still reports this model as active.
-        var hasActiveModelItem = WhisperModelComboBox.Items
-            .OfType<ComboBoxItem>()
-            .Any(i => string.Equals(i.Tag?.ToString(), activeModel, StringComparison.OrdinalIgnoreCase));
-        if (!hasActiveModelItem)
-            WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = activeModel, Tag = activeModel });
-
-        // Select the active model
-        for (int i = 0; i < WhisperModelComboBox.Items.Count; i++)
-        {
-            if (WhisperModelComboBox.Items[i] is ComboBoxItem item &&
-                string.Equals(item.Tag?.ToString(), activeModel, StringComparison.OrdinalIgnoreCase))
-            {
-                WhisperModelComboBox.SelectedIndex = i;
-                break;
-            }
-        }
+        if (selectedIndex >= 0)
+            WhisperModelComboBox.SelectedIndex = selectedIndex;
 
         WhisperModelComboBox.SelectionChanged += OnWhisperModelChanged;
 
-        // Apply the active model to the transcription service
-        if (!string.Equals(_whisperModel, activeModel, StringComparison.OrdinalIgnoreCase))
-            ApplyWhisperModel(activeModel, save: false);
+        if (selectedIndex >= 0)
+        {
+            var chosen = choices[selectedIndex].Choice;
+            // Apply if the resolved (engine, model) differs from the live state — keeps the engine,
+            // settings.WhisperModel and shared active-model coherent after any drift.
+            if (!string.Equals(_whisperModel, chosen.Model, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(currentEngine, chosen.Engine, StringComparison.OrdinalIgnoreCase))
+            {
+                ApplyModelChoice(chosen, save: true);
+            }
+        }
+        else
+        {
+            // Nothing installed for either engine — show the "download a model" hint.
+            UpdateTranscriptionAvailabilityUi();
+        }
     }
 
     private async Task InitializeDiagnosticsAsync()
@@ -500,9 +528,7 @@ public sealed partial class MainPage : Page
             _dispatcherQueue.TryEnqueue(() =>
             {
                 // Rebuild service: "auto" now resolves to the correct device
-                _transcriptionService.ProgressChanged -= OnTranscriptionProgressChanged;
-                _transcriptionService = CreateTranscriptionService(_transcriptionMode);
-                _transcriptionService.ProgressChanged += OnTranscriptionProgressChanged;
+                ReplaceTranscriptionService(_transcriptionMode);
                 UpdateDeviceInfoText();
             });
         }
@@ -533,9 +559,7 @@ public sealed partial class MainPage : Page
 
         _whisperModel = normalized;
 
-        _transcriptionService.ProgressChanged -= OnTranscriptionProgressChanged;
-        _transcriptionService = CreateTranscriptionService(_transcriptionMode);
-        _transcriptionService.ProgressChanged += OnTranscriptionProgressChanged;
+        ReplaceTranscriptionService(_transcriptionMode);
 
         if (save)
         {
@@ -954,9 +978,7 @@ public sealed partial class MainPage : Page
                     LoadWhisperModelSetting();
                     // Reload device mode and rebuild service
                     _deviceMode = _settingsService.LoadDeviceMode();
-                    _transcriptionService.ProgressChanged -= OnTranscriptionProgressChanged;
-                    _transcriptionService = CreateTranscriptionService(_transcriptionMode);
-                    _transcriptionService.ProgressChanged += OnTranscriptionProgressChanged;
+                    ReplaceTranscriptionService(_transcriptionMode);
                     LoadOutputFolderSetting();
                     UpdateTranscriptionAvailabilityUi();
                     UpdateDeviceInfoText();
@@ -1422,8 +1444,36 @@ public sealed partial class MainPage : Page
         if (sender is not ComboBox comboBox || comboBox.SelectedItem is not ComboBoxItem item)
             return;
 
-        var modelName = item.Tag?.ToString() ?? "large-v2";
-        ApplyWhisperModel(modelName, save: true);
+        if (item.Tag is ModelChoice choice)
+            ApplyModelChoice(choice, save: true);
+    }
+
+    /// <summary>
+    /// Applies a model together with the engine that runs it, then rebuilds the transcription
+    /// service. This is the single entry point that keeps engine + model in sync when the user
+    /// picks a model in the main dropdown.
+    /// </summary>
+    private void ApplyModelChoice(ModelChoice choice, bool save)
+    {
+        var engineChanged = !string.Equals(_settingsService.LoadTranscriptionEngine(), choice.Engine, StringComparison.OrdinalIgnoreCase);
+        if (save && engineChanged)
+            _settingsService.SaveTranscriptionEngine(choice.Engine);
+
+        // Force a rebuild even if only the engine changed (ApplyWhisperModel early-returns when the
+        // model name is unchanged, so handle the engine-only case explicitly).
+        var modelChanged = !string.Equals(_whisperModel, choice.Model, StringComparison.OrdinalIgnoreCase);
+        if (modelChanged)
+        {
+            ApplyWhisperModel(choice.Model, save);
+        }
+        else if (engineChanged)
+        {
+            ReplaceTranscriptionService(_transcriptionMode);
+            if (save)
+                _ = UpdateSharedActiveModelAsync(_whisperModel);
+            UpdateTranscriptionAvailabilityUi();
+            UpdateDeviceInfoText();
+        }
     }
 
     private void ShowTranscriptionSection()

@@ -327,12 +327,10 @@ public class LocalSettingsService : ISettingsService
 
     private static string NormalizeWhisperModel(string? modelName)
     {
-        return modelName?.Trim().ToLowerInvariant() switch
-        {
-            "small" => "small",
-            "medium" => "medium",
-            "tiny" => "tiny",
-            _ => "large-v2"
-        };
+        // Accept any non-empty model name. A hard-coded whitelist here previously collapsed every
+        // unlisted name (large-v3, large-v3-turbo, base, and all GGML models) to "large-v2",
+        // which silently broke model selection for the Whisper.net engine.
+        var name = modelName?.Trim().ToLowerInvariant();
+        return string.IsNullOrWhiteSpace(name) ? "large-v2" : name;
     }
 }

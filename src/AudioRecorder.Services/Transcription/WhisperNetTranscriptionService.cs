@@ -2,6 +2,7 @@ using System.Text;
 using AudioRecorder.Core.Models;
 using AudioRecorder.Core.Services;
 using AudioRecorder.Services.Audio;
+using AudioRecorder.Services.Logging;
 using Whisper.net;
 
 namespace AudioRecorder.Services.Transcription;
@@ -18,8 +19,10 @@ public sealed class WhisperNetTranscriptionService : ITranscriptionService, IDis
     private readonly string _deviceMode; // "auto" | "cuda" | "cpu"
     private readonly IDiarizationService? _diarizationService;
     private readonly string _language;
+    private readonly bool _useVad;
 
     private WhisperFactory? _factory;
+    private WhisperVadFactory? _vadFactory;
     private TimeSpan _audioDuration;
     private DateTime _transcriptionStartTime;
 
@@ -32,13 +35,15 @@ public sealed class WhisperNetTranscriptionService : ITranscriptionService, IDis
         bool enableDiarization = true,
         string deviceMode = "auto",
         IDiarizationService? diarizationService = null,
-        string language = "ru")
+        string language = "ru",
+        bool useVad = true)
     {
         _modelPath = modelPath;
         _enableDiarization = enableDiarization;
         _deviceMode = deviceMode;
         _diarizationService = diarizationService;
         _language = language;
+        _useVad = useVad;
     }
 
     public async Task<TranscriptionResult> TranscribeAsync(string audioPath, CancellationToken ct = default)
@@ -63,18 +68,27 @@ public sealed class WhisperNetTranscriptionService : ITranscriptionService, IDis
             RaiseProgress(TranscriptionState.Transcribing, 0, "Starting Whisper.net...");
 
             var factory = GetOrCreateFactory();
-            using var processor = factory.CreateBuilder()
-                .WithLanguage(_language)
-                .WithGreedySamplingStrategy(s => s.WithBestOf(1))
-                .WithNoContext()
-                .Build();
 
-            var rawSegments = new List<(TimeSpan Start, TimeSpan End, string Text)>();
+            // VAD-driven transcription: feed only detected speech regions to Whisper so it never
+            // decodes pure silence/music (which produces "Продолжение следует…"-style hallucinations).
+            // This mirrors the legacy faster-whisper-xxl engine's default --vad_filter behaviour.
+            // Falls back to whole-buffer transcription if the VAD model isn't available.
+            var speechRegions = _useVad ? await TryGetSpeechRegionsAsync(pcm, ct) : null;
 
-            await foreach (var segment in processor.ProcessAsync(pcm, ct))
+            List<(TimeSpan Start, TimeSpan End, string Text)> rawSegments;
+            if (speechRegions is { Count: > 0 })
             {
-                rawSegments.Add((segment.Start, segment.End, segment.Text.Trim()));
-                ReportSegmentProgress(segment.End);
+                // A fresh WhisperProcessor per region, rather than one processor reused across the
+                // whole file: on long recordings (hundreds of VAD regions) reusing a single native
+                // decoding session degraded and eventually threw "invalid argument" from the CUDA
+                // backend near the end of the file. Building processors is cheap — it opens a new
+                // decoding session against the already-loaded model, it does not reload weights.
+                rawSegments = await TranscribeRegionsAsync(factory, pcm, speechRegions, ct);
+            }
+            else
+            {
+                using var processor = BuildProcessor(factory);
+                rawSegments = await TranscribeWholeAsync(processor, pcm, ct);
             }
 
             List<DiarizationSegment>? diarizationSegments = null;
@@ -99,6 +113,9 @@ public sealed class WhisperNetTranscriptionService : ITranscriptionService, IDis
         }
         catch (Exception ex)
         {
+            AppLogger.LogError(
+                $"WhisperNetTranscriptionService failed (model={Path.GetFileName(_modelPath)}, " +
+                $"device={_deviceMode}, audio={Path.GetFileName(audioPath)}, duration={_audioDuration}): {ex}");
             RaiseProgress(TranscriptionState.Failed, 0, ex.Message);
             return new TranscriptionResult(false, null, [], ex.Message);
         }
@@ -115,6 +132,125 @@ public sealed class WhisperNetTranscriptionService : ITranscriptionService, IDis
             UseFlashAttention = _deviceMode != "cpu",
         });
         return _factory;
+    }
+
+    /// <summary>
+    /// Runs Silero VAD over the audio and returns merged speech regions, or null when VAD is
+    /// unavailable (model missing and not downloadable) — the caller then transcribes the whole buffer.
+    /// </summary>
+    private async Task<IReadOnlyList<(TimeSpan Start, TimeSpan End)>?> TryGetSpeechRegionsAsync(
+        float[] pcm, CancellationToken ct)
+    {
+        try
+        {
+            var vadModelPath = await EnsureVadModelAsync(ct);
+            if (vadModelPath is null) return null;
+
+            _vadFactory ??= WhisperVadFactory.FromPath(vadModelPath);
+            using var vad = _vadFactory.CreateBuilder()
+                .WithThreshold(0.5f)
+                .WithMinSpeechDuration(TimeSpan.FromMilliseconds(250))
+                .WithMinSilenceDuration(TimeSpan.FromMilliseconds(1000))
+                .WithSpeechPadding(TimeSpan.FromMilliseconds(250))
+                .WithMaxSpeechDuration(TimeSpan.FromSeconds(28))
+                .Build();
+
+            var regions = await vad.DetectSpeechAsync(pcm, ct);
+            return regions.Select(r => (r.Start, r.End)).ToList();
+        }
+        catch
+        {
+            // VAD is best-effort; on any failure fall back to whole-buffer transcription.
+            return null;
+        }
+    }
+
+    private static async Task<string?> EnsureVadModelAsync(CancellationToken ct)
+    {
+        var path = GgmlModelPaths.GetVadModelPath();
+        if (File.Exists(path)) return path;
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var tempPath = path + ".download";
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+            await using (var src = await http.GetStreamAsync(GgmlModelPaths.VadModelUrl, ct))
+            await using (var dst = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                await src.CopyToAsync(dst, ct);
+            }
+            if (File.Exists(path)) File.Delete(path);
+            File.Move(tempPath, path);
+            return path;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task<List<(TimeSpan Start, TimeSpan End, string Text)>> TranscribeRegionsAsync(
+        WhisperFactory factory, float[] pcm, IReadOnlyList<(TimeSpan Start, TimeSpan End)> regions,
+        CancellationToken ct)
+    {
+        var rawSegments = new List<(TimeSpan Start, TimeSpan End, string Text)>();
+
+        foreach (var region in regions)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var startSample = Math.Clamp((int)(region.Start.TotalSeconds * 16000), 0, pcm.Length);
+            var endSample = Math.Clamp((int)(region.End.TotalSeconds * 16000), startSample, pcm.Length);
+            if (endSample <= startSample) continue;
+
+            var chunk = pcm[startSample..endSample];
+
+            try
+            {
+                using var processor = BuildProcessor(factory);
+                await foreach (var segment in processor.ProcessAsync(chunk, ct))
+                {
+                    var text = segment.Text.Trim();
+                    if (text.Length == 0) continue;
+                    // Offset chunk-local timestamps back to absolute positions in the full audio.
+                    rawSegments.Add((region.Start + segment.Start, region.Start + segment.End, text));
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // A single bad region shouldn't sink the whole transcription — log and continue
+                // so the rest of the file (and everything decoded so far) is still saved.
+                AppLogger.LogWarning(
+                    $"WhisperNetTranscriptionService: region {region.Start}-{region.End} failed, skipping: {ex.Message}");
+            }
+
+            ReportSegmentProgress(region.End);
+        }
+
+        return rawSegments;
+    }
+
+    private WhisperProcessor BuildProcessor(WhisperFactory factory) => factory.CreateBuilder()
+        .WithLanguage(_language)
+        .WithGreedySamplingStrategy(s => s.WithBestOf(1))
+        .WithNoContext()
+        .Build();
+
+    private async Task<List<(TimeSpan Start, TimeSpan End, string Text)>> TranscribeWholeAsync(
+        WhisperProcessor processor, float[] pcm, CancellationToken ct)
+    {
+        var rawSegments = new List<(TimeSpan Start, TimeSpan End, string Text)>();
+
+        await foreach (var segment in processor.ProcessAsync(pcm, ct))
+        {
+            var text = segment.Text.Trim();
+            if (text.Length == 0) continue;
+            rawSegments.Add((segment.Start, segment.End, text));
+            ReportSegmentProgress(segment.End);
+        }
+
+        return rawSegments;
     }
 
     private void ReportSegmentProgress(TimeSpan processed)
@@ -167,5 +303,8 @@ public sealed class WhisperNetTranscriptionService : ITranscriptionService, IDis
     {
         _factory?.Dispose();
         _factory = null;
+        _vadFactory?.Dispose();
+        _vadFactory = null;
+        (_diarizationService as IDisposable)?.Dispose();
     }
 }

@@ -447,12 +447,17 @@ public sealed partial class SettingsWindow : Window
             {
                 var useBtn = new Button { Content = "Use", Padding = new Thickness(8, 4, 8, 4) };
                 var capturedName = model.Name;
+                // Selecting a model must also switch to the engine that can run it, otherwise the
+                // model shows "Active" here while the main window still runs a different engine.
+                var capturedEngine = model.RuntimeId == "whisper-net-ggml" ? "whisper-net" : "legacy-fwx";
                 useBtn.Click += async (_, _) =>
                 {
+                    _settingsService.SaveTranscriptionEngine(capturedEngine);
                     var cfg = await _sharedConfigService.LoadAsync();
                     cfg.ActiveModelName = capturedName;
                     await _sharedConfigService.SaveAsync(cfg);
                     _settingsService.SaveWhisperModel(capturedName);
+                    LoadEngineSelectorData();
                     _onSettingsChanged?.Invoke();
                     await LoadModelsDataAsync();
                 };
@@ -604,8 +609,12 @@ public sealed partial class SettingsWindow : Window
                     // а не по внутреннему id Dictator (например "whisper-ggml-large-v3").
                     var capturedName = isGgml ? ggmlShortName! : dm.Id;
                     var capturedPath = dm.DirectoryPath;
+                    // GGML runs on Whisper.net; NeMo/server models (Parakeet) route through the legacy
+                    // engine's Python-server path. Switch to the matching engine so selection actually takes effect.
+                    var capturedEngine = isGgml ? "whisper-net" : "legacy-fwx";
                     useBtn.Click += async (_, _) =>
                     {
+                        _settingsService.SaveTranscriptionEngine(capturedEngine);
                         if (isGgml)
                         {
                             // Регистрируем как полноценную InstalledModel (не только ActiveModelName),
@@ -619,6 +628,7 @@ public sealed partial class SettingsWindow : Window
                             await _sharedConfigService.SaveAsync(cfg);
                         }
                         _settingsService.SaveWhisperModel(capturedName);
+                        LoadEngineSelectorData();
                         _onSettingsChanged?.Invoke();
                         await LoadModelsDataAsync();
                     };
