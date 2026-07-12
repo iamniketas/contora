@@ -460,6 +460,10 @@ public sealed partial class MainPage : Page
 
     private async Task LoadWhisperModelSettingAsync()
     {
+        // Without this, models downloaded on disk but not yet merged into the shared config (e.g.
+        // large-v3/large-v3-turbo under the legacy engine) are invisible here, and the engine/model
+        // reconciliation below can't find them as a valid choice for the just-selected engine.
+        await _sharedConfigService.RefreshFromDiskAsync();
         var config = await _sharedConfigService.LoadAsync();
         var currentEngine = _settingsService.LoadTranscriptionEngine();
         var activeModel = !string.IsNullOrWhiteSpace(config.ActiveModelName)
@@ -488,10 +492,17 @@ public sealed partial class MainPage : Page
         foreach (var (choice, label) in choices)
             WhisperModelComboBox.Items.Add(new ComboBoxItem { Content = label, Tag = choice });
 
-        // Prefer the persisted (engine, model) pair; else the same model under any engine; else first.
+        // Prefer the persisted (engine, model) pair; else *some* model under the currently selected
+        // engine; else the same model under a different engine; else first. Engine before model-name
+        // match matters: currentEngine reflects whatever the user just picked in Settings (possibly
+        // moments ago), and that choice must win even if the previously active model isn't registered
+        // under the new engine (e.g. a GGML-only model with no faster-whisper counterpart listed) —
+        // otherwise this "keep things coherent" pass silently reverts the engine switch.
         var selectedIndex = choices.FindIndex(c =>
             string.Equals(c.Choice.Model, activeModel, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(c.Choice.Engine, currentEngine, StringComparison.OrdinalIgnoreCase));
+        if (selectedIndex < 0)
+            selectedIndex = choices.FindIndex(c => string.Equals(c.Choice.Engine, currentEngine, StringComparison.OrdinalIgnoreCase));
         if (selectedIndex < 0)
             selectedIndex = choices.FindIndex(c => string.Equals(c.Choice.Model, activeModel, StringComparison.OrdinalIgnoreCase));
         if (selectedIndex < 0 && choices.Count > 0)
