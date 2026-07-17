@@ -573,7 +573,7 @@
                                 <TextBlock
                                     FontSize="12"
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                    Text="Speakers (double-click to edit)" />
+                                    Text="Speakers (choose a meeting participant or enter another name)" />
                                 <ItemsRepeater
                                     x:Name="SpeakersRepeater"
                                     ItemsSource="{x:Bind Speakers, Mode=OneWay}">
@@ -606,6 +606,15 @@
                                                         MinWidth="80"
                                                         LostFocus="OnSpeakerNameLostFocus"
                                                         KeyDown="OnSpeakerNameKeyDown" />
+                                                    <Button
+                                                        Click="OnChooseSpeakerNameClicked"
+                                                        Tag="{x:Bind}"
+                                                        Padding="4"
+                                                        Background="Transparent"
+                                                        BorderThickness="0"
+                                                        ToolTipService.ToolTip="Choose a meeting participant or enter another name">
+                                                        <FontIcon Glyph="&#xE70D;" FontSize="11" Foreground="White" />
+                                                    </Button>
                                                 </StackPanel>
                                             </Border>
                                         </DataTemplate>

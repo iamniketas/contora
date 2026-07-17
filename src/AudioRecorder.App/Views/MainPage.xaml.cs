@@ -1497,6 +1497,8 @@ public sealed partial class MainPage : Page
         TranscribeButton.IsEnabled = true;
         TranscriptionProgressPanel.Visibility = Visibility.Collapsed;
         _lastTranscriptionPath = null;
+        _diarizationOptions = DiarizationOptions.Automatic;
+        _expectedSpeakerNames = [];
 
         TranscriptionSegments.Clear();
         Speakers.Clear();
@@ -1732,11 +1734,16 @@ public sealed partial class MainPage : Page
             HorizontalAlignment = HorizontalAlignment.Left,
             Width = 140,
         };
+        var countWasManuallyEdited = false;
+        var synchronizingSuggestedCount = false;
         constraint.SelectionChanged += (_, _) =>
         {
+            if (!synchronizingSuggestedCount)
+                countWasManuallyEdited = true;
             count.IsEnabled = (constraint.SelectedItem as ComboBoxItem)?.Tag is SpeakerCountConstraint selected
                 && selected != SpeakerCountConstraint.Auto;
         };
+        count.GotFocus += (_, _) => countWasManuallyEdited = true;
 
         var knownProfiles = _settingsService.LoadSpeakerProfiles().Select(p => p.Name).ToList();
         var savedPeople = new ListView
@@ -1753,6 +1760,35 @@ public sealed partial class MainPage : Page
             TextWrapping = TextWrapping.Wrap,
             MinHeight = 80,
         };
+
+        void ProposeExactCountFromParticipants()
+        {
+            if (countWasManuallyEdited) return;
+
+            var selectedNames = savedPeople.SelectedItems.Cast<string>()
+                .Concat(newPeople.Text.Split([',', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (selectedNames.Count == 0) return;
+
+            synchronizingSuggestedCount = true;
+            try
+            {
+                constraint.SelectedItem = constraint.Items
+                    .OfType<ComboBoxItem>()
+                    .First(item => item.Tag is SpeakerCountConstraint.Exact);
+                count.Value = selectedNames.Count;
+                count.IsEnabled = true;
+            }
+            finally
+            {
+                synchronizingSuggestedCount = false;
+            }
+        }
+
+        savedPeople.SelectionChanged += (_, _) => ProposeExactCountFromParticipants();
+        newPeople.TextChanged += (_, _) => ProposeExactCountFromParticipants();
 
         var content = new StackPanel { Spacing = 10 };
         content.Children.Add(new TextBlock
@@ -1772,7 +1808,7 @@ public sealed partial class MainPage : Page
         content.Children.Add(newPeople);
         content.Children.Add(new TextBlock
         {
-            Text = "Participants are saved with this session and remembered locally. They are not assigned to anonymous voice labels automatically; review the detected labels after transcription.",
+            Text = "Selected participants prefill an exact speaker count. After transcription, choose their names from each detected speaker label; a new name can be entered there as well.",
             FontSize = 12,
             TextWrapping = TextWrapping.Wrap,
             Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
@@ -1944,6 +1980,45 @@ public sealed partial class MainPage : Page
 
         _speakerNameMap[speakerId] = newName;
         SetUnsavedChanges(true);
+        _ = PersistSpeakerNamesAsync();
+    }
+
+    private IReadOnlyList<string> GetSpeakerNameSuggestions()
+        => _expectedSpeakerNames
+            .Concat(_settingsService.LoadSpeakerProfiles().Select(profile => profile.Name))
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+
+    private async Task PersistSpeakerNamesAsync()
+    {
+        if (_currentSessionId is not { } sessionId || _speakerNameMap.Count == 0) return;
+
+        try
+        {
+            var session = await _sessionStore.GetAsync(sessionId);
+            if (session is null) return;
+
+            session.SpeakerNamesJson = System.Text.Json.JsonSerializer.Serialize(_speakerNameMap);
+            await _sessionStore.UpdateAsync(session);
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogWarning($"Could not persist speaker names: {ex.Message}");
+        }
+    }
+
+    private void CommitSpeakerName(TextBox textBox, SpeakerViewModel speaker)
+    {
+        var newName = textBox.Text.Trim();
+        if (string.IsNullOrEmpty(newName))
+        {
+            textBox.Text = speaker.Name;
+            return;
+        }
+
+        RenameSpeaker(speaker.Id, newName);
     }
 
     private void OnSpeakerNameLostFocus(object sender, RoutedEventArgs e)
@@ -1954,14 +2029,14 @@ public sealed partial class MainPage : Page
         // except this explicit commit.
         if (sender is TextBox textBox && textBox.Tag is SpeakerViewModel speaker)
         {
-            var newName = textBox.Text.Trim();
-            if (string.IsNullOrEmpty(newName))
+            try
             {
-                textBox.Text = speaker.Name;
-                return;
+                CommitSpeakerName(textBox, speaker);
             }
-
-            RenameSpeaker(speaker.Id, newName);
+            catch (Exception ex)
+            {
+                AudioRecorder.Services.Logging.AppLogger.LogError($"Speaker name commit failed: {ex.Message}");
+            }
         }
     }
 
@@ -1969,10 +2044,28 @@ public sealed partial class MainPage : Page
     {
         if (e.Key == Windows.System.VirtualKey.Enter && sender is TextBox textBox)
         {
-            // Move focus off the TextBox to trigger the LostFocus commit above.
-            Microsoft.UI.Xaml.Input.FocusManager.TryMoveFocus(Microsoft.UI.Xaml.Input.FocusNavigationDirection.Next);
+            // FocusManager.TryMoveFocus without a loaded SearchRoot crashes WinUI Desktop with
+            // COMException 0x8000FFFF. Commit directly and leave focus in the editor instead.
+            if (textBox.Tag is SpeakerViewModel speaker)
+            {
+                try
+                {
+                    CommitSpeakerName(textBox, speaker);
+                    textBox.Select(textBox.Text.Length, 0);
+                }
+                catch (Exception ex)
+                {
+                    AudioRecorder.Services.Logging.AppLogger.LogError($"Speaker name Enter commit failed: {ex.Message}");
+                }
+            }
             e.Handled = true;
         }
+    }
+
+    private async void OnChooseSpeakerNameClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: SpeakerViewModel speaker })
+            await ShowRenameSpeakerDialogAsync(speaker.Id, speaker.Name);
     }
 
     private async void OnSpeakerSampleClicked(object sender, RoutedEventArgs e)
@@ -2021,40 +2114,57 @@ public sealed partial class MainPage : Page
 
         if (segment == null) return;
 
-        var speakerId = segment.SpeakerId;
-        var currentName = segment.SpeakerName;
+        await ShowRenameSpeakerDialogAsync(segment.SpeakerId, segment.SpeakerName);
+    }
+
+    private async Task ShowRenameSpeakerDialogAsync(string speakerId, string currentName)
+    {
+        var suggestions = GetSpeakerNameSuggestions();
+        var selectedName = new ComboBox
+        {
+            ItemsSource = suggestions,
+            PlaceholderText = "Choose a participant",
+            Visibility = suggestions.Count > 0 ? Visibility.Visible : Visibility.Collapsed,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+        var currentSuggestion = suggestions.FirstOrDefault(name =>
+            string.Equals(name, currentName, StringComparison.OrdinalIgnoreCase));
+        if (currentSuggestion is not null) selectedName.SelectedItem = currentSuggestion;
 
         var inputBox = new TextBox
         {
-            Text = currentName,
-            PlaceholderText = "Enter speaker name",
-            SelectionStart = 0,
-            SelectionLength = currentName.Length
+            PlaceholderText = "Or enter a new name",
         };
+
+        var content = new StackPanel { Spacing = 8 };
+        content.Children.Add(new TextBlock { Text = $"Detected label: {speakerId}" });
+        if (suggestions.Count > 0)
+        {
+            content.Children.Add(new TextBlock { Text = "Meeting participant" });
+            content.Children.Add(selectedName);
+        }
+        content.Children.Add(new TextBlock { Text = "New name" });
+        content.Children.Add(inputBox);
 
         var dialog = new ContentDialog
         {
             Title = "Rename speaker",
-            Content = new StackPanel
-            {
-                Spacing = 8,
-                Children =
-                {
-                    new TextBlock { Text = $"Original ID: {speakerId}" },
-                    inputBox
-                }
-            },
+            Content = content,
             PrimaryButtonText = "Rename",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = Content.XamlRoot
+            XamlRoot = XamlRoot
         };
 
         var result = await dialog.ShowAsync();
 
-        if (result == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(inputBox.Text))
+        if (result == ContentDialogResult.Primary)
         {
-            RenameSpeaker(speakerId, inputBox.Text);
+            var newName = !string.IsNullOrWhiteSpace(inputBox.Text)
+                ? inputBox.Text
+                : selectedName.SelectedItem as string;
+            if (!string.IsNullOrWhiteSpace(newName))
+                RenameSpeaker(speakerId, newName);
         }
     }
 
@@ -2824,6 +2934,25 @@ public sealed partial class MainPage : Page
         {
             if (session.TranscriptPath == null || !File.Exists(session.TranscriptPath))
                 return;
+
+            _expectedSpeakerNames = [];
+            if (!string.IsNullOrEmpty(session.ExpectedSpeakersJson))
+            {
+                try
+                {
+                    _expectedSpeakerNames = System.Text.Json.JsonSerializer
+                        .Deserialize<List<string>>(session.ExpectedSpeakersJson)?
+                        .Where(name => !string.IsNullOrWhiteSpace(name))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList()
+                        ?? [];
+                }
+                catch (Exception ex)
+                {
+                    AudioRecorder.Services.Logging.AppLogger.LogWarning(
+                        $"Could not restore meeting participants: {ex.Message}");
+                }
+            }
 
             // Restore speaker names if available
             Dictionary<string, string> speakerMap = new();
