@@ -5,6 +5,16 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] - 2026-07-17
+
+### Fixed
+- **Community-1 GPU diarization**: the isolated pyannote runtime now installs the CUDA PyTorch build for NVIDIA GPUs and verifies CUDA before use. Community-1 receives Contora's persistent Hugging Face token and loads WAV audio in memory, avoiding the incompatible Windows TorchCodec/FFmpeg path.
+- **Reliable diarization startup**: the Community-1 model is preloaded before transcription rather than stalling at the final "Detecting speakers" stage.
+- **Speaker-name editing crash**: pressing Enter no longer calls the unsupported WinUI Desktop focus API that terminated Contora with `0x8000FFFF`.
+
+### Changed
+- **Meeting participants are actionable**: selecting participants pre-fills an exact speaker count; after transcription, each detected speaker offers those participants for selection as well as a free-form name. Renames are persisted with the session and restored when reopening it.
+
 ## [0.6.1] - 2026-07-17
 
 ### Added

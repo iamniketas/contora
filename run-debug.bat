@@ -1,12 +1,15 @@
 @echo off
+setlocal
 cd /d "%~dp0"
 
-set EXE=src\AudioRecorder.App\bin\x64\Debug\net8.0-windows10.0.19041.0\win-x64\Contora.exe
+rem Always rebuild the active worktree so this launcher never starts stale binaries.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0build-and-run.ps1" Debug
+set EXIT_CODE=%ERRORLEVEL%
 
-if not exist "%EXE%" (
-    echo [build] Debug binary not found, building...
-    dotnet build src\AudioRecorder.App\AudioRecorder.csproj -c Debug -p:Platform=x64 -v quiet
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo Debug build failed. See the output above.
+    pause
 )
 
-echo [launch] %~dp0%EXE%
-start "" "%~dp0%EXE%"
+endlocal & exit /b %EXIT_CODE%
