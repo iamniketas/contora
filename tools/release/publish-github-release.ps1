@@ -91,7 +91,18 @@ function Invoke-External {
         [switch]$Dry
     )
 
+    $redactNextArgument = $false
     $display = ($Command | ForEach-Object {
+        if ($redactNextArgument) {
+            $redactNextArgument = $false
+            return "***"
+        }
+
+        if ($_ -eq "--token") {
+            $redactNextArgument = $true
+            return $_
+        }
+
         if ($_ -match "\s") { '"' + $_ + '"' } else { $_ }
     }) -join " "
 
