@@ -114,6 +114,13 @@ public sealed class PyannoteCommunityServerBackend : IDisposable
         psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
         psi.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";
         psi.EnvironmentVariables["TQDM_DISABLE"] = "1";
+        var hfToken = Environment.GetEnvironmentVariable("HF_TOKEN")
+            ?? Environment.GetEnvironmentVariable("HF_TOKEN", EnvironmentVariableTarget.User);
+        if (!string.IsNullOrWhiteSpace(hfToken))
+        {
+            psi.EnvironmentVariables["HF_TOKEN"] = hfToken;
+            psi.EnvironmentVariables["HUGGINGFACE_HUB_TOKEN"] = hfToken;
+        }
 
         _serverProcess = Process.Start(psi);
         if (_serverProcess is null) return false;

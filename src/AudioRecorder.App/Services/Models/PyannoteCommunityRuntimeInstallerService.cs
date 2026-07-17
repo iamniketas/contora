@@ -9,6 +9,10 @@ namespace AudioRecorder.Services.Models;
 /// </summary>
 public sealed class PyannoteCommunityRuntimeInstallerService
 {
+    // CUDA wheels are published separately from the CPU packages on PyPI. Keep this explicit:
+    // otherwise pip resolves torch to the CPU build and Community-1 silently runs on the CPU.
+    private const string CudaTorchVersion = "2.11.0+cu128";
+    private const string CudaTorchIndexUrl = "https://download.pytorch.org/whl/cu128";
     private readonly string _runtimeRoot = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Contora", "runtimes", "pyannote-community");
@@ -20,7 +24,12 @@ public sealed class PyannoteCommunityRuntimeInstallerService
     public async Task<(bool Success, string? Error)> EnsureInstalledAsync(
         string? bootstrapPython, Action<string>? onStatus, CancellationToken ct)
     {
-        if (IsInstalled() && await CanImportPyannoteAsync(ct)) return (true, null);
+        // Importing pyannote alone is not sufficient: Community-1 is fetched
+        // lazily and can still be absent or inaccessible on first diarization.
+        if (IsInstalled()
+            && await IsCudaTorchAvailableAsync(ct)
+            && await CanLoadCommunityModelAsync(ct))
+            return (true, null);
         if (string.IsNullOrWhiteSpace(bootstrapPython) || !File.Exists(bootstrapPython))
             return (false, "Community-1 requires the Dictator Python runtime. Install Dictator's Python/NeMo runtime first.");
 
@@ -39,11 +48,25 @@ public sealed class PyannoteCommunityRuntimeInstallerService
                 ["-m", "pip", "install", "--upgrade", "pyannote.audio>=4,<5", "flask>=3,<4"], ct, TimeSpan.FromMinutes(20));
             if (!install.Success) return (false, install.Error);
 
-            // The model is cached by huggingface_hub. This also catches gated/offline access now,
-            // before transcription begins and gives the UI a useful installation error.
+            if (!await IsCudaTorchAvailableAsync(ct))
+            {
+                onStatus?.Invoke("Installing CUDA PyTorch for Community-1 (first run only)...");
+                var cudaInstall = await RunAsync(GetPythonPath(),
+                    ["-m", "pip", "install", "--upgrade", "--force-reinstall", "--no-cache-dir",
+                        $"torch=={CudaTorchVersion}", "--index-url", CudaTorchIndexUrl],
+                    ct, TimeSpan.FromMinutes(30));
+                if (!cudaInstall.Success) return (false, cudaInstall.Error);
+
+                if (!await IsCudaTorchAvailableAsync(ct))
+                    return (false, "CUDA PyTorch was installed, but Contora cannot access an NVIDIA GPU. Update the NVIDIA driver and restart Contora.");
+            }
+
+            // Download the complete gated snapshot now. Pipeline.from_pretrained
+            // only fetches its manifest eagerly, leaving model weights to be
+            // downloaded during the "Detecting speakers" phase otherwise.
             onStatus?.Invoke("Downloading the Community-1 diarization model...");
             var preload = await RunAsync(GetPythonPath(),
-                ["-c", "from pyannote.audio import Pipeline; Pipeline.from_pretrained('pyannote/speaker-diarization-community-1')"],
+                ["-c", "import os; from huggingface_hub import snapshot_download; from pyannote.audio import Pipeline; token=os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_HUB_TOKEN'); path=snapshot_download('pyannote/speaker-diarization-community-1', token=token); Pipeline.from_pretrained(path, token=token)"],
                 ct, TimeSpan.FromMinutes(20));
             return preload.Success ? (true, null) : (false, preload.Error);
         }
@@ -51,8 +74,15 @@ public sealed class PyannoteCommunityRuntimeInstallerService
         catch (Exception ex) { return (false, ex.Message); }
     }
 
-    private async Task<bool> CanImportPyannoteAsync(CancellationToken ct)
-        => (await RunAsync(GetPythonPath(), ["-c", "import pyannote.audio"], ct, TimeSpan.FromSeconds(30))).Success;
+    private async Task<bool> CanLoadCommunityModelAsync(CancellationToken ct)
+        => (await RunAsync(GetPythonPath(),
+            ["-c", "import os; from huggingface_hub import snapshot_download; from pyannote.audio import Pipeline; token=os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_HUB_TOKEN'); path=snapshot_download('pyannote/speaker-diarization-community-1', local_files_only=True); Pipeline.from_pretrained(path, token=token)"],
+            ct, TimeSpan.FromMinutes(5))).Success;
+
+    private async Task<bool> IsCudaTorchAvailableAsync(CancellationToken ct)
+        => (await RunAsync(GetPythonPath(),
+            ["-c", "import sys, torch; sys.exit(0 if torch.version.cuda and torch.cuda.is_available() else 1)"],
+            ct, TimeSpan.FromMinutes(1))).Success;
 
     private static async Task<(bool Success, string? Error)> RunAsync(
         string fileName, IReadOnlyList<string> arguments, CancellationToken ct, TimeSpan? timeout = null)
@@ -65,6 +95,7 @@ public sealed class PyannoteCommunityRuntimeInstallerService
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
+        ConfigureHuggingFaceToken(psi);
         foreach (var argument in arguments) psi.ArgumentList.Add(argument);
         using var process = Process.Start(psi);
         if (process is null) return (false, "Could not start Python.");
@@ -87,5 +118,18 @@ public sealed class PyannoteCommunityRuntimeInstallerService
             if (ct.IsCancellationRequested) throw;
             return (false, "Timed out while installing the pyannote runtime.");
         }
+    }
+
+    private static void ConfigureHuggingFaceToken(ProcessStartInfo psi)
+    {
+        // Read the persistent user variable as well as the current process.
+        // Explorer-launched applications can otherwise miss a token added with
+        // setx until the next sign-in.
+        var token = Environment.GetEnvironmentVariable("HF_TOKEN")
+            ?? Environment.GetEnvironmentVariable("HF_TOKEN", EnvironmentVariableTarget.User);
+        if (string.IsNullOrWhiteSpace(token)) return;
+
+        psi.Environment["HF_TOKEN"] = token;
+        psi.Environment["HUGGINGFACE_HUB_TOKEN"] = token;
     }
 }

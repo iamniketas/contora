@@ -14,12 +14,24 @@ def load_pipeline():
     global pipeline
     from pyannote.audio import Pipeline
 
-    pipeline = Pipeline.from_pretrained(MODEL)
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    pipeline = Pipeline.from_pretrained(MODEL, token=token)
     requested_device = os.getenv("CONTORA_PYANNOTE_DEVICE", "auto")
     if requested_device != "cpu":
         import torch
         if torch.cuda.is_available():
             pipeline.to(torch.device("cuda"))
+
+
+def load_audio_waveform(path):
+    """Load Contora's WAV into memory and avoid torchcodec/FFmpeg entirely."""
+    import soundfile as sf
+    import torch
+
+    samples, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    # soundfile yields [frames, channels]; pyannote expects [channels, frames].
+    waveform = torch.from_numpy(samples.T.copy())
+    return {"waveform": waveform, "sample_rate": sample_rate}
 
 
 @app.route("/health", methods=["GET"])
@@ -50,7 +62,11 @@ def diarize():
             elif constraint == "maximum":
                 kwargs["max_speakers"] = count
 
-        output = pipeline(path, **kwargs)
+        # Passing a file path makes pyannote.audio 4 delegate decoding to
+        # torchcodec, which on Windows requires a separately compatible FFmpeg
+        # DLL build. Contora sends WAV, so an in-memory waveform is reliable and
+        # avoids that optional native dependency completely.
+        output = pipeline(load_audio_waveform(path), **kwargs)
         annotation = getattr(output, "exclusive_speaker_diarization", None)
         if annotation is None:
             annotation = output.speaker_diarization
