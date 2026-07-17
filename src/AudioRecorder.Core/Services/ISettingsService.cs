@@ -33,6 +33,9 @@ public interface ISettingsService
 
     string LoadTranscriptionEngine();
 
+    IReadOnlyList<AudioRecorder.Core.Models.SpeakerProfile> LoadSpeakerProfiles();
+    void SaveSpeakerProfiles(IEnumerable<AudioRecorder.Core.Models.SpeakerProfile> profiles);
+
     // ── Outline integration ──────────────────────────────────────────────────
 
     void SaveOutlineBaseUrl(string url);

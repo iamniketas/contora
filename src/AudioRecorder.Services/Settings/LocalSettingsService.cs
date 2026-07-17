@@ -258,6 +258,44 @@ public class LocalSettingsService : ISettingsService
         }
     }
 
+    public IReadOnlyList<AudioRecorder.Core.Models.SpeakerProfile> LoadSpeakerProfiles()
+    {
+        try
+        {
+            return LoadSettings().SpeakerProfiles
+                .Where(p => !string.IsNullOrWhiteSpace(p.Name))
+                .GroupBy(p => p.Name.Trim(), StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First() with { Name = g.Key })
+                .OrderBy(p => p.Name, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Failed to load speaker profiles: {ex.Message}");
+            return [];
+        }
+    }
+
+    public void SaveSpeakerProfiles(IEnumerable<AudioRecorder.Core.Models.SpeakerProfile> profiles)
+    {
+        try
+        {
+            var settings = LoadSettings();
+            settings.SpeakerProfiles = profiles
+                .Where(p => !string.IsNullOrWhiteSpace(p.Name))
+                .Select(p => p with { Name = p.Name.Trim() })
+                .GroupBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .OrderBy(p => p.Name, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+            SaveSettings(settings);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Failed to save speaker profiles: {ex.Message}");
+        }
+    }
+
     public void SaveOutlineBaseUrl(string url)
     {
         var settings = LoadSettings();
@@ -319,6 +357,7 @@ public class LocalSettingsService : ISettingsService
         public string DeviceMode { get; set; } = "auto";
         public string? InstallRootPath { get; set; }
         public string TranscriptionEngine { get; set; } = "whisper-net";
+        public List<AudioRecorder.Core.Models.SpeakerProfile> SpeakerProfiles { get; set; } = [];
         public string? OutlineBaseUrl { get; set; }
         public string? OutlineApiToken { get; set; }
         public string? OutlineDefaultCollectionId { get; set; }

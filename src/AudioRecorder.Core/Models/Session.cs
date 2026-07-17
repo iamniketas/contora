@@ -21,6 +21,10 @@ public sealed class Session
     /// <summary>JSON-encoded dictionary of speaker id → display name.</summary>
     public string? SpeakerNamesJson { get; set; }
 
+    public string? ExpectedSpeakersJson { get; set; }
+
+    public string? DiarizationOptionsJson { get; set; }
+
     /// <summary>Outline document id set after export.</summary>
     public string? OutlineDocumentId { get; set; }
 

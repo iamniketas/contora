@@ -214,6 +214,7 @@ public sealed partial class MainPage : Page
     private readonly WhisperRuntimeInstallerService _runtimeInstallerService;
     private WhisperModelDownloadService _modelDownloadService;
     private readonly FfmpegInstallerService _ffmpegInstallerService;
+    private readonly PyannoteCommunityRuntimeInstallerService _pyannoteRuntimeInstallerService;
     private readonly SharedModelConfigService _sharedConfigService;
     private readonly DictatorSharedStoreService _dictatorStoreService;
     private readonly DispatcherQueue _dispatcherQueue;
@@ -244,6 +245,8 @@ public sealed partial class MainPage : Page
     private TimeSpan? _lastTranscriptionAudioDuration; // last known audio duration from progress events
     private string? _pendingAudioPath;
     private readonly Dictionary<string, string> _speakerNameMap = new();
+    private DiarizationOptions _diarizationOptions = DiarizationOptions.Automatic;
+    private IReadOnlyList<string> _expectedSpeakerNames = [];
 
     public ObservableCollection<AudioSourceViewModel> OutputSources { get; } = new();
     public ObservableCollection<AudioSourceViewModel> InputSources { get; } = new();
@@ -278,6 +281,7 @@ public sealed partial class MainPage : Page
         // diarization backend via _dictatorStoreService, so it has to be constructed first.
         _sharedConfigService = new SharedModelConfigService();
         _dictatorStoreService = new DictatorSharedStoreService();
+        _pyannoteRuntimeInstallerService = new PyannoteCommunityRuntimeInstallerService();
         _ = _dictatorStoreService.LoadStoreAsync(); // warm up async, non-blocking
 
         _transcriptionService = CreateTranscriptionService(_transcriptionMode);
@@ -353,8 +357,8 @@ public sealed partial class MainPage : Page
     /// <summary>
     /// Swaps in a freshly-built transcription service, disposing the outgoing one first.
     /// Without this, every model/mode switch orphaned the previous WhisperNet factory and — for
-    /// whisper-net with diarization — its Sortformer python server process (fixed port 5002),
-    /// leaking a GPU-resident process per switch for the lifetime of the app.
+    /// whisper-net with diarization — dispose the Community-1 Python server before replacing the
+    /// service so a GPU-resident process never leaks across model or mode changes.
     /// </summary>
     private void ReplaceTranscriptionService(string mode)
     {
@@ -388,19 +392,19 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
-    /// Sortformer (NeMo, до 4 спикеров) точнее автоопределения числа спикеров у sherpa-onnx
-    /// (эмпирически: 4 вместо 3 реальных на тестовой записи против 14 у sherpa-onnx с порогом
-    /// по умолчанию), поэтому используется как основной бэкенд, когда доступен python-asr venv
-    /// Dictator. Если venv не установлен — фолбэк на sherpa-onnx (полностью in-process, без Python).
+    /// Community-1 is the default because it has no four-speaker architectural cap and accepts
+    /// exact/minimum/maximum participant counts. sherpa-onnx remains a local ONNX fallback when
+    /// the managed Python runtime cannot be used.
     /// </summary>
     private IDiarizationService CreateDiarizationService()
     {
-        var pythonExe = _dictatorStoreService?.GetPythonVenvPath();
-        var sortformerScript = DiarizationServerBackend.FindScript();
+        var pythonExe = _pyannoteRuntimeInstallerService.GetPythonPath();
+        var pyannoteScript = PyannoteCommunityServerBackend.FindScript();
 
-        if (pythonExe is not null && sortformerScript is not null)
+        if (_pyannoteRuntimeInstallerService.IsInstalled() && pyannoteScript is not null)
         {
-            return new SortformerDiarizationService(pythonExe, sortformerScript);
+            return new PyannoteCommunityDiarizationService(
+                pythonExe, pyannoteScript, _diarizationOptions, ResolveEffectiveDevice());
         }
 
         var diarizationRoot = DiarizationModelPaths.GetDiarizationModelsRoot();
@@ -1521,6 +1525,31 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        if (_settingsService.LoadTranscriptionEngine() == "whisper-net"
+            && !string.Equals(_transcriptionMode, "light", StringComparison.OrdinalIgnoreCase))
+        {
+            var setup = await ShowDiarizationSetupDialogAsync();
+            if (setup is null) return;
+
+            TranscribeButton.IsEnabled = false;
+            TranscribeButton.Content = "Preparing diarization...";
+            var pyannoteRuntime = await _pyannoteRuntimeInstallerService.EnsureInstalledAsync(
+                _dictatorStoreService.GetPythonVenvPath(),
+                status => TranscribeButton.Content = status,
+                CancellationToken.None);
+            TranscribeButton.IsEnabled = true;
+            TranscribeButton.Content = "Transcribe";
+            if (!pyannoteRuntime.Success)
+            {
+                await ShowErrorDialogAsync($"Could not prepare Community-1 diarization:\n{pyannoteRuntime.Error}");
+                return;
+            }
+
+            _diarizationOptions = setup.Options;
+            _expectedSpeakerNames = setup.ParticipantNames;
+            ReplaceTranscriptionService(_transcriptionMode);
+        }
+
         // For imported files there is no prior session — create one now before transcription starts.
         // (Recordings create their session on stop, so _currentSessionId is already set in that case.)
         if (_currentSessionId == null)
@@ -1529,6 +1558,7 @@ public sealed partial class MainPage : Page
         // Capture current values so a new recording started in parallel doesn't overwrite them
         var audioPath = _lastRecordingPath;
         var transcriptionSessionId = _currentSessionId;
+        await SaveDiarizationSetupAsync(transcriptionSessionId, _diarizationOptions, _expectedSpeakerNames);
 
         _isTranscribing = true;
         TranscribeButton.Content = "Stop transcription";
@@ -1678,6 +1708,133 @@ public sealed partial class MainPage : Page
                 _pendingAudioPath = null;
                 ShowTranscriptionSection();
             }
+        }
+    }
+
+    private sealed record DiarizationSetup(DiarizationOptions Options, IReadOnlyList<string> ParticipantNames);
+
+    private async Task<DiarizationSetup?> ShowDiarizationSetupDialogAsync()
+    {
+        var constraint = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
+        constraint.Items.Add(new ComboBoxItem { Content = "Detect automatically", Tag = SpeakerCountConstraint.Auto });
+        constraint.Items.Add(new ComboBoxItem { Content = "Exact number", Tag = SpeakerCountConstraint.Exact });
+        constraint.Items.Add(new ComboBoxItem { Content = "At least", Tag = SpeakerCountConstraint.Minimum });
+        constraint.Items.Add(new ComboBoxItem { Content = "At most", Tag = SpeakerCountConstraint.Maximum });
+        constraint.SelectedIndex = 0;
+
+        var count = new NumberBox
+        {
+            Minimum = 1,
+            Maximum = 50,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact,
+            Value = 6,
+            IsEnabled = false,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Width = 140,
+        };
+        constraint.SelectionChanged += (_, _) =>
+        {
+            count.IsEnabled = (constraint.SelectedItem as ComboBoxItem)?.Tag is SpeakerCountConstraint selected
+                && selected != SpeakerCountConstraint.Auto;
+        };
+
+        var knownProfiles = _settingsService.LoadSpeakerProfiles().Select(p => p.Name).ToList();
+        var savedPeople = new ListView
+        {
+            ItemsSource = knownProfiles,
+            SelectionMode = ListViewSelectionMode.Multiple,
+            MaxHeight = 130,
+            Visibility = knownProfiles.Count > 0 ? Visibility.Visible : Visibility.Collapsed,
+        };
+        var newPeople = new TextBox
+        {
+            PlaceholderText = "Add names, one per line or separated by commas",
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            MinHeight = 80,
+        };
+
+        var content = new StackPanel { Spacing = 10 };
+        content.Children.Add(new TextBlock
+        {
+            Text = "Speaker count helps Community-1 separate large meetings. Leave automatic when the meeting size is unknown.",
+            TextWrapping = TextWrapping.Wrap,
+        });
+        content.Children.Add(new TextBlock { Text = "Number of speakers", FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+        content.Children.Add(constraint);
+        content.Children.Add(count);
+        if (knownProfiles.Count > 0)
+        {
+            content.Children.Add(new TextBlock { Text = "Saved participants (select everyone expected in this meeting)", FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+            content.Children.Add(savedPeople);
+        }
+        content.Children.Add(new TextBlock { Text = "Other participants", FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+        content.Children.Add(newPeople);
+        content.Children.Add(new TextBlock
+        {
+            Text = "Participants are saved with this session and remembered locally. They are not assigned to anonymous voice labels automatically; review the detected labels after transcription.",
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+        });
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Meeting speakers",
+            Content = content,
+            PrimaryButtonText = "Start transcription",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return null;
+
+        var selectedConstraint = (constraint.SelectedItem as ComboBoxItem)?.Tag is SpeakerCountConstraint value
+            ? value
+            : SpeakerCountConstraint.Auto;
+        var requestedCount = selectedConstraint == SpeakerCountConstraint.Auto
+            ? null
+            : (int?)Math.Round(count.Value);
+        if (selectedConstraint != SpeakerCountConstraint.Auto && requestedCount is not >= 1 and <= 50)
+        {
+            await ShowErrorDialogAsync("Enter a speaker count between 1 and 50.");
+            return null;
+        }
+
+        var names = savedPeople.SelectedItems.Cast<string>()
+            .Concat(newPeople.Text.Split([',', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (names.Count > 0)
+        {
+            var profiles = _settingsService.LoadSpeakerProfiles()
+                .Concat(names.Select(name => new SpeakerProfile(name)))
+                .GroupBy(profile => profile.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First());
+            _settingsService.SaveSpeakerProfiles(profiles);
+        }
+
+        return new DiarizationSetup(new DiarizationOptions(selectedConstraint, requestedCount).Normalize(), names);
+    }
+
+    private async Task SaveDiarizationSetupAsync(
+        Guid? sessionId, DiarizationOptions options, IReadOnlyList<string> participantNames)
+    {
+        if (sessionId is not { } id) return;
+        try
+        {
+            var session = await _sessionStore.GetAsync(id);
+            if (session is null) return;
+            session.DiarizationOptionsJson = System.Text.Json.JsonSerializer.Serialize(options);
+            session.ExpectedSpeakersJson = participantNames.Count == 0
+                ? null
+                : System.Text.Json.JsonSerializer.Serialize(participantNames);
+            await _sessionStore.UpdateAsync(session);
+        }
+        catch (Exception ex)
+        {
+            AudioRecorder.Services.Logging.AppLogger.LogWarning($"Could not save diarization setup: {ex.Message}");
         }
     }
 

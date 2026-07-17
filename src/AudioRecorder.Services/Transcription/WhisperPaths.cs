@@ -83,12 +83,50 @@ public static class WhisperPaths
         if (!string.IsNullOrWhiteSpace(explicitModelsRoot))
             return explicitModelsRoot;
 
-        var sharedRoot = GetSharedModelsRoot();
-        if (!string.IsNullOrWhiteSpace(sharedRoot))
-            return sharedRoot;
+        // Faster-Whisper models use CTranslate2 directories such as
+        // "faster-whisper-large-v2". They cannot live in Dictator's GGML
+        // AudioModels root, which contains flat ggml-*.bin files. Linking
+        // Contora to Dictator must therefore not redirect this runtime to
+        // AudioModels; the common Faster-Whisper location is maintained
+        // independently in SharedWhisperModels.
+        var fasterWhisperRoot = GetFasterWhisperModelsRoot();
+        if (!string.IsNullOrWhiteSpace(fasterWhisperRoot))
+            return fasterWhisperRoot;
 
         var rootDir = Path.GetDirectoryName(whisperPath) ?? AppContext.BaseDirectory;
         return Path.Combine(rootDir, "_models");
+    }
+
+    private static string GetFasterWhisperModelsRoot()
+    {
+        var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var defaultRoot = Path.Combine(appDataPath, "SharedWhisperModels");
+
+        // A user may select a custom root in Contora settings. Honor it only
+        // when it actually contains Faster-Whisper model directories. The
+        // same setting is also used by the GGML link to Dictator, so merely
+        // having an existing AudioModels directory is not sufficient.
+        var configPath = Path.Combine(defaultRoot, "config.json");
+        if (File.Exists(configPath))
+        {
+            try
+            {
+                var json = File.ReadAllText(configPath);
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("modelsRootPath", out var rootEl))
+                {
+                    var configuredRoot = rootEl.GetString();
+                    if (!string.IsNullOrWhiteSpace(configuredRoot) && HasFasterWhisperModelDir(configuredRoot))
+                        return configuredRoot;
+                }
+            }
+            catch { }
+        }
+
+        if (Directory.Exists(defaultRoot))
+            return defaultRoot;
+
+        return string.Empty;
     }
 
     public static string GetModelDirectory(string whisperPath, string modelName)
@@ -283,5 +321,18 @@ public static class WhisperPaths
         return RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
             ? "faster-whisper-xxl.exe"
             : "faster-whisper-xxl";
+    }
+
+    private static bool HasFasterWhisperModelDir(string root)
+    {
+        try
+        {
+            return Directory.EnumerateDirectories(root)
+                .Any(dir => Path.GetFileName(dir).StartsWith(ModelDirPrefix, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return false;
+        }
     }
 }

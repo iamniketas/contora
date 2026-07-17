@@ -89,6 +89,10 @@ public sealed class SqliteSessionStore : ISessionStore
         catch (SqliteException) { }
         try { await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN decisions_json TEXT;"); }
         catch (SqliteException) { }
+        try { await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN expected_speakers_json TEXT;"); }
+        catch (SqliteException) { }
+        try { await ExecAsync(conn, "ALTER TABLE sessions ADD COLUMN diarization_options_json TEXT;"); }
+        catch (SqliteException) { }
 
         // FTS5 virtual table for full-text search
         await ExecAsync(conn, """
@@ -138,11 +142,13 @@ public sealed class SqliteSessionStore : ISessionStore
             INSERT INTO sessions
                 (id, title, recorded_at, duration_sec, audio_path, transcript_path,
                  state, speaker_names, outline_doc_id, outline_doc_url, preview_text,
-                 summary_text, action_items_json, decisions_json, created_at)
+                  summary_text, action_items_json, decisions_json, expected_speakers_json,
+                  diarization_options_json, created_at)
             VALUES
                 ($id, $title, $recorded_at, $dur, $audio, $transcript,
                  $state, $speakers, $outline, $outline_url, $preview,
-                 $summary, $action_items, $decisions, $created);
+                  $summary, $action_items, $decisions, $expected_speakers, $diarization_options,
+                  $created);
             """;
         BindSession(cmd, session);
         await cmd.ExecuteNonQueryAsync();
@@ -172,7 +178,9 @@ public sealed class SqliteSessionStore : ISessionStore
                 preview_text     = $preview,
                 summary_text     = $summary,
                 action_items_json = $action_items,
-                decisions_json   = $decisions
+                decisions_json   = $decisions,
+                expected_speakers_json = $expected_speakers,
+                diarization_options_json = $diarization_options
             WHERE id = $id;
             """;
         BindSession(cmd, session);
@@ -331,6 +339,8 @@ public sealed class SqliteSessionStore : ISessionStore
         cmd.Parameters.AddWithValue("$summary", (object?)s.SummaryText ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$action_items", (object?)s.ActionItemsJson ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$decisions", (object?)s.DecisionsJson ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$expected_speakers", (object?)s.ExpectedSpeakersJson ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$diarization_options", (object?)s.DiarizationOptionsJson ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$created", s.CreatedAt.ToString("O"));
     }
 
@@ -344,6 +354,8 @@ public sealed class SqliteSessionStore : ISessionStore
         TranscriptPath = r.IsDBNull(r.GetOrdinal("transcript_path")) ? null : r.GetString(r.GetOrdinal("transcript_path")),
         State = Enum.TryParse<SessionState>(r.GetString(r.GetOrdinal("state")), out var st) ? st : SessionState.Recorded,
         SpeakerNamesJson = r.IsDBNull(r.GetOrdinal("speaker_names")) ? null : r.GetString(r.GetOrdinal("speaker_names")),
+        ExpectedSpeakersJson = SafeGetString(r, "expected_speakers_json"),
+        DiarizationOptionsJson = SafeGetString(r, "diarization_options_json"),
         OutlineDocumentId = r.IsDBNull(r.GetOrdinal("outline_doc_id")) ? null : r.GetString(r.GetOrdinal("outline_doc_id")),
         OutlineDocumentUrl = r.IsDBNull(r.GetOrdinal("outline_doc_url")) ? null : r.GetString(r.GetOrdinal("outline_doc_url")),
         PreviewText = r.IsDBNull(r.GetOrdinal("preview_text")) ? null : r.GetString(r.GetOrdinal("preview_text")),

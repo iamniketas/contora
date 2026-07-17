@@ -121,6 +121,8 @@ tools/*
 !tools/macos-release/
 !tools/macos-release/**
 !tools/sortformer-server/
+!tools/pyannote-community-server/
+!tools/pyannote-community-server/**
 **/__pycache__/
 **/*.pyc
 

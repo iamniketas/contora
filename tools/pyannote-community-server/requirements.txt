@@ -1,0 +1,4 @@
+# Installed into Contora's isolated pyannote-community runtime on first use.
+# Do not add this to Dictator's python-asr environment.
+pyannote.audio>=4,<5
+flask>=3,<4
