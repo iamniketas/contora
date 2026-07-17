@@ -5,6 +5,17 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-07-17
+
+### Added
+- **Pyannote Community diarization**: configurable community-server runtime and diarization options, including speaker profiles and session persistence.
+- **Speaker sample playback**: each speaker chip can play the longest available segment for quick identification.
+
+### Fixed
+- **Shared Faster-Whisper model storage**: Contora now keeps CTranslate2 models in `SharedWhisperModels` even when linked to Dictator's GGML `AudioModels` store; the two incompatible model formats no longer redirect each other to the wrong directory.
+- **Audio startup responsiveness**: Windows device-notification registration now runs off the UI thread, preventing a delayed or stuck audio driver from freezing the window on launch.
+- **Speaker rename input**: names commit on focus loss or Enter without resetting the text caret while typing, and changes propagate consistently to transcript segments.
+
 ## [0.6.0] - 2026-07-06
 
 ### Added
