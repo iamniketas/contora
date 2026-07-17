@@ -25,7 +25,8 @@ public class WasapiAudioCaptureService : IAudioCaptureService, IMMNotificationCl
     private readonly Stopwatch _stopwatch = new();
     private RecordingInfo _currentInfo;
     private volatile bool _isPaused;
-    private readonly MMDeviceEnumerator _deviceEnumerator;
+    private MMDeviceEnumerator? _deviceEnumerator;
+    private bool _disposed;
     private DateTime _lastDeviceEventTime = DateTime.MinValue;
 
     // Выходной формат: 48kHz, 16-bit, stereo (стандарт для качественного аудио)
@@ -37,8 +38,27 @@ public class WasapiAudioCaptureService : IAudioCaptureService, IMMNotificationCl
     public WasapiAudioCaptureService()
     {
         _currentInfo = new RecordingInfo(RecordingState.Stopped, TimeSpan.Zero, 0);
-        _deviceEnumerator = new MMDeviceEnumerator();
-        _deviceEnumerator.RegisterEndpointNotificationCallback(this);
+
+        // MMDeviceEnumerator construction + RegisterEndpointNotificationCallback are synchronous
+        // COM calls into the Windows audio subsystem. On some driver setups (virtual audio
+        // cables, Bluetooth devices stuck reconnecting) these can block for seconds, which used
+        // to freeze the whole UI thread on startup since this constructor runs during MainPage
+        // construction, before the window is even shown. Do it off the UI thread instead; the
+        // enumerator is only used for device-change notifications, not synchronously elsewhere.
+        Task.Run(() =>
+        {
+            var enumerator = new MMDeviceEnumerator();
+            enumerator.RegisterEndpointNotificationCallback(this);
+            lock (_lock)
+            {
+                if (_disposed)
+                {
+                    enumerator.Dispose();
+                    return;
+                }
+                _deviceEnumerator = enumerator;
+            }
+        });
     }
 
     // ── IMMNotificationClient — device change notifications ─────────────────
@@ -405,8 +425,16 @@ public class WasapiAudioCaptureService : IAudioCaptureService, IMMNotificationCl
     {
         _cts?.Cancel();
         Cleanup();
-        try { _deviceEnumerator.UnregisterEndpointNotificationCallback(this); } catch { }
-        _deviceEnumerator.Dispose();
+        lock (_lock)
+        {
+            _disposed = true;
+            if (_deviceEnumerator is not null)
+            {
+                try { _deviceEnumerator.UnregisterEndpointNotificationCallback(this); } catch { }
+                _deviceEnumerator.Dispose();
+                _deviceEnumerator = null;
+            }
+        }
         GC.SuppressFinalize(this);
     }
 }
