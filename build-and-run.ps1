@@ -13,7 +13,7 @@ $ProjectRoot = $PSScriptRoot
 Write-Host "Building Contora ($Configuration)..." -ForegroundColor Cyan
 
 # Build the solution (x64 — Whisper.net/sherpa-onnx native runtimes only ship x64 binaries)
-dotnet build "$ProjectRoot\Contora.sln" --configuration $Configuration -p:Platform=x64
+dotnet build "$ProjectRoot\src\AudioRecorder.App\AudioRecorder.csproj" --configuration $Configuration -p:Platform=x64
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red
