@@ -585,15 +585,28 @@
                                             <Border
                                                 Background="{ThemeResource AccentFillColorDefaultBrush}"
                                                 CornerRadius="4"
-                                                Padding="8,4">
-                                                <TextBox
-                                                    Text="{x:Bind Name, Mode=TwoWay}"
-                                                    Background="Transparent"
-                                                    BorderThickness="0"
-                                                    Foreground="White"
-                                                    FontSize="12"
-                                                    MinWidth="80"
-                                                    TextChanged="OnSpeakerNameChanged" />
+                                                Padding="4,4">
+                                                <StackPanel Orientation="Horizontal" Spacing="2">
+                                                    <Button
+                                                        Click="OnSpeakerSampleClicked"
+                                                        Tag="{x:Bind}"
+                                                        Padding="4"
+                                                        Background="Transparent"
+                                                        BorderThickness="0"
+                                                        ToolTipService.ToolTip="Play a sample from this speaker">
+                                                        <FontIcon Glyph="&#xE768;" FontSize="11" Foreground="White" />
+                                                    </Button>
+                                                    <TextBox
+                                                        Text="{x:Bind Name, Mode=OneWay}"
+                                                        Tag="{x:Bind}"
+                                                        Background="Transparent"
+                                                        BorderThickness="0"
+                                                        Foreground="White"
+                                                        FontSize="12"
+                                                        MinWidth="80"
+                                                        LostFocus="OnSpeakerNameLostFocus"
+                                                        KeyDown="OnSpeakerNameKeyDown" />
+                                                </StackPanel>
                                             </Border>
                                         </DataTemplate>
                                     </ItemsRepeater.ItemTemplate>

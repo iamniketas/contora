@@ -1927,17 +1927,67 @@ public sealed partial class MainPage : Page
         return sb.ToString();
     }
 
-    private void OnSpeakerNameChanged(object sender, TextChangedEventArgs e)
+    // Shared rename path used by both the top speaker bar and the per-segment rename dialog,
+    // so a rename from either UI updates the chip, every matching transcript segment, and the
+    // name map (used on save/export) identically.
+    private void RenameSpeaker(string speakerId, string newName)
     {
-        if (sender is TextBox textBox && textBox.DataContext is SpeakerViewModel speaker)
+        newName = newName.Trim();
+        if (string.IsNullOrEmpty(newName)) return;
+
+        var speakerVm = Speakers.FirstOrDefault(s => s.Id == speakerId);
+        if (speakerVm != null)
+            speakerVm.Name = newName;
+
+        foreach (var seg in TranscriptionSegments.Where(s => s.SpeakerId == speakerId))
+            seg.SpeakerName = newName;
+
+        _speakerNameMap[speakerId] = newName;
+        SetUnsavedChanges(true);
+    }
+
+    private void OnSpeakerNameLostFocus(object sender, RoutedEventArgs e)
+    {
+        // Commit on LostFocus (not TextChanged): writing the source property on every keystroke
+        // fed back into the bound TextBox.Text and reset the caret to position 0 on each key press,
+        // making it impossible to type a name. Text is now OneWay, so nothing else writes it back
+        // except this explicit commit.
+        if (sender is TextBox textBox && textBox.Tag is SpeakerViewModel speaker)
         {
-            var newName = textBox.Text; // use textBox.Text directly — binding updates on LostFocus, not on TextChanged
-            speaker.Name = newName;
-            foreach (var segment in TranscriptionSegments.Where(s => s.SpeakerId == speaker.Id))
-                segment.SpeakerName = newName;
-            _speakerNameMap[speaker.Id] = newName;
-            SetUnsavedChanges(true);
+            var newName = textBox.Text.Trim();
+            if (string.IsNullOrEmpty(newName))
+            {
+                textBox.Text = speaker.Name;
+                return;
+            }
+
+            RenameSpeaker(speaker.Id, newName);
         }
+    }
+
+    private void OnSpeakerNameKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs e)
+    {
+        if (e.Key == Windows.System.VirtualKey.Enter && sender is TextBox textBox)
+        {
+            // Move focus off the TextBox to trigger the LostFocus commit above.
+            Microsoft.UI.Xaml.Input.FocusManager.TryMoveFocus(Microsoft.UI.Xaml.Input.FocusNavigationDirection.Next);
+            e.Handled = true;
+        }
+    }
+
+    private async void OnSpeakerSampleClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.Tag is not SpeakerViewModel speaker) return;
+
+        // Pick the longest segment for this speaker so the sample is long enough to identify
+        // them by voice, instead of grabbing the first (possibly one-word) segment.
+        var sample = TranscriptionSegments
+            .Where(s => s.SpeakerId == speaker.Id)
+            .OrderByDescending(s => (s.End - s.Start).TotalSeconds)
+            .FirstOrDefault();
+
+        if (sample != null)
+            await PlaySegmentAsync(sample);
     }
 
     private void OnSegmentTextChanged(object sender, TextChangedEventArgs e)
@@ -2004,21 +2054,7 @@ public sealed partial class MainPage : Page
 
         if (result == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(inputBox.Text))
         {
-            var newName = inputBox.Text.Trim();
-
-            foreach (var seg in TranscriptionSegments.Where(s => s.SpeakerId == speakerId))
-            {
-                seg.SpeakerName = newName;
-            }
-
-            var speakerVm = Speakers.FirstOrDefault(s => s.Id == speakerId);
-            if (speakerVm != null)
-            {
-                speakerVm.Name = newName;
-            }
-
-            _speakerNameMap[speakerId] = newName;
-            SetUnsavedChanges(true);
+            RenameSpeaker(speakerId, inputBox.Text);
         }
     }
 
@@ -2026,30 +2062,35 @@ public sealed partial class MainPage : Page
     {
         if (sender is Button button && button.Tag is TranscriptionSegmentViewModel segment)
         {
-            if (_playingSegment == segment && _playbackService.State == PlaybackState.Playing)
+            await PlaySegmentAsync(segment);
+        }
+    }
+
+    private async Task PlaySegmentAsync(TranscriptionSegmentViewModel segment)
+    {
+        if (_playingSegment == segment && _playbackService.State == PlaybackState.Playing)
+        {
+            _playbackService.Stop();
+            _playingSegment = null;
+            return;
+        }
+
+        if (_lastRecordingPath != null && _playbackService.LoadedFilePath != _lastRecordingPath)
+        {
+            try
             {
-                _playbackService.Stop();
-                _playingSegment = null;
+                await _playbackService.LoadAsync(_lastRecordingPath);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Audio loading error: {ex.Message}");
+                await ShowErrorDialogAsync($"Failed to load audio: {ex.Message}");
                 return;
             }
-
-            if (_lastRecordingPath != null && _playbackService.LoadedFilePath != _lastRecordingPath)
-            {
-                try
-                {
-                    await _playbackService.LoadAsync(_lastRecordingPath);
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Audio loading error: {ex.Message}");
-                    await ShowErrorDialogAsync($"Failed to load audio: {ex.Message}");
-                    return;
-                }
-            }
-
-            _playbackService.PlaySegment(segment.Start, segment.End, loop: false);
-            _playingSegment = segment;
         }
+
+        _playbackService.PlaySegment(segment.Start, segment.End, loop: false);
+        _playingSegment = segment;
     }
 
     private void OnPlaybackStateChanged(object? sender, PlaybackState state)
