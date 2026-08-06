@@ -228,38 +228,124 @@ final class FasterWhisperRuntimeInstaller {
             }
             try fileManager.copyItem(at: source, to: destination)
         }
-        repairBundledPythonInstallNames(in: targetRoot)
+        try repairBundledPythonInstallNames(in: targetRoot)
         try makeWritable(targetRoot)
     }
 
-    private func repairBundledPythonInstallNames(in root: URL) {
+    func repairInstalledRuntimeIfNeeded() throws {
+        let root = SharedRuntimePaths.whisperRoot()
+        guard FileManager.default.isExecutableFile(atPath: SharedRuntimePaths.whisperBundledPython().path) else {
+            return
+        }
+        try repairBundledPythonInstallNames(in: root)
+        try validateBundledPythonCryptography(in: root)
+    }
+
+    private func repairBundledPythonInstallNames(in root: URL) throws {
         let version = "3.12"
         let frameworkRoot = root.appendingPathComponent("python/Python.framework/Versions/\(version)", isDirectory: true)
         let frameworkLib = frameworkRoot.appendingPathComponent("Python")
         let absoluteReference = "/Library/Frameworks/Python.framework/Versions/\(version)/Python"
-        let repairs: [(URL, String)] = [
-            (frameworkRoot.appendingPathComponent("bin/python\(version)"), "@executable_path/../Python"),
-            (frameworkRoot.appendingPathComponent("Resources/Python.app/Contents/MacOS/Python"), "@executable_path/../../../../Python")
+        let executableRepairs: [(URL, String, String)] = [
+            (frameworkRoot.appendingPathComponent("bin/python\(version)"), absoluteReference, "@executable_path/../Python"),
+            (frameworkRoot.appendingPathComponent("Resources/Python.app/Contents/MacOS/Python"), absoluteReference, "@executable_path/../../../../Python")
         ]
 
-        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/xcrun") else {
-            return
-        }
+        let frameworkLibraryDirectory = frameworkRoot.appendingPathComponent("lib", isDirectory: true)
+        let dynamicModules = frameworkLibraryDirectory
+            .appendingPathComponent("python\(version)/lib-dynload", isDirectory: true)
+        let absoluteSSL = "/Library/Frameworks/Python.framework/Versions/\(version)/lib/libssl.3.dylib"
+        let absoluteCrypto = "/Library/Frameworks/Python.framework/Versions/\(version)/lib/libcrypto.3.dylib"
+        let dependencyRepairs: [(URL, String, String)] = [
+            (
+                dynamicModules.appendingPathComponent("_ssl.cpython-312-darwin.so"),
+                absoluteSSL,
+                "@loader_path/../../libssl.3.dylib"
+            ),
+            (
+                dynamicModules.appendingPathComponent("_ssl.cpython-312-darwin.so"),
+                absoluteCrypto,
+                "@loader_path/../../libcrypto.3.dylib"
+            ),
+            (
+                dynamicModules.appendingPathComponent("_hashlib.cpython-312-darwin.so"),
+                absoluteCrypto,
+                "@loader_path/../../libcrypto.3.dylib"
+            ),
+            (
+                frameworkLibraryDirectory.appendingPathComponent("libssl.3.dylib"),
+                absoluteCrypto,
+                "@loader_path/libcrypto.3.dylib"
+            ),
+        ]
 
-        for (binary, relativeReference) in repairs where FileManager.default.isExecutableFile(atPath: binary.path) {
-            try? run(URL(fileURLWithPath: "/usr/bin/xcrun"), arguments: [
-                "install_name_tool",
-                "-change",
-                absoluteReference,
-                relativeReference,
-                binary.path
-            ])
-            try? adHocSign(binary)
+        for (binary, oldReference, relativeReference) in executableRepairs + dependencyRepairs {
+            try repairDependencyIfPresent(
+                in: binary,
+                oldReference: oldReference,
+                newReference: relativeReference
+            )
         }
+        try repairDylibIDIfPresent(
+            frameworkLibraryDirectory.appendingPathComponent("libssl.3.dylib"),
+            oldID: absoluteSSL,
+            newID: "@loader_path/libssl.3.dylib"
+        )
+        try repairDylibIDIfPresent(
+            frameworkLibraryDirectory.appendingPathComponent("libcrypto.3.dylib"),
+            oldID: absoluteCrypto,
+            newID: "@loader_path/libcrypto.3.dylib"
+        )
 
         if FileManager.default.fileExists(atPath: frameworkLib.path) {
-            try? adHocSign(frameworkLib)
+            try adHocSign(frameworkLib)
         }
+    }
+
+    private func repairDependencyIfPresent(
+        in binary: URL,
+        oldReference: String,
+        newReference: String
+    ) throws {
+        guard FileManager.default.fileExists(atPath: binary.path) else { return }
+        let dependencies = try runAndCapture(
+            URL(fileURLWithPath: "/usr/bin/otool"),
+            arguments: ["-L", binary.path]
+        )
+        guard dependencies.contains(oldReference) else { return }
+        try run(
+            URL(fileURLWithPath: "/usr/bin/install_name_tool"),
+            arguments: ["-change", oldReference, newReference, binary.path]
+        )
+        try adHocSign(binary)
+    }
+
+    private func repairDylibIDIfPresent(_ binary: URL, oldID: String, newID: String) throws {
+        guard FileManager.default.fileExists(atPath: binary.path) else { return }
+        let identifiers = try runAndCapture(
+            URL(fileURLWithPath: "/usr/bin/otool"),
+            arguments: ["-D", binary.path]
+        )
+        guard identifiers.contains(oldID) else { return }
+        try run(
+            URL(fileURLWithPath: "/usr/bin/install_name_tool"),
+            arguments: ["-id", newID, binary.path]
+        )
+        try adHocSign(binary)
+    }
+
+    private func validateBundledPythonCryptography(in root: URL) throws {
+        let frameworkRoot = root.appendingPathComponent("python/Python.framework/Versions/3.12", isDirectory: true)
+        let python = frameworkRoot.appendingPathComponent("bin/python3.12")
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONHOME"] = frameworkRoot.path
+        environment.removeValue(forKey: "PYTHONPATH")
+        environment["PYTHONNOUSERSITE"] = "1"
+        _ = try runAndCapture(
+            python,
+            arguments: ["-c", "import ssl, hashlib; print(ssl.OPENSSL_VERSION)"],
+            environment: environment
+        )
     }
 
     private func adHocSign(_ url: URL) throws {
@@ -405,10 +491,15 @@ final class FasterWhisperRuntimeInstaller {
         }
     }
 
-    private func runAndCapture(_ executableURL: URL, arguments: [String]) throws -> String {
+    private func runAndCapture(
+        _ executableURL: URL,
+        arguments: [String],
+        environment: [String: String]? = nil
+    ) throws -> String {
         let process = Process()
         process.executableURL = executableURL
         process.arguments = arguments
+        process.environment = environment
 
         let output = Pipe()
         let error = Pipe()

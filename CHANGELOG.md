@@ -5,6 +5,13 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.4] - 2026-08-06
+
+### macOS
+- **MLX startup on clean Macs**: repairs absolute OpenSSL paths left in the relocatable Python runtime, so MLX no longer depends on a separately installed `/Library/Frameworks/Python.framework`.
+- **Existing installations are repaired in place**: starting MLX fixes the already downloaded runtime and validates `ssl` and `hashlib`; users do not need to download the 483 MB Whisper runtime again.
+- **Runtime build validation**: release tooling now rewrites and signs the `_ssl`, `_hashlib`, `libssl`, and `libcrypto` dependencies and includes a clean-runtime relocation smoke test.
+
 ## [0.6.3] - 2026-08-06
 
 ### macOS

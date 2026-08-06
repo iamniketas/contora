@@ -112,6 +112,10 @@ final class SharedMLXServerToolkitService: @unchecked Sendable {
         guard status().isInstalled else {
             throw MLXRuntimeError.serverNotInstalled
         }
+        // Older Contora runtimes bundled Python's OpenSSL libraries but retained
+        // absolute /Library/Frameworks references. Repair existing installations
+        // before importing uvicorn or contacting Hugging Face over HTTPS.
+        try FasterWhisperRuntimeInstaller().repairInstalledRuntimeIfNeeded()
         if await isHealthy() {
             return "MLX server is ready"
         }

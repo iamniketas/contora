@@ -33,9 +33,13 @@ fi
 repair_bundled_python_install_names() {
   local framework_root="$RUNTIME_ROOT/python/Python.framework/Versions/$PYTHON_VERSION"
   local framework_lib="$framework_root/Python"
+  local framework_lib_dir="$framework_root/lib"
+  local dynload_dir="$framework_lib_dir/python$PYTHON_VERSION/lib-dynload"
   local python_bin="$framework_root/bin/python$PYTHON_VERSION"
   local python_app_bin="$framework_root/Resources/Python.app/Contents/MacOS/Python"
   local absolute_ref="/Library/Frameworks/Python.framework/Versions/$PYTHON_VERSION/Python"
+  local absolute_ssl="/Library/Frameworks/Python.framework/Versions/$PYTHON_VERSION/lib/libssl.3.dylib"
+  local absolute_crypto="/Library/Frameworks/Python.framework/Versions/$PYTHON_VERSION/lib/libcrypto.3.dylib"
 
   if ! command -v install_name_tool >/dev/null 2>&1; then
     return
@@ -54,6 +58,25 @@ repair_bundled_python_install_names() {
   if [[ -f "$framework_lib" ]]; then
     codesign --force --sign - "$framework_lib" >/dev/null 2>&1 || true
   fi
+
+  repair_dependency() {
+    local binary="$1"
+    local old_ref="$2"
+    local new_ref="$3"
+    if [[ -f "$binary" ]] && otool -L "$binary" | grep -Fq "$old_ref"; then
+      install_name_tool -change "$old_ref" "$new_ref" "$binary"
+      codesign --force --sign - "$binary" >/dev/null 2>&1 || true
+    fi
+  }
+
+  repair_dependency "$dynload_dir/_ssl.cpython-312-darwin.so" "$absolute_ssl" '@loader_path/../../libssl.3.dylib'
+  repair_dependency "$dynload_dir/_ssl.cpython-312-darwin.so" "$absolute_crypto" '@loader_path/../../libcrypto.3.dylib'
+  repair_dependency "$dynload_dir/_hashlib.cpython-312-darwin.so" "$absolute_crypto" '@loader_path/../../libcrypto.3.dylib'
+  repair_dependency "$framework_lib_dir/libssl.3.dylib" "$absolute_crypto" '@loader_path/libcrypto.3.dylib'
+  install_name_tool -id '@loader_path/libssl.3.dylib' "$framework_lib_dir/libssl.3.dylib"
+  install_name_tool -id '@loader_path/libcrypto.3.dylib' "$framework_lib_dir/libcrypto.3.dylib"
+  codesign --force --sign - "$framework_lib_dir/libssl.3.dylib" >/dev/null 2>&1 || true
+  codesign --force --sign - "$framework_lib_dir/libcrypto.3.dylib" >/dev/null 2>&1 || true
 }
 
 repair_bundled_python_install_names
