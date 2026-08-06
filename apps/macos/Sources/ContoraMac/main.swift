@@ -939,7 +939,13 @@ final class WhisperHTTPTranscriptionService {
 }
 
 final class MLXHTTPTranscriptionService {
-    func transcribe(samples16kMono: [Float], language: String, endpointURL: URL, modelID: String) async throws -> String {
+    func transcribe(
+        samples16kMono: [Float],
+        language: String,
+        endpointURL: URL,
+        modelID: String,
+        enableDiarization: Bool
+    ) async throws -> String {
         let wavData = WAVEncoder.makeWAVData(samples: samples16kMono, sampleRate: 16_000)
         let boundary = "Boundary-\(UUID().uuidString)"
         let audioSeconds = Double(samples16kMono.count) / 16_000.0
@@ -963,7 +969,7 @@ final class MLXHTTPTranscriptionService {
 
         body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
         body.append("Content-Disposition: form-data; name=\"diarize\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
-        body.append("true\(lineBreak)".data(using: .utf8)!)
+        body.append("\(enableDiarization ? "true" : "false")\(lineBreak)".data(using: .utf8)!)
 
         body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
         body.append("Content-Disposition: form-data; name=\"chunk_duration\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
@@ -1381,8 +1387,11 @@ final class AppModel: ObservableObject {
     @Published var transcriptionLanguage = "ru"
     @Published var transcriptionBackend: TranscriptionBackend = .fasterWhisperProcess
     @Published var transcriptionEndpoint = "http://127.0.0.1:5500/transcribe"
-    @Published var mlxTranscriptionEndpoint = "http://127.0.0.1:8000/v1/audio/transcriptions"
+    @Published var mlxTranscriptionEndpoint = "http://127.0.0.1:8010/v1/audio/transcriptions"
     @Published var mlxModelID = "mlx-community/whisper-large-v3-turbo-asr-fp16"
+    @Published var mlxDiarizationEnabled = false
+    @Published var mlxSetupStatus = "Not configured"
+    @Published var isSettingUpMLX = false
     @Published var fasterWhisperModelName = "large-v2"
     @Published var fasterWhisperDiarizationEnabled = true
     @Published var fasterWhisperDownloadStatus = "Not checked"
@@ -1489,10 +1498,21 @@ final class AppModel: ObservableObject {
 
     private func autoStartMLXServerIfNeeded() {
         guard transcriptionBackend == .mlxOpenAIHTTP,
-              let toolkit = sharedMLXToolkitService.discoverToolkit() else { return }
+              sharedMLXToolkitService.status().isInstalled else { return }
         let service = sharedMLXToolkitService
-        Task.detached(priority: .background) {
-            _ = try? service.runScript(at: toolkit.startScriptURL)
+        let modelID = mlxModelID
+        Task { [weak self] in
+            do {
+                let status = try await service.start(modelID: modelID)
+                await MainActor.run {
+                    self?.sharedMLXToolkitActionStatus = status
+                    self?.backendProbeStatus = "MLX: OK (/health)"
+                }
+            } catch {
+                await MainActor.run {
+                    self?.sharedMLXToolkitActionStatus = error.localizedDescription
+                }
+            }
         }
     }
 
@@ -1580,6 +1600,18 @@ final class AppModel: ObservableObject {
         isSettingUpLocalWhisper || isInstallingFasterWhisperRuntime || isDownloadingFasterWhisperModel
     }
 
+    var isMLXBusy: Bool {
+        isSettingUpMLX || isTranscriptionBusy
+    }
+
+    var sharedMLXToolkitServiceStatusInstalled: Bool {
+        sharedMLXToolkitService.status().isInstalled
+    }
+
+    var mlxPrimaryActionTitle: String {
+        sharedMLXToolkitService.status().isInstalled ? "Repair MLX" : "Set Up MLX"
+    }
+
     var localWhisperPrimaryActionTitle: String {
         let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
         let runtimeInstalled = fasterWhisperRuntimeInstaller.status().isInstalled
@@ -1625,6 +1657,11 @@ final class AppModel: ObservableObject {
         probeSharedBackend()
     }
 
+    func updateMLXDiarization(_ enabled: Bool) {
+        mlxDiarizationEnabled = enabled
+        saveSharedServerConfig()
+    }
+
     var captureScopeDescription: String {
         switch captureSourceMode {
         case .microphone:
@@ -1643,6 +1680,7 @@ final class AppModel: ObservableObject {
             transcriptionEndpoint = config.whisperTranscribeURL
             mlxTranscriptionEndpoint = config.mlxTranscribeURL
             mlxModelID = config.mlxModelID
+            mlxDiarizationEnabled = config.mlxDiarizationEnabled
             fasterWhisperModelName = WhisperModelOption.normalizedName(config.fasterWhisperModelName)
             fasterWhisperDiarizationEnabled = config.fasterWhisperDiarizationEnabled
             sharedServerConfigStatus = "Loaded (\(config.schemaVersion))"
@@ -1658,6 +1696,7 @@ final class AppModel: ObservableObject {
             whisperTranscribeURL: transcriptionEndpoint,
             mlxTranscribeURL: mlxTranscriptionEndpoint,
             mlxModelID: mlxModelID,
+            mlxDiarizationEnabled: mlxDiarizationEnabled,
             fasterWhisperModelName: fasterWhisperModelName,
             fasterWhisperDiarizationEnabled: fasterWhisperDiarizationEnabled,
             updatedAt: ISO8601DateFormatter().string(from: Date())
@@ -1754,15 +1793,11 @@ final class AppModel: ObservableObject {
         diagnostics.sharedModelCatalogPath = sharedModelCatalogStore.catalogURL().path
         diagnostics.activeBackend = transcriptionBackend.rawValue
 
-        if let toolkit = sharedMLXToolkitService.discoverToolkit() {
-            diagnostics.sharedMLXToolkitRoot = toolkit.baseURL.path
-            diagnostics.sharedMLXLogPath = toolkit.logFileURL.path
-            diagnostics.sharedMLXToolkitStatus = "Present"
-        } else {
-            diagnostics.sharedMLXToolkitRoot = ""
-            diagnostics.sharedMLXLogPath = ""
-            diagnostics.sharedMLXToolkitStatus = "Missing"
-        }
+        let mlxRuntime = sharedMLXToolkitService.status()
+        diagnostics.sharedMLXToolkitRoot = mlxRuntime.rootURL.path
+        diagnostics.sharedMLXLogPath = mlxRuntime.logURL.path
+        diagnostics.sharedMLXToolkitStatus = mlxRuntime.displayText
+        mlxSetupStatus = mlxRuntime.isInstalled ? "Ready" : "Needs setup"
 
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false
@@ -1805,65 +1840,94 @@ final class AppModel: ObservableObject {
     }
 
     func startSharedMLXToolkitServer() {
-        guard let toolkit = sharedMLXToolkitService.discoverToolkit() else {
-            sharedMLXToolkitActionStatus = "Shared MLX toolkit not found"
+        guard sharedMLXToolkitService.status().isInstalled else {
+            sharedMLXToolkitActionStatus = "MLX is not installed. Click Set Up MLX."
             return
         }
 
-        Task { @MainActor [weak self] in
+        sharedMLXToolkitActionStatus = "Starting MLX server…"
+        Task { [weak self] in
             guard let self else { return }
             do {
-                let output = try self.sharedMLXToolkitService.runScript(at: toolkit.startScriptURL)
-                self.sharedMLXToolkitActionStatus = output.isEmpty ? "Shared MLX server started" : output
+                let output = try await self.sharedMLXToolkitService.start(modelID: self.mlxModelID)
+                self.sharedMLXToolkitActionStatus = output
+                self.backendProbeStatus = "MLX: OK (/health)"
                 self.refreshDiagnostics()
             } catch {
                 self.sharedMLXToolkitActionStatus = error.localizedDescription
+                self.backendProbeStatus = "MLX: failed to start"
             }
         }
     }
 
     func stopSharedMLXToolkitServer() {
-        guard let toolkit = sharedMLXToolkitService.discoverToolkit() else {
-            sharedMLXToolkitActionStatus = "Shared MLX toolkit not found"
-            return
-        }
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let output = try self.sharedMLXToolkitService.runScript(at: toolkit.stopScriptURL)
-                self.sharedMLXToolkitActionStatus = output.isEmpty ? "Shared MLX server stopped" : output
-                self.refreshDiagnostics()
-            } catch {
-                self.sharedMLXToolkitActionStatus = error.localizedDescription
-            }
+        do {
+            sharedMLXToolkitActionStatus = try sharedMLXToolkitService.stop()
+            backendProbeStatus = "MLX: stopped"
+            refreshDiagnostics()
+        } catch {
+            sharedMLXToolkitActionStatus = error.localizedDescription
         }
     }
 
     func checkSharedMLXToolkitServer() {
-        guard let toolkit = sharedMLXToolkitService.discoverToolkit() else {
-            sharedMLXToolkitActionStatus = "Shared MLX toolkit not found"
-            return
-        }
-
-        Task { @MainActor [weak self] in
+        sharedMLXToolkitActionStatus = "Checking MLX…"
+        Task { [weak self] in
             guard let self else { return }
-            do {
-                let output = try self.sharedMLXToolkitService.runScript(at: toolkit.checkScriptURL)
-                self.sharedMLXToolkitActionStatus = output.isEmpty ? "Shared MLX check completed" : output
-                self.refreshDiagnostics()
-            } catch {
-                self.sharedMLXToolkitActionStatus = error.localizedDescription
-            }
+            let output = await self.sharedMLXToolkitService.check()
+            self.sharedMLXToolkitActionStatus = output
+            self.backendProbeStatus = output.contains("ready") ? "MLX: OK (/health)" : "MLX: stopped"
         }
     }
 
     func openSharedMLXLog() {
-        guard let toolkit = sharedMLXToolkitService.discoverToolkit() else {
-            sharedMLXToolkitActionStatus = "Shared MLX toolkit not found"
-            return
+        let logURL = SharedRuntimePaths.mlxServerLog()
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([logURL])
+        } else {
+            let root = SharedRuntimePaths.mlxAudioRoot()
+            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(root)
         }
-        openURL(toolkit.logFileURL)
+    }
+
+    func setUpMLX() {
+        guard !isSettingUpMLX else { return }
+        isSettingUpMLX = true
+        mlxSetupStatus = "Preparing shared Python runtime…"
+        transcriptionBackend = .mlxOpenAIHTTP
+        transcriptionEnabled = true
+        saveSharedServerConfig()
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                if !self.fasterWhisperRuntimeInstaller.status().isInstalled {
+                    _ = try await self.fasterWhisperRuntimeInstaller.install { message in
+                        Task { @MainActor in self.mlxSetupStatus = message }
+                    }
+                }
+
+                let service = self.sharedMLXToolkitService
+                _ = try await Task.detached(priority: .userInitiated) {
+                    try await service.install { message in
+                        Task { @MainActor in self.mlxSetupStatus = message }
+                    }
+                }.value
+
+                self.mlxSetupStatus = "Starting MLX server…"
+                self.sharedMLXToolkitActionStatus = try await service.start(modelID: self.mlxModelID)
+                self.isSettingUpMLX = false
+                self.mlxSetupStatus = "Ready"
+                self.backendProbeStatus = "MLX: OK (/health)"
+                self.refreshDiagnostics()
+            } catch {
+                self.isSettingUpMLX = false
+                self.mlxSetupStatus = "Setup failed: \(error.localizedDescription)"
+                self.sharedMLXToolkitActionStatus = error.localizedDescription
+                self.refreshDiagnostics()
+            }
+        }
     }
 
     private func refreshFFmpegDiagnostics() {
@@ -1923,6 +1987,14 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([session.recordingURL])
     }
 
+    func revealTranscript(_ session: ContoraSession) {
+        guard let transcriptURL = session.transcriptURL else {
+            statusMessage = "This session does not have a transcript yet"
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([transcriptURL])
+    }
+
     func openURL(_ url: URL) {
         NSWorkspace.shared.open(url)
     }
@@ -1935,6 +2007,10 @@ final class AppModel: ObservableObject {
         } catch {
             statusMessage = "Failed to open recordings folder"
         }
+    }
+
+    func openTranscriptsFolder() {
+        openRecordingsFolder()
     }
 
     func openFasterWhisperRuntimeFolder() {
@@ -1997,18 +2073,27 @@ final class AppModel: ObservableObject {
 
         isDownloadingUpdate = true
         downloadedUpdatePath = ""
-        updateStatus = "Downloading \(update.assetName)..."
+        updateStatus = "Downloading and verifying \(update.assetName)…"
 
         let service = appUpdateService
         Task { [weak self] in
             do {
                 let destination = try await service.download(update: update)
                 await MainActor.run {
+                    self?.updateStatus = "Preparing automatic installation…"
+                }
+                try await Task.detached(priority: .userInitiated) {
+                    try SelfUpdateInstaller.stageAndLaunchHelper(
+                        archiveURL: destination,
+                        expectedVersion: update.version
+                    )
+                }.value
+                await MainActor.run {
                     guard let self else { return }
                     self.isDownloadingUpdate = false
                     self.downloadedUpdatePath = destination.path
-                    self.updateStatus = "Downloaded \(update.assetName). Open it to install the update."
-                    NSWorkspace.shared.open(destination)
+                    self.updateStatus = "Update verified. Restarting Contora…"
+                    NSApp.terminate(nil)
                 }
             } catch {
                 await MainActor.run {
@@ -2904,11 +2989,13 @@ final class AppModel: ObservableObject {
             guard let endpointURL = URL(string: mlxTranscriptionEndpoint) else {
                 throw TranscriptionError.serverError(statusCode: 400, message: "Invalid MLX endpoint URL")
             }
+            _ = try await sharedMLXToolkitService.start(modelID: mlxModelID)
             return try await mlxTranscriber.transcribe(
                 samples16kMono: samples16k,
                 language: transcriptionLanguage,
                 endpointURL: endpointURL,
-                modelID: mlxModelID
+                modelID: mlxModelID,
+                enableDiarization: mlxDiarizationEnabled
             )
 
         case .fasterWhisperProcess:
@@ -3542,6 +3629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         model.cancelActiveTranscription()
+        model.stopSharedMLXToolkitServer()
     }
 
     private func buildStatusItem() {
@@ -4425,10 +4513,34 @@ struct BackendWorkspacePanel: View {
             }
             .disabled(model.isRecording || model.isTranscriptionBusy)
 
-            WorkspaceMetricRow(label: "Engine", value: "MLX + pyannote")
+            Toggle(
+                "Speaker diarization (slower)",
+                isOn: Binding(
+                    get: { model.mlxDiarizationEnabled },
+                    set: { model.updateMLXDiarization($0) }
+                )
+            )
+            .toggleStyle(.checkbox)
+            .disabled(model.isMLXBusy)
+
+            WorkspaceMetricRow(label: "Engine", value: model.mlxDiarizationEnabled ? "MLX + pyannote" : "MLX accelerated")
+            WorkspaceMetricRow(label: "Setup", value: model.mlxSetupStatus)
             WorkspaceMetricRow(label: "Endpoint", value: model.mlxTranscriptionEndpoint)
             WorkspaceMetricRow(label: "Model", value: model.mlxModelID)
             WorkspaceMetricRow(label: "Probe", value: model.backendProbeStatus)
+            WorkspaceMetricRow(label: "Server", value: model.sharedMLXToolkitActionStatus)
+
+            Button {
+                model.setUpMLX()
+            } label: {
+                Label(model.mlxPrimaryActionTitle, systemImage: "arrow.down.circle")
+            }
+            .disabled(model.isMLXBusy)
+
+            if model.isSettingUpMLX {
+                ProgressView()
+                    .controlSize(.small)
+            }
 
             HStack(spacing: 8) {
                 Button {
@@ -4436,11 +4548,18 @@ struct BackendWorkspacePanel: View {
                 } label: {
                     Label("Start MLX", systemImage: "play.fill")
                 }
+                .disabled(!model.sharedMLXToolkitServiceStatusInstalled || model.isSettingUpMLX)
 
                 Button {
                     model.checkSharedMLXToolkitServer()
                 } label: {
                     Label("Check MLX", systemImage: "stethoscope")
+                }
+
+                Button {
+                    model.openSharedMLXLog()
+                } label: {
+                    Label("Log", systemImage: "doc.text.magnifyingglass")
                 }
             }
         }
@@ -4663,8 +4782,15 @@ struct SessionDetailView: View {
                         Button {
                             model.revealSession(session)
                         } label: {
-                            Label("Reveal", systemImage: "folder")
+                            Label("Recording in Finder", systemImage: "waveform.path")
                         }
+
+                        Button {
+                            model.revealTranscript(session)
+                        } label: {
+                            Label("Transcript in Finder", systemImage: "doc.text.magnifyingglass")
+                        }
+                        .disabled(session.transcriptURL == nil)
 
                         Menu {
                             if let transcriptURL = session.transcriptURL {
@@ -4893,266 +5019,301 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        ScrollView {
-            Form {
-            Picker("Capture Source", selection: $model.captureSourceMode) {
-                ForEach(CaptureSourceMode.allCases, id: \.self) { mode in
-                    Text(mode.rawValue).tag(mode)
-                }
+        TabView {
+            generalSettings
+                .tabItem { Label("General", systemImage: "gearshape") }
+            transcriptionSettings
+                .tabItem { Label("Transcription", systemImage: "waveform") }
+            storageSettings
+                .tabItem { Label("Storage", systemImage: "folder") }
+            updateSettings
+                .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
+            advancedSettings
+                .tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
+        }
+        .padding(16)
+        .frame(minWidth: 700, minHeight: 540)
+    }
+
+    private var generalSettings: some View {
+        Form {
+            Section("App") {
+                Toggle("Launch at Login", isOn: $model.launchAtLogin)
             }
 
-            Toggle("Enable Transcription (experimental)", isOn: $model.transcriptionEnabled)
-            Picker("Transcription Backend", selection: $model.transcriptionBackend) {
-                ForEach(TranscriptionBackend.allCases) { backend in
-                    Text(backend.title).tag(backend)
-                }
-            }
-            Toggle("Launch at Login", isOn: $model.launchAtLogin)
-            Toggle("Enable Streaming by Default", isOn: $model.streamingEnabled)
-                .disabled(!model.transcriptionEnabled || model.captureSourceMode == .systemAudio)
-            Picker("Chunk Size", selection: $model.chunkSeconds) {
-                Text("3s").tag(3)
-                Text("8s").tag(8)
-                Text("15s").tag(15)
-            }
-            .pickerStyle(.segmented)
-            .disabled(!model.transcriptionEnabled)
-            Picker("Recording Storage", selection: $model.recordingStoragePolicy) {
-                ForEach(RecordingStoragePolicy.allCases) { policy in
-                    Text(policy.rawValue).tag(policy)
-                }
-            }
-
-            HStack {
-                Text("Storage status: \(model.storageStatus)")
-                Spacer()
-            }
-            TextField("Whisper endpoint URL", text: $model.transcriptionEndpoint)
-                .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .whisperHTTP)
-            TextField("MLX endpoint URL", text: $model.mlxTranscriptionEndpoint)
-                .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .mlxOpenAIHTTP)
-            TextField("MLX model ID", text: $model.mlxModelID)
-                .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .mlxOpenAIHTTP)
-            Picker("Whisper model", selection: $model.fasterWhisperModelName) {
-                ForEach(WhisperModelOption.fasterWhisperOptions) { option in
-                    Text("\(option.displayName) - \(option.detail)").tag(option.name)
-                }
-            }
-            .disabled(!model.transcriptionEnabled || model.isSettingUpLocalWhisper)
-            Toggle("Whisper diarization", isOn: $model.fasterWhisperDiarizationEnabled)
-                .disabled(!model.transcriptionEnabled || model.isSettingUpLocalWhisper)
-            HStack {
-                Text("Local Whisper: \(model.localWhisperSetupStatus)")
-                    .lineLimit(2)
-                Spacer()
-                Button("Set Up Local Whisper") { model.setUpLocalWhisper() }
-                    .disabled(model.isSettingUpLocalWhisper)
-            }
-            .disabled(!model.transcriptionEnabled)
-            HStack {
-                Text("Runtime: \(model.fasterWhisperRuntimeStatus)")
-                    .lineLimit(2)
-                Spacer()
-                Button("Install Runtime") { model.installFasterWhisperRuntime() }
-                    .disabled(model.isInstallingFasterWhisperRuntime || model.isSettingUpLocalWhisper)
-                Button("Runtime Folder") { model.openFasterWhisperRuntimeFolder() }
-            }
-            .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .fasterWhisperProcess)
-            HStack {
-                Text("Model: \(model.fasterWhisperDownloadStatus)")
-                    .lineLimit(2)
-                Spacer()
-                Button("Download Model") { model.downloadSelectedFasterWhisperModel() }
-                    .disabled(model.isDownloadingFasterWhisperModel || model.isInstallingFasterWhisperRuntime || model.isSettingUpLocalWhisper)
-                Button("Runtime Releases") { model.openFasterWhisperRuntimeReleases() }
-            }
-            .disabled(!model.transcriptionEnabled || model.transcriptionBackend != .fasterWhisperProcess)
-            TextField("Transcription language", text: $model.transcriptionLanguage)
-                .disabled(!model.transcriptionEnabled)
-
-            HStack {
-                Text("Shared server config:")
-                Spacer()
-                Text(model.sharedServerConfigPath)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            HStack {
-                Text("Config status: \(model.sharedServerConfigStatus)")
-                Spacer()
-                Button("Reload") { model.loadSharedServerConfig() }
-                Button("Save") { model.saveSharedServerConfig() }
-            }
-
-            HStack {
-                Text("Backend probe: \(model.backendProbeStatus)")
-                Spacer()
-                Button("Check") { model.probeSharedBackend() }
-            }
-
-            Section("Updates") {
-                HStack {
-                    Text("Installed version")
-                    Spacer()
-                    Text(model.appVersion)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-
-                HStack {
-                    Text("Status")
-                    Spacer()
-                    Text(model.updateStatus)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                if let update = model.availableUpdate {
-                    HStack {
-                        Text("Available")
-                        Spacer()
-                        Text("\(update.version) · \(update.assetName) · \(update.assetSizeDisplay)")
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
+            Section("Recording") {
+                Picker("Capture Source", selection: $model.captureSourceMode) {
+                    ForEach(CaptureSourceMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
                     }
                 }
+                Text(model.captureScopeDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
-                if !model.downloadedUpdatePath.isEmpty {
-                    diagnosticPathRow("Downloaded update", model.downloadedUpdatePath)
+                Toggle("Enable Streaming by Default", isOn: $model.streamingEnabled)
+                    .disabled(!model.transcriptionEnabled || model.captureSourceMode == .systemAudio)
+                Picker("Streaming Chunk Size", selection: $model.chunkSeconds) {
+                    Text("3s").tag(3)
+                    Text("8s").tag(8)
+                    Text("15s").tag(15)
                 }
+                .pickerStyle(.segmented)
+                .disabled(!model.transcriptionEnabled || !model.streamingEnabled)
+            }
+
+            Section("Permissions") {
+                permissionRow("Microphone", status: model.permissions.microphone.rawValue) {
+                    model.permissions.requestMicrophone()
+                }
+                permissionRow("Screen Recording", status: model.permissions.screenRecording.rawValue) {
+                    model.permissions.requestScreenRecording()
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var transcriptionSettings: some View {
+        Form {
+            Section("Transcription") {
+                Toggle("Enable Transcription", isOn: $model.transcriptionEnabled)
+                Picker("Backend", selection: transcriptionBackendBinding) {
+                    ForEach(TranscriptionBackend.allCases) { backend in
+                        Text(backend.title).tag(backend)
+                    }
+                }
+                .disabled(!model.transcriptionEnabled)
+                TextField("Language", text: $model.transcriptionLanguage)
+                    .disabled(!model.transcriptionEnabled)
+                statusRow("Backend status", model.backendProbeStatus)
+            }
+
+            if model.transcriptionBackend == .fasterWhisperProcess {
+                localWhisperSettings
+            } else if model.transcriptionBackend == .mlxOpenAIHTTP {
+                mlxSettings
+            } else {
+                Section("Whisper HTTP") {
+                    Text("Uses an external Whisper-compatible HTTP server. Configure its endpoint in Advanced.")
+                        .foregroundStyle(.secondary)
+                    Button("Check Connection") { model.probeSharedBackend() }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var localWhisperSettings: some View {
+        Section("Local Whisper") {
+            Picker("Model", selection: fasterWhisperModelBinding) {
+                ForEach(WhisperModelOption.fasterWhisperOptions) { option in
+                    Text("\(option.displayName) — \(option.detail)").tag(option.name)
+                }
+            }
+            Toggle("Speaker Diarization", isOn: fasterWhisperDiarizationBinding)
+            Text("Diarization identifies speakers, but substantially increases processing time.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            statusRow("Setup", model.localWhisperSetupStatus)
+            statusRow("Runtime", model.fasterWhisperRuntimeStatus)
+            statusRow("Model", model.fasterWhisperDownloadStatus)
+
+            HStack {
+                Button(model.localWhisperPrimaryActionTitle) { model.setUpLocalWhisper() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isSettingUpLocalWhisper)
+                Button("Check") { model.probeSharedBackend() }
+                Menu("More") {
+                    Button("Open Runtime Folder") { model.openFasterWhisperRuntimeFolder() }
+                    Button("Open Logs Folder") { model.openFasterWhisperLogsFolder() }
+                    Button("Runtime Releases") { model.openFasterWhisperRuntimeReleases() }
+                }
+                if model.isLocalWhisperBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+        }
+        .disabled(!model.transcriptionEnabled)
+    }
+
+    private var mlxSettings: some View {
+        Section("MLX — Apple Silicon Accelerated") {
+            TextField("Model ID", text: $model.mlxModelID)
+                .onSubmit { model.updateMLXModelID(model.mlxModelID) }
+            Toggle("Speaker Diarization", isOn: mlxDiarizationBinding)
+            Text("Keep diarization off when speed matters. The first transcription also downloads and loads the selected model.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            statusRow("Setup", model.mlxSetupStatus)
+            statusRow("Runtime", model.diagnostics.sharedMLXToolkitStatus)
+            statusRow("Server", model.sharedMLXToolkitActionStatus)
+
+            HStack {
+                Button(model.mlxPrimaryActionTitle) { model.setUpMLX() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isMLXBusy)
+                Button("Start") { model.startSharedMLXToolkitServer() }
+                    .disabled(!model.sharedMLXToolkitServiceStatusInstalled || model.isMLXBusy)
+                Button("Stop") { model.stopSharedMLXToolkitServer() }
+                    .disabled(!model.sharedMLXToolkitServiceStatusInstalled)
+                Button("Check") { model.checkSharedMLXToolkitServer() }
+                    .disabled(!model.sharedMLXToolkitServiceStatusInstalled)
+                Button("Open Log") { model.openSharedMLXLog() }
+                if model.isSettingUpMLX {
+                    ProgressView().controlSize(.small)
+                }
+            }
+        }
+        .disabled(!model.transcriptionEnabled)
+    }
+
+    private var storageSettings: some View {
+        Form {
+            Section("Session Files") {
+                Picker("Recording Storage", selection: $model.recordingStoragePolicy) {
+                    ForEach(RecordingStoragePolicy.allCases) { policy in
+                        Text(policy.rawValue).tag(policy)
+                    }
+                }
+                statusRow("Status", model.storageStatus)
+                diagnosticPathRow("Folder", model.recordingsFolderPath)
+                Text("Recordings and their text transcripts are kept together in this folder.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Open Recordings Folder") { model.openRecordingsFolder() }
+                    Button("Open Transcripts Folder") { model.openTranscriptsFolder() }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var updateSettings: some View {
+        Form {
+            Section("Contora Updates") {
+                statusRow("Installed version", model.appVersion)
+                statusRow("Status", model.updateStatus)
+                if let update = model.availableUpdate {
+                    statusRow("Available", "\(update.version) · \(update.assetSizeDisplay)")
+                }
+
+                Text("Updates are downloaded, verified, installed, and relaunched automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 HStack {
                     Button("Check for Updates") { model.checkForUpdates() }
                         .disabled(model.isCheckingForUpdates || model.isDownloadingUpdate)
-                    Button("Download Update") { model.downloadAvailableUpdate() }
+                    Button("Install and Restart") { model.downloadAvailableUpdate() }
+                        .buttonStyle(.borderedProminent)
                         .disabled(model.availableUpdate == nil || model.isCheckingForUpdates || model.isDownloadingUpdate)
-                    Button("Open Download") { model.openDownloadedUpdate() }
-                        .disabled(model.downloadedUpdatePath.isEmpty || model.isDownloadingUpdate)
                     Button("Release Page") { model.openUpdateReleasePage() }
                     if model.isCheckingForUpdates || model.isDownloadingUpdate {
-                        ProgressView()
-                            .controlSize(.small)
+                        ProgressView().controlSize(.small)
                     }
                 }
             }
-
-            Section("Diagnostics") {
-                HStack {
-                    Text("FFmpeg")
-                    Spacer()
-                    Text(model.diagnostics.ffmpegStatus)
-                        .foregroundStyle(.secondary)
-                }
-                diagnosticPathRow("FFmpeg path", model.diagnostics.ffmpegPath)
-                diagnosticPathRow("FFmpeg version", model.diagnostics.ffmpegVersion)
-
-                HStack {
-                    Text("Shared runtime")
-                    Spacer()
-                    Text(model.diagnostics.sharedRuntimeRootStatus)
-                        .foregroundStyle(.secondary)
-                }
-                diagnosticPathRow("Runtime root", model.diagnostics.sharedRuntimeRoot)
-
-                HStack {
-                    Text("Whisper executable")
-                    Spacer()
-                    Text(model.diagnostics.whisperExecutableStatus)
-                        .foregroundStyle(.secondary)
-                }
-                diagnosticPathRow("Whisper path", model.diagnostics.whisperExecutablePath)
-
-                HStack {
-                    Text("Models directory")
-                    Spacer()
-                    Text(model.diagnostics.modelsDirectoryStatus)
-                        .foregroundStyle(.secondary)
-                }
-                diagnosticPathRow("Models path", model.diagnostics.modelsDirectoryPath)
-
-                HStack {
-                    Text("Shared config")
-                    Spacer()
-                    Text(model.diagnostics.sharedConfigStatus)
-                        .foregroundStyle(.secondary)
-                }
-                diagnosticPathRow("Config path", model.diagnostics.sharedConfigPath)
-                diagnosticPathRow("Active backend", model.diagnostics.activeBackend)
-
-                HStack {
-                    Text("Shared model catalog")
-                    Spacer()
-                    Text(model.diagnostics.sharedModelCatalogStatus)
-                        .foregroundStyle(.secondary)
-                }
-                diagnosticPathRow("Catalog path", model.diagnostics.sharedModelCatalogPath)
-                diagnosticPathRow("Catalog summary", model.diagnostics.sharedModelCatalogSummary)
-
-                if !model.sharedModelCatalogEntries.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Shared model entries")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        ForEach(model.sharedModelCatalogEntries.prefix(8), id: \.id) { entry in
-                            Text("\(entry.provider.rawValue) · \(entry.modelID) · \(entry.source)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                }
-
-                HStack {
-                    Text("Shared MLX toolkit")
-                    Spacer()
-                    Text(model.diagnostics.sharedMLXToolkitStatus)
-                        .foregroundStyle(.secondary)
-                }
-                diagnosticPathRow("Toolkit root", model.diagnostics.sharedMLXToolkitRoot)
-                diagnosticPathRow("Toolkit log", model.diagnostics.sharedMLXLogPath)
-                diagnosticPathRow("Toolkit action", model.sharedMLXToolkitActionStatus)
-
-                HStack {
-                    Button("Start MLX") { model.startSharedMLXToolkitServer() }
-                        .disabled(model.diagnostics.sharedMLXToolkitStatus != "Present")
-                    Button("Stop MLX") { model.stopSharedMLXToolkitServer() }
-                        .disabled(model.diagnostics.sharedMLXToolkitStatus != "Present")
-                    Button("Check MLX") { model.checkSharedMLXToolkitServer() }
-                        .disabled(model.diagnostics.sharedMLXToolkitStatus != "Present")
-                    Button("Open MLX Log") { model.openSharedMLXLog() }
-                        .disabled(model.diagnostics.sharedMLXToolkitStatus != "Present")
-                }
-
-                HStack {
-                    Spacer()
-                    Button("Refresh Catalog") { model.refreshSharedModelCatalog() }
-                    Button("Refresh Diagnostics") { model.refreshDiagnostics() }
-                }
-            }
-
-            HStack {
-                Text("Mic Permission: \(model.permissions.microphone.rawValue)")
-                Spacer()
-                Button("Request") { model.permissions.requestMicrophone() }
-            }
-
-            HStack {
-                Text("Screen Recording: \(model.permissions.screenRecording.rawValue)")
-                Spacer()
-                Button("Request") { model.permissions.requestScreenRecording() }
-            }
-
-            Text("MVP mode: recording/transcription are local-first. Storage policy controls whether sessions keep WAV, add M4A, or switch to M4A only.")
-                .foregroundStyle(.secondary)
-            }
-            .padding(20)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .frame(minWidth: 760, minHeight: 620)
+        .formStyle(.grouped)
+    }
+
+    private var advancedSettings: some View {
+        Form {
+            Section("Server Endpoints") {
+                TextField("Whisper endpoint URL", text: $model.transcriptionEndpoint)
+                TextField("MLX endpoint URL", text: $model.mlxTranscriptionEndpoint)
+                HStack {
+                    Button("Reload Config") { model.loadSharedServerConfig() }
+                    Button("Save Config") { model.saveSharedServerConfig() }
+                    Button("Check Active Backend") { model.probeSharedBackend() }
+                }
+                statusRow("Config", model.sharedServerConfigStatus)
+                diagnosticPathRow("Config file", model.sharedServerConfigPath)
+            }
+
+            DisclosureGroup("Diagnostics") {
+                VStack(alignment: .leading, spacing: 10) {
+                    statusRow("FFmpeg", model.diagnostics.ffmpegStatus)
+                    diagnosticPathRow("FFmpeg path", model.diagnostics.ffmpegPath)
+                    diagnosticPathRow("FFmpeg version", model.diagnostics.ffmpegVersion)
+                    statusRow("Shared runtime", model.diagnostics.sharedRuntimeRootStatus)
+                    diagnosticPathRow("Runtime root", model.diagnostics.sharedRuntimeRoot)
+                    statusRow("Whisper executable", model.diagnostics.whisperExecutableStatus)
+                    diagnosticPathRow("Whisper path", model.diagnostics.whisperExecutablePath)
+                    statusRow("Models directory", model.diagnostics.modelsDirectoryStatus)
+                    diagnosticPathRow("Models path", model.diagnostics.modelsDirectoryPath)
+                    statusRow("Model catalog", model.diagnostics.sharedModelCatalogStatus)
+                    diagnosticPathRow("Catalog path", model.diagnostics.sharedModelCatalogPath)
+                    diagnosticPathRow("Catalog summary", model.diagnostics.sharedModelCatalogSummary)
+                    statusRow("MLX runtime", model.diagnostics.sharedMLXToolkitStatus)
+                    diagnosticPathRow("MLX root", model.diagnostics.sharedMLXToolkitRoot)
+                    diagnosticPathRow("MLX log", model.diagnostics.sharedMLXLogPath)
+
+                    HStack {
+                        Spacer()
+                        Button("Refresh Catalog") { model.refreshSharedModelCatalog() }
+                        Button("Refresh Diagnostics") { model.refreshDiagnostics() }
+                    }
+                }
+                .padding(.top, 8)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var transcriptionBackendBinding: Binding<TranscriptionBackend> {
+        Binding(
+            get: { model.transcriptionBackend },
+            set: { model.selectTranscriptionBackend($0) }
+        )
+    }
+
+    private var fasterWhisperModelBinding: Binding<String> {
+        Binding(
+            get: { model.fasterWhisperModelName },
+            set: { model.updateFasterWhisperModelName($0) }
+        )
+    }
+
+    private var fasterWhisperDiarizationBinding: Binding<Bool> {
+        Binding(
+            get: { model.fasterWhisperDiarizationEnabled },
+            set: { model.updateFasterWhisperDiarization($0) }
+        )
+    }
+
+    private var mlxDiarizationBinding: Binding<Bool> {
+        Binding(
+            get: { model.mlxDiarizationEnabled },
+            set: { model.updateMLXDiarization($0) }
+        )
+    }
+
+    @ViewBuilder
+    private func statusRow(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title)
+            Spacer()
+            Text(value)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private func permissionRow(_ title: String, status: String, action: @escaping () -> Void) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(status).foregroundStyle(.secondary)
+            Button("Request") { action() }
+        }
     }
 
     @ViewBuilder
@@ -5207,8 +5368,11 @@ struct ContoraMacApp: App {
         Settings {
             SettingsView(model: AppModel.shared)
         }
-        .defaultSize(width: 820, height: 680)
+        .defaultSize(width: 760, height: 600)
     }
 }
 
+if SelfUpdateInstaller.handleCommandLineIfNeeded() {
+    exit(EXIT_SUCCESS)
+}
 ContoraMacApp.main()

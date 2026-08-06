@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct AppUpdateInfo: Identifiable {
@@ -7,6 +8,7 @@ struct AppUpdateInfo: Identifiable {
     let assetName: String
     let assetURL: URL
     let assetSizeBytes: Int64
+    let expectedSHA256: String?
     let publishedAt: Date?
 
     var id: String { version }
@@ -52,11 +54,13 @@ final class AppUpdateService {
             let name: String
             let browserDownloadURL: URL
             let size: Int64
+            let digest: String?
 
             enum CodingKeys: String, CodingKey {
                 case name
                 case browserDownloadURL = "browser_download_url"
                 case size
+                case digest
             }
         }
 
@@ -139,6 +143,7 @@ final class AppUpdateService {
             assetName: asset.name,
             assetURL: asset.browserDownloadURL,
             assetSizeBytes: asset.size,
+            expectedSHA256: asset.digest?.replacingOccurrences(of: "sha256:", with: ""),
             publishedAt: release.publishedAt
         )
     }
@@ -150,6 +155,13 @@ final class AppUpdateService {
         let (temporaryURL, response) = try await session.download(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw AppUpdateError.downloadFailed
+        }
+
+        if let expected = update.expectedSHA256 {
+            let actual = try sha256(of: temporaryURL)
+            guard actual.caseInsensitiveCompare(expected) == .orderedSame else {
+                throw AppUpdateError.downloadFailed
+            }
         }
 
         let destination = try uniqueDownloadDestination(fileName: update.assetName)
@@ -180,7 +192,8 @@ final class AppUpdateService {
             return lower.contains(Self.currentArchitecture) || lower.contains("universal")
         }
         let candidates = compatibleAssets.isEmpty ? appAssets : compatibleAssets
-        let extensionPriority = ["dmg": 0, "pkg": 1, "zip": 2]
+        // ZIP can be staged and atomically installed by Contora without mounting a DMG.
+        let extensionPriority = ["zip": 0, "dmg": 1, "pkg": 2]
 
         return candidates.sorted { lhs, rhs in
             let lhsExt = lhs.name.split(separator: ".").last.map(String.init) ?? ""
@@ -254,5 +267,10 @@ final class AppUpdateService {
         normalizedVersion(value)
             .split { !$0.isNumber }
             .compactMap { Int($0) }
+    }
+
+    private func sha256(of url: URL) throws -> String {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

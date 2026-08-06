@@ -5,6 +5,16 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.3] - 2026-08-06
+
+### macOS
+- **Working MLX setup**: Apple Silicon Macs can install the managed MLX runtime from Contora, start and stop its local server, run health checks, and open a persistent server log. The previous machine-specific development path has been removed.
+- **MLX transcription**: the bundled OpenAI-compatible local server loads MLX Whisper models on demand and supports optional speaker diarization. Diarization defaults to off for substantially better speed.
+- **Automatic updates**: ZIP updates are hash-checked, code-signature-verified, installed over the running app through a rollback-capable helper, and relaunched without requiring a Finder drag.
+- **Clearer settings**: settings are separated into General, Transcription, Storage, Updates, and Advanced tabs. Backend setup is shown next to the selected backend; low-level paths and diagnostics are collapsed under Advanced.
+- **Transcript location controls**: the session view can reveal its transcript in Finder, and Storage settings show and open the directory containing recordings and transcripts.
+- **Small app bundle**: MLX and Whisper runtimes remain separate downloads, keeping the packaged app at roughly 3.4 MB (about 1.4 MB as a ZIP).
+
 ## [0.6.2] - 2026-07-17
 
 ### macOS

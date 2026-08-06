@@ -83,6 +83,22 @@ enum SharedRuntimePaths {
         sharedRuntimeRoot().appendingPathComponent("mlx-audio", isDirectory: true)
     }
 
+    static func mlxVenvSitePackages() -> URL {
+        mlxAudioRoot().appendingPathComponent("venv/lib/python3.12/site-packages", isDirectory: true)
+    }
+
+    static func mlxServerScript() -> URL {
+        mlxAudioRoot().appendingPathComponent("bin/contora_mlx_server.py")
+    }
+
+    static func mlxServerLog() -> URL {
+        mlxAudioRoot().appendingPathComponent("mlx-server.log")
+    }
+
+    static func mlxServerPIDFile() -> URL {
+        mlxAudioRoot().appendingPathComponent("mlx-server.pid")
+    }
+
     static func localLLMRoot() -> URL {
         sharedRuntimeRoot().appendingPathComponent("llm", isDirectory: true)
     }

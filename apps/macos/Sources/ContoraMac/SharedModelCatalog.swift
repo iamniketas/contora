@@ -205,20 +205,6 @@ final class SharedModelCatalogStore {
             }
         }
 
-        if let toolkit = SharedMLXServerToolkit.discover() {
-            entries.append(
-                SharedModelCatalogEntry(
-                    id: "mlx-audio::toolkit",
-                    provider: .mlxAudio,
-                    modelID: "toolkit",
-                    path: toolkit.baseURL.path,
-                    source: "toolkit",
-                    status: "available",
-                    updatedAt: now
-                )
-            )
-        }
-
         return entries
     }
 

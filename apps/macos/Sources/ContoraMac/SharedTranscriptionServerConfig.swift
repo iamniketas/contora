@@ -30,6 +30,7 @@ struct SharedTranscriptionServerConfig: Codable {
     var whisperTranscribeURL: String
     var mlxTranscribeURL: String
     var mlxModelID: String
+    var mlxDiarizationEnabled: Bool
     var fasterWhisperModelName: String
     var fasterWhisperDiarizationEnabled: Bool
     var updatedAt: String
@@ -40,6 +41,7 @@ struct SharedTranscriptionServerConfig: Codable {
         case whisperTranscribeURL
         case mlxTranscribeURL
         case mlxModelID
+        case mlxDiarizationEnabled
         case fasterWhisperModelName
         case fasterWhisperDiarizationEnabled
         case updatedAt
@@ -52,6 +54,7 @@ struct SharedTranscriptionServerConfig: Codable {
             whisperTranscribeURL: "http://127.0.0.1:5500/transcribe",
             mlxTranscribeURL: "http://127.0.0.1:8010/v1/audio/transcriptions",
             mlxModelID: "mlx-community/whisper-large-v3-turbo-asr-fp16",
+            mlxDiarizationEnabled: false,
             fasterWhisperModelName: "large-v2",
             fasterWhisperDiarizationEnabled: true,
             updatedAt: ISO8601DateFormatter().string(from: Date())
@@ -64,6 +67,7 @@ struct SharedTranscriptionServerConfig: Codable {
         whisperTranscribeURL: String,
         mlxTranscribeURL: String,
         mlxModelID: String,
+        mlxDiarizationEnabled: Bool = false,
         fasterWhisperModelName: String,
         fasterWhisperDiarizationEnabled: Bool,
         updatedAt: String
@@ -73,6 +77,7 @@ struct SharedTranscriptionServerConfig: Codable {
         self.whisperTranscribeURL = whisperTranscribeURL
         self.mlxTranscribeURL = mlxTranscribeURL
         self.mlxModelID = mlxModelID
+        self.mlxDiarizationEnabled = mlxDiarizationEnabled
         self.fasterWhisperModelName = fasterWhisperModelName
         self.fasterWhisperDiarizationEnabled = fasterWhisperDiarizationEnabled
         self.updatedAt = updatedAt
@@ -85,6 +90,7 @@ struct SharedTranscriptionServerConfig: Codable {
         whisperTranscribeURL = try values.decodeIfPresent(String.self, forKey: .whisperTranscribeURL) ?? "http://127.0.0.1:5500/transcribe"
         mlxTranscribeURL = try values.decodeIfPresent(String.self, forKey: .mlxTranscribeURL) ?? "http://127.0.0.1:8010/v1/audio/transcriptions"
         mlxModelID = try values.decodeIfPresent(String.self, forKey: .mlxModelID) ?? "mlx-community/whisper-large-v3-turbo-asr-fp16"
+        mlxDiarizationEnabled = try values.decodeIfPresent(Bool.self, forKey: .mlxDiarizationEnabled) ?? false
         fasterWhisperModelName = try values.decodeIfPresent(String.self, forKey: .fasterWhisperModelName) ?? "large-v2"
         fasterWhisperDiarizationEnabled = try values.decodeIfPresent(Bool.self, forKey: .fasterWhisperDiarizationEnabled) ?? true
         updatedAt = try values.decodeIfPresent(String.self, forKey: .updatedAt) ?? ISO8601DateFormatter().string(from: Date())
