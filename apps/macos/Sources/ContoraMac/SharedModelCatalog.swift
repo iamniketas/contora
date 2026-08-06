@@ -155,6 +155,22 @@ final class SharedModelCatalogStore {
 
     private func scanMLX(now: String) -> [SharedModelCatalogEntry] {
         var entries: [SharedModelCatalogEntry] = []
+        if let config = try? SharedTranscriptionServerConfigStore.shared.loadOrCreate(),
+           !config.mlxModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let cacheURL = huggingFaceCacheURL(forModelID: config.mlxModelID)
+            entries.append(
+                SharedModelCatalogEntry(
+                    id: "mlx-audio::\(config.mlxModelID)",
+                    provider: .mlxAudio,
+                    modelID: config.mlxModelID,
+                    path: cacheURL?.path ?? config.mlxModelID,
+                    source: cacheURL == nil ? "configured" : "huggingface-cache",
+                    status: cacheURL == nil ? "configured" : "available",
+                    updatedAt: now
+                )
+            )
+        }
+
         let sharedRoot = SharedRuntimePaths.mlxAudioRoot()
         if FileManager.default.fileExists(atPath: sharedRoot.path) {
             entries.append(
@@ -168,6 +184,25 @@ final class SharedModelCatalogStore {
                     updatedAt: now
                 )
             )
+
+            let modelsRoot = sharedRoot.appendingPathComponent("models", isDirectory: true)
+            if let modelDirectories = try? FileManager.default.contentsOfDirectory(
+                at: modelsRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                entries.append(contentsOf: modelDirectories.map { directory in
+                    SharedModelCatalogEntry(
+                        id: "mlx-audio::shared::\(directory.lastPathComponent)",
+                        provider: .mlxAudio,
+                        modelID: directory.lastPathComponent,
+                        path: directory.path,
+                        source: "shared",
+                        status: "available",
+                        updatedAt: now
+                    )
+                })
+            }
         }
 
         if let toolkit = SharedMLXServerToolkit.discover() {
@@ -185,6 +220,15 @@ final class SharedModelCatalogStore {
         }
 
         return entries
+    }
+
+    private func huggingFaceCacheURL(forModelID modelID: String) -> URL? {
+        let cacheName = "models--" + modelID.replacingOccurrences(of: "/", with: "--")
+        let candidates = [
+            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".cache/huggingface/hub/\(cacheName)", isDirectory: true),
+            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Caches/huggingface/hub/\(cacheName)", isDirectory: true)
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     private func scanOllama(now: String) -> [SharedModelCatalogEntry] {

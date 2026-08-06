@@ -13,6 +13,8 @@ ARCHIVE_NAME="${CONTORA_RUNTIME_ARCHIVE_NAME:-ContoraMacWhisperRuntime-$(uname -
 rm -rf "$BUILD_ROOT" "$DIST_ROOT"
 mkdir -p "$RUNTIME_ROOT/bin" "$DIST_ROOT"
 
+"$SCRIPT_DIR/sync-app-script.sh"
+
 PYTHON_EXECUTABLE="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
 PYTHON_VERSION="$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 PYTHON_PREFIX="$("$PYTHON_BIN" -c 'import sys; print(sys.prefix)')"
@@ -27,6 +29,34 @@ if [[ -d "$PYTHON_PREFIX" ]]; then
   mkdir -p "$RUNTIME_ROOT/python"
   ditto "$PYTHON_PREFIX" "$RUNTIME_ROOT/python/Python.framework/Versions/$PYTHON_VERSION"
 fi
+
+repair_bundled_python_install_names() {
+  local framework_root="$RUNTIME_ROOT/python/Python.framework/Versions/$PYTHON_VERSION"
+  local framework_lib="$framework_root/Python"
+  local python_bin="$framework_root/bin/python$PYTHON_VERSION"
+  local python_app_bin="$framework_root/Resources/Python.app/Contents/MacOS/Python"
+  local absolute_ref="/Library/Frameworks/Python.framework/Versions/$PYTHON_VERSION/Python"
+
+  if ! command -v install_name_tool >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ -x "$python_bin" ]]; then
+    install_name_tool -change "$absolute_ref" "@executable_path/../Python" "$python_bin" || true
+    codesign --force --sign - "$python_bin" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -x "$python_app_bin" ]]; then
+    install_name_tool -change "$absolute_ref" "@executable_path/../../../../Python" "$python_app_bin" || true
+    codesign --force --sign - "$python_app_bin" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -f "$framework_lib" ]]; then
+    codesign --force --sign - "$framework_lib" >/dev/null 2>&1 || true
+  fi
+}
+
+repair_bundled_python_install_names
 
 cat > "$RUNTIME_ROOT/$RUNTIME_NAME" <<'EOF'
 #!/bin/sh

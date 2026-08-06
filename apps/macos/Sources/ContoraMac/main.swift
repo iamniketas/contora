@@ -943,7 +943,7 @@ final class MLXHTTPTranscriptionService {
         let wavData = WAVEncoder.makeWAVData(samples: samples16kMono, sampleRate: 16_000)
         let boundary = "Boundary-\(UUID().uuidString)"
         let audioSeconds = Double(samples16kMono.count) / 16_000.0
-        let timeoutSeconds = max(60, min(900, (audioSeconds * 2.0) + 30))
+        let timeoutSeconds = max(600, (audioSeconds * 3.0) + 600)
 
         var body = Data()
         let lineBreak = "\r\n"
@@ -960,6 +960,14 @@ final class MLXHTTPTranscriptionService {
         body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
         body.append("Content-Disposition: form-data; name=\"language\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
         body.append("\(language)\(lineBreak)".data(using: .utf8)!)
+
+        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"diarize\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
+        body.append("true\(lineBreak)".data(using: .utf8)!)
+
+        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"chunk_duration\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
+        body.append("30\(lineBreak)".data(using: .utf8)!)
 
         body.append("--\(boundary)--\(lineBreak)".data(using: .utf8)!)
 
@@ -1419,8 +1427,10 @@ final class AppModel: ObservableObject {
     @Published var sessionLibraryStatus = "Not loaded"
     @Published var sessionEditorTranscriptDraft = ""
     @Published var sessionEditorSegments: [EditableSessionSegment] = []
+    @Published var sessionEditorSpeakerNames: [String: String] = [:]
     @Published var sessionEditorStatus = "No session selected"
     @Published var sessionEditorHasUnsavedChanges = false
+    @Published var lastOutlineExportPath = ""
     @Published var storageStatus = "WAV only"
     @Published var diagnostics = RuntimeDiagnostics()
     @Published var sharedMLXToolkitActionStatus = "Idle"
@@ -1429,6 +1439,12 @@ final class AppModel: ObservableObject {
     @Published var activeOutputDeviceName = "Unknown output"
     @Published var playingSegmentID: String?
     @Published var transcriptionJobs: [TranscriptionJob] = []
+    @Published var appVersion = AppUpdateService.currentAppVersion
+    @Published var updateStatus = "Not checked"
+    @Published var availableUpdate: AppUpdateInfo?
+    @Published var isCheckingForUpdates = false
+    @Published var isDownloadingUpdate = false
+    @Published var downloadedUpdatePath = ""
 
     let permissions = PermissionState()
 
@@ -1443,6 +1459,7 @@ final class AppModel: ObservableObject {
     private let sharedMLXToolkitService = SharedMLXServerToolkitService()
     private let sharedModelCatalogStore = SharedModelCatalogStore.shared
     private let fasterWhisperRuntimeInstaller = FasterWhisperRuntimeInstaller()
+    private let appUpdateService = AppUpdateService()
     private let sessionLibrary = SessionLibraryService()
     private var recordingTickerTask: Task<Void, Never>?
     private var transcriptionTickerTask: Task<Void, Never>?
@@ -1467,6 +1484,7 @@ final class AppModel: ObservableObject {
         refreshDiagnostics()
         refreshAudioDeviceContext()
         autoStartMLXServerIfNeeded()
+        checkForUpdates(silent: true)
     }
 
     private func autoStartMLXServerIfNeeded() {
@@ -1580,6 +1598,7 @@ final class AppModel: ObservableObject {
         transcriptionEnabled = true
         saveSharedServerConfig()
         refreshDiagnostics()
+        autoStartMLXServerIfNeeded()
         probeSharedBackend()
     }
 
@@ -1593,6 +1612,17 @@ final class AppModel: ObservableObject {
         fasterWhisperDiarizationEnabled = enabled
         saveSharedServerConfig()
         refreshDiagnostics()
+    }
+
+    func updateMLXModelID(_ modelID: String) {
+        let normalized = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty, normalized != mlxModelID else {
+            return
+        }
+        mlxModelID = normalized
+        saveSharedServerConfig()
+        refreshSharedModelCatalog()
+        probeSharedBackend()
     }
 
     var captureScopeDescription: String {
@@ -1845,7 +1875,7 @@ final class AppModel: ObservableObject {
         ].compactMap { $0 }.filter { !$0.isEmpty }
 
         let fileManager = FileManager.default
-        let ffmpegPath = candidatePaths.first(where: { fileManager.isExecutableFile(atPath: $0) }) ?? resolveFFmpegViaWhich()
+        let ffmpegPath = candidatePaths.first(where: { fileManager.isExecutableFile(atPath: $0) })
 
         guard let ffmpegPath else {
             diagnostics.ffmpegStatus = "Missing"
@@ -1856,51 +1886,7 @@ final class AppModel: ObservableObject {
 
         diagnostics.ffmpegPath = ffmpegPath
         diagnostics.ffmpegStatus = "Available"
-        diagnostics.ffmpegVersion = ffmpegVersion(at: ffmpegPath)
-    }
-
-    private func resolveFFmpegViaWhich() -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        process.arguments = ["ffmpeg"]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
-        }
-
-        guard process.terminationStatus == 0 else {
-            return nil
-        }
-
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (path?.isEmpty == false) ? path : nil
-    }
-
-    private func ffmpegVersion(at path: String) -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = ["-version"]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return "Unavailable"
-        }
-
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let text = String(data: data, encoding: .utf8) ?? ""
-        return text.components(separatedBy: .newlines).first ?? "Unknown"
+        diagnostics.ffmpegVersion = "Available"
     }
 
     func reloadSessions() {
@@ -1916,6 +1902,7 @@ final class AppModel: ObservableObject {
             selectedSessionID = nil
             sessionEditorTranscriptDraft = ""
             sessionEditorSegments = []
+            sessionEditorSpeakerNames = [:]
             sessionLibraryStatus = "Load failed: \(error.localizedDescription)"
         }
     }
@@ -1956,7 +1943,96 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.open(root)
     }
 
+    func openFasterWhisperLogsFolder() {
+        let logs = SharedRuntimePaths.whisperLogsDirectory()
+        try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(logs)
+    }
+
     func openFasterWhisperRuntimeReleases() {
+        if let url = URL(string: "https://github.com/iamniketas/contora/releases") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func checkForUpdates(silent: Bool = false) {
+        guard !isCheckingForUpdates else { return }
+
+        isCheckingForUpdates = true
+        if !silent {
+            updateStatus = "Checking for updates..."
+        }
+
+        let service = appUpdateService
+        let currentVersion = appVersion
+        Task { [weak self] in
+            do {
+                let update = try await service.checkForUpdate(currentVersion: currentVersion)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.isCheckingForUpdates = false
+                    self.availableUpdate = update
+                    if let update {
+                        self.updateStatus = "Version \(update.version) is available: \(update.assetName) (\(update.assetSizeDisplay))"
+                    } else {
+                        self.updateStatus = "Contora \(currentVersion) is up to date"
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self else { return }
+                    self.isCheckingForUpdates = false
+                    if !silent {
+                        self.updateStatus = "Update check failed: \(error.localizedDescription)"
+                    }
+                }
+            }
+        }
+    }
+
+    func downloadAvailableUpdate() {
+        guard let update = availableUpdate, !isDownloadingUpdate else {
+            return
+        }
+
+        isDownloadingUpdate = true
+        downloadedUpdatePath = ""
+        updateStatus = "Downloading \(update.assetName)..."
+
+        let service = appUpdateService
+        Task { [weak self] in
+            do {
+                let destination = try await service.download(update: update)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.isDownloadingUpdate = false
+                    self.downloadedUpdatePath = destination.path
+                    self.updateStatus = "Downloaded \(update.assetName). Open it to install the update."
+                    NSWorkspace.shared.open(destination)
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self else { return }
+                    self.isDownloadingUpdate = false
+                    self.updateStatus = "Download failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func openDownloadedUpdate() {
+        guard !downloadedUpdatePath.isEmpty else {
+            updateStatus = "No downloaded update yet"
+            return
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: downloadedUpdatePath))
+    }
+
+    func openUpdateReleasePage() {
+        if let releaseURL = availableUpdate?.releaseURL {
+            NSWorkspace.shared.open(releaseURL)
+            return
+        }
         if let url = URL(string: "https://github.com/iamniketas/contora/releases") {
             NSWorkspace.shared.open(url)
         }
@@ -2191,12 +2267,13 @@ final class AppModel: ObservableObject {
 
             if !sessionEditorSegments.isEmpty {
                 transcriptText = sessionEditorSegments.map { segment in
-                    "[\(formatTranscriptTime(segment.startSeconds)) --> \(formatTranscriptTime(segment.endSeconds))] [\(segment.speakerName)]: \(segment.text.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    let speakerName = displayName(forSpeakerID: segment.speakerID, fallback: segment.speakerName)
+                    return "[\(formatTranscriptTime(segment.startSeconds)) --> \(formatTranscriptTime(segment.endSeconds))] [\(speakerName)]: \(segment.text.trimmingCharacters(in: .whitespacesAndNewlines))"
                 }.joined(separator: "\n")
 
-                let speakerMap = Dictionary(uniqueKeysWithValues: sessionEditorSegments.map { ($0.speakerID, $0.speakerName) })
-                speakers = speakerMap.keys.sorted().map { key in
-                    ContoraSession.Speaker(id: key, displayName: speakerMap[key] ?? key)
+                let speakerIDs = Set(sessionEditorSegments.map(\.speakerID)).sorted()
+                speakers = speakerIDs.map { key in
+                    ContoraSession.Speaker(id: key, displayName: displayName(forSpeakerID: key))
                 }
                 segments = sessionEditorSegments.map {
                     ContoraSession.Segment(
@@ -2256,12 +2333,117 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func updateSpeakerName(speakerID: String, newName: String) {
-        for index in sessionEditorSegments.indices where sessionEditorSegments[index].speakerID == speakerID {
-            sessionEditorSegments[index].speakerName = newName
+    func exportSelectedSessionOutlineMarkdown() {
+        guard let session = selectedSession else {
+            sessionEditorStatus = "No session selected"
+            return
         }
+
+        let markdown = buildOptimizedOutlineMarkdown(for: session)
+        guard !markdown.isEmpty else {
+            sessionEditorStatus = "Nothing to export"
+            return
+        }
+
+        do {
+            let exportURL = (artifactBaseURL(for: session.id, recordingURL: session.recordingURL)?
+                .appendingPathExtension("outline.md"))
+                ?? session.recordingURL.deletingPathExtension().appendingPathExtension("outline.md")
+            try markdown.write(to: exportURL, atomically: true, encoding: .utf8)
+
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(markdown, forType: .string)
+
+            lastOutlineExportPath = exportURL.path
+            sessionEditorStatus = "Outline Markdown exported and copied"
+            statusMessage = "Outline export ready"
+        } catch {
+            sessionEditorStatus = "Outline export failed: \(error.localizedDescription)"
+        }
+    }
+
+    func updateSpeakerName(speakerID: String, newName: String) {
+        sessionEditorSpeakerNames[speakerID] = newName
         sessionEditorHasUnsavedChanges = true
         sessionEditorStatus = "Unsaved changes"
+    }
+
+    func displayName(forSpeakerID speakerID: String, fallback: String? = nil) -> String {
+        let mapped = sessionEditorSpeakerNames[speakerID]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let mapped, !mapped.isEmpty {
+            return mapped
+        }
+        return fallback?.isEmpty == false ? fallback! : speakerID
+    }
+
+    private func buildOptimizedOutlineMarkdown(for session: ContoraSession) -> String {
+        let segments: [(speakerID: String, speakerName: String, text: String)]
+        if !sessionEditorSegments.isEmpty {
+            segments = sessionEditorSegments.map {
+                (
+                    speakerID: $0.speakerID,
+                    speakerName: displayName(forSpeakerID: $0.speakerID, fallback: $0.speakerName),
+                    text: $0.text
+                )
+            }
+        } else {
+            let parsed = TranscriptSegmentParser().parseSpeakersAndSegments(from: sessionEditorTranscriptDraft)
+            let parsedSpeakerNames = Dictionary(uniqueKeysWithValues: parsed.speakers.map { ($0.id, $0.displayName) })
+            segments = parsed.segments.map {
+                (
+                    speakerID: $0.speakerID,
+                    speakerName: parsedSpeakerNames[$0.speakerID] ?? $0.speakerID,
+                    text: $0.text
+                )
+            }
+        }
+
+        guard !segments.isEmpty else {
+            return normalizedParagraph(sessionEditorTranscriptDraft)
+        }
+
+        var output = ["## Transcript", ""]
+        var currentSpeaker: String?
+        var chunk = ""
+
+        func flushChunk() {
+            guard let currentSpeaker, !chunk.isEmpty else {
+                return
+            }
+            output.append("**\(currentSpeaker):** \(chunk)")
+            output.append("")
+            chunk = ""
+        }
+
+        for segment in segments {
+            let speaker = segment.speakerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? segment.speakerID
+                : segment.speakerName
+            let text = normalizedParagraph(segment.text)
+            guard !text.isEmpty else {
+                continue
+            }
+
+            if speaker != currentSpeaker {
+                flushChunk()
+                currentSpeaker = speaker
+            }
+
+            if !chunk.isEmpty {
+                chunk += " "
+            }
+            chunk += text
+        }
+
+        flushChunk()
+        return output.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func normalizedParagraph(_ text: String) -> String {
+        text.components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
     }
 
     func updateSegmentText(segmentID: String, newText: String) {
@@ -2277,6 +2459,7 @@ final class AppModel: ObservableObject {
         guard let session = selectedSession else {
             sessionEditorTranscriptDraft = ""
             sessionEditorSegments = []
+            sessionEditorSpeakerNames = [:]
             sessionEditorStatus = "No session selected"
             sessionEditorHasUnsavedChanges = false
             return
@@ -2290,6 +2473,7 @@ final class AppModel: ObservableObject {
         }
 
         let speakerNameMap = Dictionary(uniqueKeysWithValues: session.speakers.map { ($0.id, $0.displayName) })
+        sessionEditorSpeakerNames = speakerNameMap
         sessionEditorSegments = session.segments.map {
             EditableSessionSegment(
                 id: $0.id,
@@ -2701,7 +2885,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func transcribeWithSelectedBackend(samples16k: [Float]) async throws -> String {
+    private func transcribeWithSelectedBackend(
+        samples16k: [Float],
+        onProgress: @escaping @Sendable (FasterWhisperProcessProgress) -> Void = { _ in }
+    ) async throws -> String {
         switch transcriptionBackend {
         case .whisperHTTP:
             guard let endpointURL = URL(string: transcriptionEndpoint) else {
@@ -2729,22 +2916,32 @@ final class AppModel: ObservableObject {
             let language = transcriptionLanguage
             let enableDiarization = fasterWhisperDiarizationEnabled
             let wavData = WAVEncoder.makeWAVData(samples: samples16k, sampleRate: 16_000)
-            return try await Task.detached(priority: .userInitiated) {
-                let workDirectory = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("contora-faster-whisper-\(UUID().uuidString)", isDirectory: true)
-                try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
-                defer { try? FileManager.default.removeItem(at: workDirectory) }
+            let cancellationFlag = FasterWhisperCancellationFlag()
+            return try await withTaskCancellationHandler {
+                try await Task.detached(priority: .userInitiated) {
+                    let workDirectory = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("contora-faster-whisper-\(UUID().uuidString)", isDirectory: true)
+                    try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
+                    defer { try? FileManager.default.removeItem(at: workDirectory) }
 
-                let audioURL = workDirectory.appendingPathComponent("audio.wav")
-                try wavData.write(to: audioURL, options: .atomic)
+                    let audioURL = workDirectory.appendingPathComponent("audio.wav")
+                    try wavData.write(to: audioURL, options: .atomic)
 
-                let service = FasterWhisperProcessTranscriptionService(
-                    modelName: modelName,
-                    language: language,
-                    enableDiarization: enableDiarization
-                )
-                return try service.transcribe(audioFileURL: audioURL, outputDirectory: workDirectory)
-            }.value
+                    let service = FasterWhisperProcessTranscriptionService(
+                        modelName: modelName,
+                        language: language,
+                        enableDiarization: enableDiarization
+                    )
+                    return try service.transcribe(
+                        audioFileURL: audioURL,
+                        outputDirectory: workDirectory,
+                        onProgress: onProgress,
+                        isCancelled: { cancellationFlag.isCancelled() }
+                    )
+                }.value
+            } onCancel: {
+                cancellationFlag.cancel()
+            }
         }
     }
 
@@ -2859,7 +3056,18 @@ final class AppModel: ObservableObject {
             startTranscriptionTicker(from: transcribeStartedAt, jobID: jobID, statusText: "Transcribing")
 
             do {
-                let text = try await transcribeWithSelectedBackend(samples16k: result.samples16kMono)
+                let text = try await transcribeWithSelectedBackend(
+                    samples16k: result.samples16kMono,
+                    onProgress: { [weak self] progress in
+                        Task { @MainActor in
+                            self?.applyFasterWhisperProgress(
+                                progress,
+                                jobID: jobID,
+                                startedAt: transcribeStartedAt
+                            )
+                        }
+                    }
+                )
                 try Task.checkCancellation()
                 transcriptionTickerTask?.cancel()
                 transcriptionTickerTask = nil
@@ -2988,6 +3196,32 @@ final class AppModel: ObservableObject {
             return
         }
         update(&transcriptionJobs[index])
+    }
+
+    private func applyFasterWhisperProgress(
+        _ progress: FasterWhisperProcessProgress,
+        jobID: UUID,
+        startedAt: Date
+    ) {
+        guard activeTranscriptionJobID == jobID else { return }
+        let elapsed = max(0, Date().timeIntervalSince(startedAt))
+        updateTranscriptionJob(jobID) { job in
+            job.progress = progress.fraction
+            job.statusText = progress.message
+
+            if progress.phase == "transcribing",
+               let current = progress.currentSeconds,
+               let total = progress.totalSeconds,
+               current > 0,
+               total > current,
+               elapsed > 0 {
+                let audioPerWallSecond = current / elapsed
+                job.speedRatio = audioPerWallSecond
+                job.remainingSeconds = audioPerWallSecond > 0 ? (total - current) / audioPerWallSecond : nil
+            } else {
+                job.remainingSeconds = nil
+            }
+        }
     }
 
     private func mix16kMono(_ lhs: [Float], _ rhs: [Float]) -> [Float] {
@@ -3229,10 +3463,9 @@ final class AppModel: ObservableObject {
                 self.transcriptionElapsedSeconds = elapsed
                 self.updateTranscriptionJob(jobID) { job in
                     job.elapsedSeconds = elapsed
-                    job.progress = nil
-                    job.remainingSeconds = nil
-                    job.speedRatio = nil
-                    job.statusText = statusText
+                    if job.progress == nil {
+                        job.statusText = statusText
+                    }
                 }
                 try? await Task.sleep(for: .milliseconds(200))
             }
@@ -3293,6 +3526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sourceSystemItem: NSMenuItem?
     private var sourceMixedItem: NSMenuItem?
     private var launchAtLoginItem: NSMenuItem?
+    private var checkForUpdatesItem: NSMenuItem?
     private var chunk3Item: NSMenuItem?
     private var chunk8Item: NSMenuItem?
     private var chunk15Item: NSMenuItem?
@@ -3304,6 +3538,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildStatusItem()
         bindState()
         model.permissions.refresh()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model.cancelActiveTranscription()
     }
 
     private func buildStatusItem() {
@@ -3325,6 +3563,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
+
+        let updatesItem = NSMenuItem(title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: "")
+        updatesItem.target = self
+        menu.addItem(updatesItem)
 
         let openRecordingsItem = NSMenuItem(title: "Open Recordings Folder", action: #selector(openRecordingsFolder), keyEquivalent: "")
         openRecordingsItem.target = self
@@ -3378,6 +3620,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.sourceSystemItem = sourceSystem
         self.sourceMixedItem = sourceMixed
         self.launchAtLoginItem = launchAtLogin
+        self.checkForUpdatesItem = updatesItem
         self.statusItem = item
         self.statusItem?.menu = menu
 
@@ -3409,6 +3652,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.$captureSourceMode
             .sink { [weak self] _ in self?.refreshMenuState() }
             .store(in: &cancellables)
+        model.$isCheckingForUpdates
+            .sink { [weak self] _ in self?.refreshMenuState() }
+            .store(in: &cancellables)
+        model.$isDownloadingUpdate
+            .sink { [weak self] _ in self?.refreshMenuState() }
+            .store(in: &cancellables)
     }
 
     private func refreshMenuState() {
@@ -3419,6 +3668,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sourceSystemItem?.state = model.captureSourceMode == .systemAudio ? .on : .off
         sourceMixedItem?.state = model.captureSourceMode == .mixed ? .on : .off
         launchAtLoginItem?.state = model.launchAtLogin ? .on : .off
+        checkForUpdatesItem?.isEnabled = !model.isCheckingForUpdates && !model.isDownloadingUpdate
         let isProcessing = model.isFinalizingStop || model.isTranscribing || model.isStreamingChunkTranscribing
         statusItem?.button?.image = statusIconImage(isRecording: model.isRecording, isProcessing: isProcessing)
 
@@ -3477,6 +3727,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         openContoraSettingsWindow()
+    }
+
+    @objc private func checkForUpdates() {
+        openContoraSettingsWindow()
+        model.checkForUpdates()
     }
 
     @objc private func openRecordingsFolder() {
@@ -3919,14 +4174,25 @@ struct TranscriptionProgressPanel: View {
             }
 
             if let activeJob = model.activeTranscriptionJob {
-                ProgressView()
-                    .controlSize(.small)
+                if let progress = activeJob.progress {
+                    ProgressView(value: progress, total: 1)
+                        .controlSize(.small)
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                }
 
                 WorkspaceMetricRow(label: "Active", value: activeJob.sessionTitle)
                 WorkspaceMetricRow(label: "Status", value: activeJob.statusText)
                 WorkspaceMetricRow(label: "Audio length", value: activeJob.audioSeconds > 0 ? formatDuration(activeJob.audioSeconds) : "Detecting during preparation")
                 WorkspaceMetricRow(label: "Elapsed", value: formatDuration(activeJob.elapsedSeconds))
-                WorkspaceMetricRow(label: "Progress", value: "Waiting for backend progress events")
+                WorkspaceMetricRow(
+                    label: "Progress",
+                    value: activeJob.progress.map { "\(Int(($0 * 100).rounded()))%" } ?? "Starting backend"
+                )
+                if let remaining = activeJob.remainingSeconds {
+                    WorkspaceMetricRow(label: "Estimated remaining", value: formatDuration(remaining))
+                }
 
                 Button(role: .destructive) {
                     model.cancelActiveTranscription()
@@ -4063,6 +4329,7 @@ struct BackendWorkspacePanel: View {
             }
 
             Picker("Engine", selection: backendBinding) {
+                Text("MLX").tag(TranscriptionBackend.mlxOpenAIHTTP)
                 Text("Local Whisper").tag(TranscriptionBackend.fasterWhisperProcess)
             }
             .labelsHidden()
@@ -4077,11 +4344,13 @@ struct BackendWorkspacePanel: View {
                 .disabled(model.isLocalWhisperBusy)
             }
 
-            localWhisperControls
-        }
-        .onAppear {
-            if model.transcriptionBackend != .fasterWhisperProcess {
-                model.selectTranscriptionBackend(.fasterWhisperProcess)
+            switch model.transcriptionBackend {
+            case .mlxOpenAIHTTP:
+                mlxControls
+            case .fasterWhisperProcess:
+                localWhisperControls
+            case .whisperHTTP:
+                WorkspaceMetricRow(label: "Endpoint", value: model.transcriptionEndpoint)
             }
         }
     }
@@ -4105,6 +4374,76 @@ struct BackendWorkspacePanel: View {
             get: { model.fasterWhisperDiarizationEnabled },
             set: { model.updateFasterWhisperDiarization($0) }
         )
+    }
+
+    private var mlxModelBinding: Binding<String> {
+        Binding(
+            get: { model.mlxModelID },
+            set: { model.updateMLXModelID($0) }
+        )
+    }
+
+    private var mlxModelOptions: [SharedModelCatalogEntry] {
+        var seen = Set<String>()
+        return model.sharedModelCatalogEntries
+            .filter { $0.provider == .mlxAudio }
+            .filter { entry in
+                entry.modelID != "toolkit" && entry.modelID != "shared-root"
+            }
+            .filter { entry in
+                let resolved = resolvedMLXModelID(entry)
+                guard !resolved.isEmpty, seen.insert(resolved).inserted else {
+                    return false
+                }
+                return true
+            }
+            .sorted { lhs, rhs in
+                if lhs.source == rhs.source {
+                    return lhs.modelID < rhs.modelID
+                }
+                return lhs.source == "shared"
+            }
+    }
+
+    private func resolvedMLXModelID(_ entry: SharedModelCatalogEntry) -> String {
+        if entry.modelID == "whisper-large-v3-turbo-asr-fp16" {
+            return "mlx-community/whisper-large-v3-turbo-asr-fp16"
+        }
+        return entry.modelID
+    }
+
+    @ViewBuilder
+    private var mlxControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("MLX model", selection: mlxModelBinding) {
+                ForEach(mlxModelOptions) { entry in
+                    Text("\(entry.modelID) · \(entry.source)").tag(resolvedMLXModelID(entry))
+                }
+                if !mlxModelOptions.contains(where: { resolvedMLXModelID($0) == model.mlxModelID }) {
+                    Text("\(model.mlxModelID) · configured").tag(model.mlxModelID)
+                }
+            }
+            .disabled(model.isRecording || model.isTranscriptionBusy)
+
+            WorkspaceMetricRow(label: "Engine", value: "MLX + pyannote")
+            WorkspaceMetricRow(label: "Endpoint", value: model.mlxTranscriptionEndpoint)
+            WorkspaceMetricRow(label: "Model", value: model.mlxModelID)
+            WorkspaceMetricRow(label: "Probe", value: model.backendProbeStatus)
+
+            HStack(spacing: 8) {
+                Button {
+                    model.startSharedMLXToolkitServer()
+                } label: {
+                    Label("Start MLX", systemImage: "play.fill")
+                }
+
+                Button {
+                    model.checkSharedMLXToolkitServer()
+                } label: {
+                    Label("Check MLX", systemImage: "stethoscope")
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -4146,6 +4485,12 @@ struct BackendWorkspacePanel: View {
                     model.openFasterWhisperRuntimeFolder()
                 } label: {
                     Label("Runtime Folder", systemImage: "folder")
+                }
+
+                Button {
+                    model.openFasterWhisperLogsFolder()
+                } label: {
+                    Label("Logs", systemImage: "doc.text.magnifyingglass")
                 }
 
                 Menu {
@@ -4342,6 +4687,11 @@ struct SessionDetailView: View {
                         }
                         .disabled(!model.sessionEditorHasUnsavedChanges)
 
+                        Button("Export Outline") {
+                            model.exportSelectedSessionOutlineMarkdown()
+                        }
+                        .disabled(model.sessionEditorSegments.isEmpty && model.sessionEditorTranscriptDraft.isEmpty)
+
                         if model.sessionEditorHasUnsavedChanges {
                             Text("Unsaved")
                                 .font(.caption.weight(.semibold))
@@ -4355,6 +4705,14 @@ struct SessionDetailView: View {
                 Text(model.sessionEditorStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if !model.lastOutlineExportPath.isEmpty {
+                    Text(model.lastOutlineExportPath)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
 
                 Divider()
 
@@ -4380,7 +4738,7 @@ struct SessionDetailView: View {
                 }
 
                 if !model.sessionEditorSegments.isEmpty {
-                    VStack(alignment: .leading, spacing: 12) {
+                    LazyVStack(alignment: .leading, spacing: 12) {
                         Text("Segments")
                             .font(.headline)
                         ForEach($model.sessionEditorSegments) { $segment in
@@ -4413,7 +4771,7 @@ struct SessionDetailView: View {
         var result: [(id: String, name: String)] = []
         for segment in model.sessionEditorSegments {
             if seen.insert(segment.speakerID).inserted {
-                result.append((segment.speakerID, segment.speakerName))
+                result.append((segment.speakerID, model.displayName(forSpeakerID: segment.speakerID, fallback: segment.speakerName)))
             }
         }
         return result.sorted { $0.id < $1.id }
@@ -4424,6 +4782,7 @@ struct SegmentReviewRowView: View {
     @ObservedObject var model: AppModel
     let session: ContoraSession
     @Binding var segment: EditableSessionSegment
+    @State private var isEditingText = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -4446,22 +4805,42 @@ struct SegmentReviewRowView: View {
                     .frame(width: 86, alignment: .leading)
 
                 TextField("Speaker", text: Binding(
-                    get: { segment.speakerName },
+                    get: { model.displayName(forSpeakerID: segment.speakerID, fallback: segment.speakerName) },
                     set: { model.updateSpeakerName(speakerID: segment.speakerID, newName: $0) }
                 ))
                 .textFieldStyle(.roundedBorder)
+
+                Button {
+                    isEditingText.toggle()
+                } label: {
+                    Image(systemName: isEditingText ? "checkmark.circle" : "square.and.pencil")
+                }
+                .buttonStyle(.borderless)
+                .help(isEditingText ? "Finish editing text" : "Edit segment text")
             }
 
-            TextEditor(text: Binding(
-                get: { segment.text },
-                set: { model.updateSegmentText(segmentID: segment.id, newText: $0) }
-            ))
-                .font(.body)
-                .frame(minHeight: 72)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.secondary.opacity(0.15))
-                )
+            if isEditingText {
+                TextEditor(text: Binding(
+                    get: { segment.text },
+                    set: { model.updateSegmentText(segmentID: segment.id, newText: $0) }
+                ))
+                    .font(.body)
+                    .frame(minHeight: 72)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Color.secondary.opacity(0.15))
+                    )
+            } else {
+                Text(segment.text.isEmpty ? " " : segment.text)
+                    .font(.body)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .topLeading)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        isEditingText = true
+                    }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
@@ -4611,6 +4990,54 @@ struct SettingsView: View {
                 Text("Backend probe: \(model.backendProbeStatus)")
                 Spacer()
                 Button("Check") { model.probeSharedBackend() }
+            }
+
+            Section("Updates") {
+                HStack {
+                    Text("Installed version")
+                    Spacer()
+                    Text(model.appVersion)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                HStack {
+                    Text("Status")
+                    Spacer()
+                    Text(model.updateStatus)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let update = model.availableUpdate {
+                    HStack {
+                        Text("Available")
+                        Spacer()
+                        Text("\(update.version) · \(update.assetName) · \(update.assetSizeDisplay)")
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                if !model.downloadedUpdatePath.isEmpty {
+                    diagnosticPathRow("Downloaded update", model.downloadedUpdatePath)
+                }
+
+                HStack {
+                    Button("Check for Updates") { model.checkForUpdates() }
+                        .disabled(model.isCheckingForUpdates || model.isDownloadingUpdate)
+                    Button("Download Update") { model.downloadAvailableUpdate() }
+                        .disabled(model.availableUpdate == nil || model.isCheckingForUpdates || model.isDownloadingUpdate)
+                    Button("Open Download") { model.openDownloadedUpdate() }
+                        .disabled(model.downloadedUpdatePath.isEmpty || model.isDownloadingUpdate)
+                    Button("Release Page") { model.openUpdateReleasePage() }
+                    if model.isCheckingForUpdates || model.isDownloadingUpdate {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
             }
 
             Section("Diagnostics") {

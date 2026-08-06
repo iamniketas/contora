@@ -47,6 +47,15 @@ enum SharedRuntimePaths {
             .appendingPathComponent("contora_fw_transcribe.py")
     }
 
+    static func whisperLogsDirectory() -> URL {
+        if let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first {
+            return logs.appendingPathComponent("Logs/Contora", isDirectory: true)
+        }
+
+        return URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Logs/Contora", isDirectory: true)
+    }
+
     static func modelsDirectory() -> URL {
         whisperRoot().appendingPathComponent("_models", isDirectory: true)
     }

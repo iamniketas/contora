@@ -228,7 +228,45 @@ final class FasterWhisperRuntimeInstaller {
             }
             try fileManager.copyItem(at: source, to: destination)
         }
+        repairBundledPythonInstallNames(in: targetRoot)
         try makeWritable(targetRoot)
+    }
+
+    private func repairBundledPythonInstallNames(in root: URL) {
+        let version = "3.12"
+        let frameworkRoot = root.appendingPathComponent("python/Python.framework/Versions/\(version)", isDirectory: true)
+        let frameworkLib = frameworkRoot.appendingPathComponent("Python")
+        let absoluteReference = "/Library/Frameworks/Python.framework/Versions/\(version)/Python"
+        let repairs: [(URL, String)] = [
+            (frameworkRoot.appendingPathComponent("bin/python\(version)"), "@executable_path/../Python"),
+            (frameworkRoot.appendingPathComponent("Resources/Python.app/Contents/MacOS/Python"), "@executable_path/../../../../Python")
+        ]
+
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/xcrun") else {
+            return
+        }
+
+        for (binary, relativeReference) in repairs where FileManager.default.isExecutableFile(atPath: binary.path) {
+            try? run(URL(fileURLWithPath: "/usr/bin/xcrun"), arguments: [
+                "install_name_tool",
+                "-change",
+                absoluteReference,
+                relativeReference,
+                binary.path
+            ])
+            try? adHocSign(binary)
+        }
+
+        if FileManager.default.fileExists(atPath: frameworkLib.path) {
+            try? adHocSign(frameworkLib)
+        }
+    }
+
+    private func adHocSign(_ url: URL) throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/codesign") else {
+            return
+        }
+        try run(URL(fileURLWithPath: "/usr/bin/codesign"), arguments: ["--force", "--sign", "-", url.path])
     }
 
     func resetRuntime(preservingModels: Bool) throws {
@@ -421,6 +459,20 @@ final class FasterWhisperRuntimeInstaller {
     }
 
     private func writeTranscribeScript() throws {
+        let packageBundleName = "ContoraMac_ContoraMac.bundle"
+        let executableDirectory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        let bundledCandidates = [
+            Bundle.main.resourceURL?.appendingPathComponent("\(packageBundleName)/Resources/contora_fw_transcribe.py"),
+            Bundle.main.bundleURL.appendingPathComponent("\(packageBundleName)/Resources/contora_fw_transcribe.py"),
+            executableDirectory.appendingPathComponent("\(packageBundleName)/Resources/contora_fw_transcribe.py"),
+        ].compactMap { $0 }
+        if let bundled = bundledCandidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+            let url = SharedRuntimePaths.whisperTranscribeScript()
+            try Data(contentsOf: bundled).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            return
+        }
+
         let script = #"""
         #!/usr/bin/env python3
         import argparse

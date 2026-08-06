@@ -155,26 +155,45 @@ extension SystemAudioCaptureService: SCStreamOutput {
             return
         }
 
-        var audioBufferList = AudioBufferList(
-            mNumberBuffers: 0,
-            mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil)
-        )
         var blockBuffer: CMBlockBuffer?
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        var bufferListSize = 0
+        let sizeStatus = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             sampleBuffer,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            bufferListSizeNeededOut: &bufferListSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
             blockBufferAllocator: nil,
             blockBufferMemoryAllocator: nil,
             flags: 0,
             blockBufferOut: &blockBuffer
         )
-        guard status == noErr else {
+        guard sizeStatus == noErr, bufferListSize >= MemoryLayout<AudioBufferList>.size else {
             return
         }
 
-        let monoSamples = extractMonoSamples(from: audioBufferList, frames: frames, asbd: asbd.pointee)
+        var bufferListStorage = [UInt8](repeating: 0, count: bufferListSize)
+        let monoSamples: [Float] = bufferListStorage.withUnsafeMutableBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                return []
+            }
+
+            let audioBufferList = baseAddress.assumingMemoryBound(to: AudioBufferList.self)
+            let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+                sampleBuffer,
+                bufferListSizeNeededOut: nil,
+                bufferListOut: audioBufferList,
+                bufferListSize: bufferListSize,
+                blockBufferAllocator: nil,
+                blockBufferMemoryAllocator: nil,
+                flags: 0,
+                blockBufferOut: &blockBuffer
+            )
+            guard status == noErr else {
+                return []
+            }
+
+            return extractMonoSamples(from: audioBufferList, frames: frames, asbd: asbd.pointee)
+        }
         guard !monoSamples.isEmpty else {
             return
         }
@@ -191,8 +210,11 @@ extension SystemAudioCaptureService: SCStreamOutput {
         }
     }
 
-    private func extractMonoSamples(from audioBufferList: AudioBufferList, frames: Int, asbd: AudioStreamBasicDescription) -> [Float] {
-        let channels = Int(max(1, asbd.mChannelsPerFrame))
+    private func extractMonoSamples(
+        from audioBufferList: UnsafeMutablePointer<AudioBufferList>,
+        frames: Int,
+        asbd: AudioStreamBasicDescription
+    ) -> [Float] {
         var mono = [Float](repeating: 0, count: frames)
         let format = asbd.mFormatID
 
@@ -203,40 +225,68 @@ extension SystemAudioCaptureService: SCStreamOutput {
         let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
         let isSignedInteger = (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0
         let bitsPerChannel = Int(asbd.mBitsPerChannel)
+        let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+        guard !buffers.isEmpty else {
+            return []
+        }
 
-        var list = audioBufferList
-        withUnsafeMutablePointer(to: &list) { ptr in
-            let buffers = UnsafeMutableAudioBufferListPointer(ptr)
-            guard let first = buffers.first, let rawData = first.mData else {
-                return
+        var channelContributions = 0
+        for buffer in buffers {
+            guard let rawData = buffer.mData else {
+                continue
             }
 
+            let channelsInBuffer = Int(max(1, buffer.mNumberChannels))
+            let sampleCount = frames * channelsInBuffer
+
             if isFloat && bitsPerChannel == 32 {
-                let data = rawData.bindMemory(to: Float.self, capacity: frames * channels)
+                let data = rawData.bindMemory(to: Float.self, capacity: sampleCount)
                 for frame in 0..<frames {
                     var sum: Float = 0
-                    for channel in 0..<channels {
-                        sum += data[frame * channels + channel]
+                    for channel in 0..<channelsInBuffer {
+                        sum += data[frame * channelsInBuffer + channel]
                     }
-                    mono[frame] = sum / Float(channels)
+                    mono[frame] += sum
                 }
-                return
+                channelContributions += channelsInBuffer
+                continue
             }
 
             if isSignedInteger && bitsPerChannel == 16 {
-                let data = rawData.bindMemory(to: Int16.self, capacity: frames * channels)
+                let data = rawData.bindMemory(to: Int16.self, capacity: sampleCount)
                 for frame in 0..<frames {
                     var sum: Float = 0
-                    for channel in 0..<channels {
-                        let value = Float(data[frame * channels + channel]) / 32768.0
-                        sum += value
+                    for channel in 0..<channelsInBuffer {
+                        sum += Float(data[frame * channelsInBuffer + channel]) / 32768.0
                     }
-                    mono[frame] = sum / Float(channels)
+                    mono[frame] += sum
                 }
-                return
+                channelContributions += channelsInBuffer
+                continue
+            }
+
+            if isSignedInteger && bitsPerChannel == 32 {
+                let data = rawData.bindMemory(to: Int32.self, capacity: sampleCount)
+                for frame in 0..<frames {
+                    var sum: Float = 0
+                    for channel in 0..<channelsInBuffer {
+                        sum += Float(data[frame * channelsInBuffer + channel]) / 2_147_483_648.0
+                    }
+                    mono[frame] += sum
+                }
+                channelContributions += channelsInBuffer
+                continue
             }
         }
 
-        return []
+        guard channelContributions > 0 else {
+            return []
+        }
+
+        let divisor = Float(channelContributions)
+        for index in mono.indices {
+            mono[index] /= divisor
+        }
+        return mono
     }
 }

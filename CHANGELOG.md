@@ -7,6 +7,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.6.2] - 2026-07-17
 
+### macOS
+- **In-app updates**: the latest release now includes an Apple Silicon DMG/ZIP that the native macOS client can discover and download from GitHub Releases.
+- **Live Local Whisper progress**: model loading, speech transcription, diarization, formatting, completion percentage, elapsed time, and ETA are shown in the workspace.
+- **Reliable transcript delivery**: Contora continuously drains the Python backend output, preventing the full-pipe deadlock that could leave a completed transcript stuck outside the app.
+- **Safe cancellation and diagnostics**: stopping transcription or quitting Contora terminates its Python process; per-run logs are available under `~/Library/Logs/Contora`.
+- **Slim application updates**: the macOS DMG no longer embeds the 483 MB Whisper runtime. Existing runtimes and models are preserved; clean installs download the runtime once through `Set Up Local Whisper`.
+
 ### Fixed
 - **Community-1 GPU diarization**: the isolated pyannote runtime now installs the CUDA PyTorch build for NVIDIA GPUs and verifies CUDA before use. Community-1 receives Contora's persistent Hugging Face token and loads WAV audio in memory, avoiding the incompatible Windows TorchCodec/FFmpeg path.
 - **Reliable diarization startup**: the Community-1 model is preloaded before transcription rather than stalling at the final "Detecting speakers" stage.

@@ -11,15 +11,31 @@ VERSION="${CONTORA_VERSION:-$(git -C "$REPO_ROOT" describe --tags --always --dir
 ARCH="$(uname -m)"
 BUILD_ROOT="${CONTORA_MACOS_BUILD_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/contora-macos-pilot.XXXXXX")}"
 PUBLISH_APP_DIR="$ARTIFACT_ROOT/$APP_NAME.app"
+CODE_SIGN_IDENTITY="${CONTORA_MACOS_SIGN_IDENTITY:--}"
+CREATE_DMG="${CONTORA_MACOS_CREATE_DMG:-1}"
+NOTARIZE="${CONTORA_MACOS_NOTARIZE:-0}"
+NOTARY_PROFILE="${CONTORA_MACOS_NOTARY_PROFILE:-}"
+BUNDLE_SHORT_VERSION="${CONTORA_MACOS_BUNDLE_SHORT_VERSION:-$(printf '%s' "$VERSION" | sed -E 's/^([0-9]+(\.[0-9]+){0,2}).*/\1/')}"
+BUNDLE_BUILD_VERSION="${CONTORA_MACOS_BUNDLE_VERSION:-$(printf '%s' "$VERSION" | tr -cs '[:alnum:].-' '.')}"
+SIGNING_LABEL="unsigned"
+if [[ "$CODE_SIGN_IDENTITY" != "-" ]]; then
+  SIGNING_LABEL="signed"
+fi
+if [[ -z "$BUNDLE_SHORT_VERSION" || ! "$BUNDLE_SHORT_VERSION" =~ ^[0-9]+([.][0-9]+){0,2}$ ]]; then
+  BUNDLE_SHORT_VERSION="0.0.0"
+fi
+if [[ -z "$BUNDLE_BUILD_VERSION" ]]; then
+  BUNDLE_BUILD_VERSION="$BUNDLE_SHORT_VERSION"
+fi
 
 APP_DIR="$BUILD_ROOT/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_CONTENTS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 STAGING_DIR="$BUILD_ROOT/staging"
-ZIP_PATH="$ARTIFACT_ROOT/${APP_NAME}-macOS-${VERSION}-${ARCH}-unsigned.zip"
-DMG_PATH="$ARTIFACT_ROOT/${APP_NAME}-macOS-${VERSION}-${ARCH}-unsigned.dmg"
-DMG_RW_PATH="$BUILD_ROOT/${APP_NAME}-macOS-${VERSION}-${ARCH}-unsigned-rw.dmg"
+ZIP_PATH="$ARTIFACT_ROOT/${APP_NAME}-macOS-${VERSION}-${ARCH}-${SIGNING_LABEL}.zip"
+DMG_PATH="$ARTIFACT_ROOT/${APP_NAME}-macOS-${VERSION}-${ARCH}-${SIGNING_LABEL}.dmg"
+DMG_RW_PATH="$BUILD_ROOT/${APP_NAME}-macOS-${VERSION}-${ARCH}-${SIGNING_LABEL}-rw.dmg"
 DMG_MOUNT_DIR="$BUILD_ROOT/dmg-mount"
 
 rm -rf "$BUILD_ROOT" "$PUBLISH_APP_DIR" "$ZIP_PATH" "$DMG_PATH" "$DMG_RW_PATH" "$DMG_MOUNT_DIR"
@@ -29,6 +45,20 @@ clear_extended_attributes() {
   local path="$1"
   xattr -cr "$path" 2>/dev/null || true
   find "$path" -exec xattr -c {} \; 2>/dev/null || true
+}
+
+sign_app() {
+  local app_path="$1"
+  if ! command -v codesign >/dev/null 2>&1; then
+    return
+  fi
+
+  clear_extended_attributes "$app_path"
+  local args=(--force --deep --sign "$CODE_SIGN_IDENTITY")
+  if [[ "$CODE_SIGN_IDENTITY" != "-" ]]; then
+    args+=(--options runtime --timestamp)
+  fi
+  codesign "${args[@]}" "$app_path"
 }
 
 swift build -c release --package-path "$MACOS_DIR"
@@ -41,7 +71,8 @@ if [[ -d "$BIN_PATH/ContoraMac_ContoraMac.bundle" ]]; then
 fi
 
 RUNTIME_ARCHIVE="${CONTORA_MACOS_WHISPER_RUNTIME_ARCHIVE:-}"
-if [[ -z "$RUNTIME_ARCHIVE" ]]; then
+BUNDLE_WHISPER_RUNTIME="${CONTORA_MACOS_BUNDLE_WHISPER_RUNTIME:-0}"
+if [[ -z "$RUNTIME_ARCHIVE" && "$BUNDLE_WHISPER_RUNTIME" == "1" ]]; then
   CANDIDATE="$REPO_ROOT/artifacts/macos-whisper-runtime/dist/ContoraMacWhisperRuntime-${ARCH}.tar.gz"
   if [[ -f "$CANDIDATE" ]]; then
     RUNTIME_ARCHIVE="$CANDIDATE"
@@ -90,9 +121,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>$VERSION</string>
+  <string>$BUNDLE_SHORT_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>$VERSION</string>
+  <string>$BUNDLE_BUILD_VERSION</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.productivity</string>
   <key>LSMinimumSystemVersion</key>
@@ -107,10 +138,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
-if command -v codesign >/dev/null 2>&1; then
-  clear_extended_attributes "$APP_DIR"
-  codesign --force --deep --sign - "$APP_DIR"
-fi
+sign_app "$APP_DIR"
 
 ditto --noextattr --norsrc "$APP_DIR" "$STAGING_DIR/$APP_NAME.app"
 ln -s /Applications "$STAGING_DIR/Applications"
@@ -118,7 +146,7 @@ cat > "$STAGING_DIR/OPEN_ME_FIRST.txt" <<README
 Contora macOS Pilot
 ===================
 
-This pilot build is not signed with an Apple Developer ID.
+Build: ${VERSION} (${ARCH}, ${SIGNING_LABEL})
 
 First launch:
 1. Move Contora.app to Applications.
@@ -137,9 +165,9 @@ README
 
 ditto --noextattr --norsrc -c -k --keepParent "$APP_DIR" "$ZIP_PATH"
 
-if [[ "${CONTORA_MACOS_CREATE_DMG:-0}" == "1" ]]; then
+if [[ "$CREATE_DMG" == "1" ]]; then
   mkdir -p "$DMG_MOUNT_DIR"
-  hdiutil create -quiet -size "${CONTORA_MACOS_DMG_SIZE:-1100m}" -fs APFS -volname "Contora Pilot" -type UDIF -ov "$DMG_RW_PATH"
+  hdiutil create -quiet -size "${CONTORA_MACOS_DMG_SIZE:-1100m}" -fs APFS -volname "Contora ${VERSION}" -type UDIF -ov "$DMG_RW_PATH"
   hdiutil attach "$DMG_RW_PATH" -mountpoint "$DMG_MOUNT_DIR" -nobrowse -quiet
   cleanup_dmg_mount() {
     hdiutil detach "$DMG_MOUNT_DIR" -quiet >/dev/null 2>&1 || true
@@ -152,7 +180,7 @@ if [[ "${CONTORA_MACOS_CREATE_DMG:-0}" == "1" ]]; then
 Contora macOS Pilot
 ===================
 
-This pilot build is not signed with an Apple Developer ID and is not notarized.
+Build: ${VERSION} (${ARCH}, ${SIGNING_LABEL})
 
 First launch:
 1. Drag Contora.app to Applications.
@@ -165,24 +193,36 @@ Local Whisper:
 - If setup fails, use Backend -> Repair Runtime.
 README
 
-  if command -v codesign >/dev/null 2>&1; then
-    clear_extended_attributes "$DMG_MOUNT_DIR/$APP_NAME.app"
-    codesign --force --deep --sign - "$DMG_MOUNT_DIR/$APP_NAME.app"
-    codesign --verify --deep --strict --verbose=2 "$DMG_MOUNT_DIR/$APP_NAME.app"
-  fi
+  sign_app "$DMG_MOUNT_DIR/$APP_NAME.app"
+  codesign --verify --deep --strict --verbose=2 "$DMG_MOUNT_DIR/$APP_NAME.app"
 
   hdiutil detach "$DMG_MOUNT_DIR" -quiet
   trap - EXIT
   hdiutil convert "$DMG_RW_PATH" -quiet -format UDZO -o "$DMG_PATH"
   rm -f "$DMG_RW_PATH"
+
+  if [[ "$CODE_SIGN_IDENTITY" != "-" ]]; then
+    codesign --force --sign "$CODE_SIGN_IDENTITY" "$DMG_PATH"
+  fi
+
+  if [[ "$NOTARIZE" == "1" ]]; then
+    if [[ -z "$NOTARY_PROFILE" ]]; then
+      echo "CONTORA_MACOS_NOTARY_PROFILE is required when CONTORA_MACOS_NOTARIZE=1" >&2
+      exit 1
+    fi
+    xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG_PATH"
+  fi
+
   hdiutil attach "$DMG_PATH" -mountpoint "$DMG_MOUNT_DIR" -nobrowse -quiet
   trap cleanup_dmg_mount EXIT
-  if command -v codesign >/dev/null 2>&1; then
-    codesign --verify --deep --strict --verbose=2 "$DMG_MOUNT_DIR/$APP_NAME.app"
-  fi
+  codesign --verify --deep --strict --verbose=2 "$DMG_MOUNT_DIR/$APP_NAME.app"
   hdiutil detach "$DMG_MOUNT_DIR" -quiet
   trap - EXIT
   rm -rf "$DMG_MOUNT_DIR"
+elif [[ "$NOTARIZE" == "1" ]]; then
+  echo "CONTORA_MACOS_CREATE_DMG=1 is required for notarized macOS releases" >&2
+  exit 1
 fi
 
 if [[ -f "$DMG_PATH" ]]; then

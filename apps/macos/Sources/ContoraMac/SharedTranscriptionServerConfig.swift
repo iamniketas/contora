@@ -48,7 +48,7 @@ struct SharedTranscriptionServerConfig: Codable {
     static func `default`() -> SharedTranscriptionServerConfig {
         SharedTranscriptionServerConfig(
             schemaVersion: "1.0",
-            activeBackend: .fasterWhisperProcess,
+            activeBackend: .mlxOpenAIHTTP,
             whisperTranscribeURL: "http://127.0.0.1:5500/transcribe",
             mlxTranscribeURL: "http://127.0.0.1:8010/v1/audio/transcriptions",
             mlxModelID: "mlx-community/whisper-large-v3-turbo-asr-fp16",
@@ -81,7 +81,7 @@ struct SharedTranscriptionServerConfig: Codable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try values.decodeIfPresent(String.self, forKey: .schemaVersion) ?? "1.0"
-        activeBackend = try values.decodeIfPresent(TranscriptionBackend.self, forKey: .activeBackend) ?? .fasterWhisperProcess
+        activeBackend = try values.decodeIfPresent(TranscriptionBackend.self, forKey: .activeBackend) ?? .mlxOpenAIHTTP
         whisperTranscribeURL = try values.decodeIfPresent(String.self, forKey: .whisperTranscribeURL) ?? "http://127.0.0.1:5500/transcribe"
         mlxTranscribeURL = try values.decodeIfPresent(String.self, forKey: .mlxTranscribeURL) ?? "http://127.0.0.1:8010/v1/audio/transcriptions"
         mlxModelID = try values.decodeIfPresent(String.self, forKey: .mlxModelID) ?? "mlx-community/whisper-large-v3-turbo-asr-fp16"
