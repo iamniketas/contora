@@ -5,6 +5,14 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.6] - 2026-08-22
+
+### macOS
+- **Live MLX transcription progress**: the workspace now shows model loading, ASR, speaker diarization, merge, percentage, elapsed time, and rolling ETA instead of remaining on `Starting backend` until completion.
+- **Persistent local job API**: MLX transcription uses create/status/result/cancel endpoints, with atomic `status.json` updates that remain inspectable alongside ASR, diarization, and result artifacts.
+- **Progress without accuracy loss**: ASR progress comes from Whisper's internal seek loop rather than independent external audio chunks; diarization progress comes from pyannote's native pipeline hook.
+- **Backend cancellation**: stopping an MLX transcription now sends an explicit cancellation request to the local job and preserves completed checkpoints.
+
 ## [0.6.5] - 2026-08-21
 
 ### macOS

@@ -6,6 +6,7 @@ struct ClientCrashSafetySmokeTest {
         try verifyLegacyManifestCompatibility()
         try verifyFailureArtifactPreservesTranscript()
         try verifyStructuredServerFailure()
+        try verifyMLXJobProgressStatus()
         print("Client crash-safety smoke test passed")
     }
 
@@ -101,6 +102,32 @@ struct ClientCrashSafetySmokeTest {
             throw SmokeTestError.structuredFailureInvalid
         }
     }
+
+    private static func verifyMLXJobProgressStatus() throws {
+        let data = Data(
+            """
+            {
+              "job_id": "job-progress",
+              "state": "diarizing",
+              "phase": "diarizing",
+              "message": "Detecting speakers · Embeddings",
+              "progress": 0.81,
+              "processed_seconds": 1200,
+              "total_seconds": 3600,
+              "elapsed_seconds": 180,
+              "eta_seconds": 42,
+              "error": null
+            }
+            """.utf8
+        )
+        let status = try JSONDecoder().decode(MLXJobStatusEnvelope.self, from: data)
+        guard status.jobID == "job-progress",
+              status.phase == "diarizing",
+              status.progress == 0.81,
+              status.etaSeconds == 42 else {
+            throw SmokeTestError.jobProgressInvalid
+        }
+    }
 }
 
 enum SmokeTestError: Error {
@@ -108,4 +135,5 @@ enum SmokeTestError: Error {
     case transcriptWasOverwritten
     case failureArtifactInvalid
     case structuredFailureInvalid
+    case jobProgressInvalid
 }

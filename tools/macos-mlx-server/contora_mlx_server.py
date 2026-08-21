@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
+import threading
 import time
 import uuid
+import wave
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import uvicorn
@@ -19,7 +24,6 @@ from result_safety import (
     ResponseValidationError,
     atomic_write_json,
     sanitize_finite_numbers,
-    strict_json_bytes,
     validate_transcription_response,
 )
 
@@ -44,6 +48,15 @@ RESULTS_ROOT = Path(
 app = FastAPI(title="Contora MLX transcription server")
 _models: dict[str, Any] = {}
 _diarization_pipeline = None
+_jobs: dict[str, dict[str, Any]] = {}
+_job_tasks: dict[str, asyncio.Task] = {}
+_job_cancellations: dict[str, threading.Event] = {}
+_jobs_lock = threading.Lock()
+_processing_lock = threading.Lock()
+
+
+class JobCancelledError(Exception):
+    pass
 
 
 def timestamp(seconds: float | None) -> str:
@@ -57,6 +70,138 @@ def timestamp(seconds: float | None) -> str:
     minutes = (whole % 3600) // 60
     secs = whole % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def audio_duration_seconds(audio_path: Path) -> float | None:
+    try:
+        with wave.open(str(audio_path), "rb") as handle:
+            frame_rate = handle.getframerate()
+            return handle.getnframes() / frame_rate if frame_rate > 0 else None
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
+def _job_snapshot(job_id: str) -> dict[str, Any] | None:
+    with _jobs_lock:
+        status = _jobs.get(job_id)
+        return dict(status) if status is not None else None
+
+
+def _store_job_status(job_id: str, **changes: Any) -> dict[str, Any]:
+    with _jobs_lock:
+        status = _jobs[job_id]
+        previous_progress = float(status.get("progress") or 0.0)
+        if "progress" in changes:
+            changes["progress"] = min(1.0, max(previous_progress, float(changes["progress"])))
+        status.update(sanitize_finite_numbers(changes))
+        status["updated_at"] = time.time()
+        snapshot = dict(status)
+    atomic_write_json(RESULTS_ROOT / job_id / "status.json", snapshot)
+    return snapshot
+
+
+def _initialize_job(job_id: str, total_seconds: float | None, *, diarize: bool) -> dict[str, Any]:
+    now = time.time()
+    status = {
+        "schema_version": "1.0",
+        "job_id": job_id,
+        "state": "queued",
+        "phase": "queued",
+        "message": "Queued",
+        "progress": 0.0,
+        "asr_progress": 0.0,
+        "diarization_progress": 0.0 if diarize else 1.0,
+        "processed_seconds": 0.0,
+        "total_seconds": total_seconds,
+        "elapsed_seconds": 0.0,
+        "eta_seconds": None,
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+    }
+    with _jobs_lock:
+        _jobs[job_id] = status
+    atomic_write_json(RESULTS_ROOT / job_id / "status.json", status)
+    return dict(status)
+
+
+def _estimated_remaining(started: float, progress: float) -> float | None:
+    elapsed = max(0.0, time.time() - started)
+    if progress < 0.03 or elapsed < 1.0:
+        return None
+    return max(0.0, elapsed * (1.0 - progress) / progress)
+
+
+def _update_progress(
+    job_id: str,
+    *,
+    started: float,
+    state: str,
+    phase: str,
+    message: str,
+    progress: float,
+    processed_seconds: float | None = None,
+    asr_progress: float | None = None,
+    diarization_progress: float | None = None,
+) -> None:
+    changes: dict[str, Any] = {
+        "state": state,
+        "phase": phase,
+        "message": message,
+        "progress": progress,
+        "elapsed_seconds": max(0.0, time.time() - started),
+        "eta_seconds": _estimated_remaining(started, progress),
+    }
+    if processed_seconds is not None:
+        changes["processed_seconds"] = processed_seconds
+    if asr_progress is not None:
+        changes["asr_progress"] = asr_progress
+    if diarization_progress is not None:
+        changes["diarization_progress"] = diarization_progress
+    _store_job_status(job_id, **changes)
+
+
+def _raise_if_cancelled(cancel_event: threading.Event) -> None:
+    if cancel_event.is_set():
+        raise JobCancelledError("Transcription cancelled")
+
+
+@contextmanager
+def mlx_progress_callback(callback: Callable[[float], None]):
+    """Observe Whisper's internal seek loop without splitting audio into external chunks."""
+    from mlx_audio.stt.models.whisper import whisper as whisper_module
+
+    original_tqdm = whisper_module.tqdm.tqdm
+
+    class CallbackProgressBar:
+        def __init__(self, *args, **kwargs):
+            self._inner = original_tqdm(*args, **kwargs)
+            self.total = float(kwargs.get("total") or getattr(self._inner, "total", 0.0) or 0.0)
+            self.completed = 0.0
+
+        def __enter__(self):
+            self._inner.__enter__()
+            callback(0.0)
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def update(self, amount=1):
+            self.completed = min(self.total, self.completed + float(amount or 0.0))
+            result = self._inner.update(amount)
+            if self.total > 0:
+                callback(self.completed / self.total)
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    whisper_module.tqdm.tqdm = CallbackProgressBar
+    try:
+        yield
+    finally:
+        whisper_module.tqdm.tqdm = original_tqdm
 
 
 def model_for(model_name: str):
@@ -132,8 +277,32 @@ def normalize_segments(value: Any) -> list[dict[str, Any]]:
     return segments
 
 
-def assign_speakers(audio_path: str, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    diarization = diarization_pipeline()(audio_path)
+def assign_speakers(
+    audio_path: str,
+    segments: list[dict[str, Any]],
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> list[dict[str, Any]]:
+    step_ranges = {
+        "segmentation": (0.0, 0.30),
+        "speaker_counting": (0.30, 0.35),
+        "embeddings": (0.35, 0.95),
+        "discrete_diarization": (0.95, 1.0),
+    }
+    observed_progress = 0.0
+
+    def hook(step_name, _artifact, file=None, total=None, completed=None):
+        nonlocal observed_progress
+        start, end = step_ranges.get(str(step_name), (observed_progress, min(1.0, observed_progress + 0.02)))
+        if total and completed is not None:
+            fraction = min(1.0, max(0.0, float(completed) / float(total)))
+            candidate = start + ((end - start) * fraction)
+        else:
+            candidate = end
+        observed_progress = max(observed_progress, candidate)
+        if progress_callback is not None:
+            progress_callback(observed_progress, str(step_name))
+
+    diarization = diarization_pipeline()(audio_path, hook=hook if progress_callback is not None else None)
     labelled: list[dict[str, Any]] = []
 
     for segment in segments:
@@ -167,7 +336,7 @@ def formatted_text(segments: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def failure_response(job_id: str, stage: str, exc: Exception, recoverable: bool) -> JSONResponse:
+def failure_payload(job_id: str, stage: str, exc: Exception, recoverable: bool) -> dict[str, Any]:
     error = {
         "schema_version": "1.0",
         "job_id": job_id,
@@ -184,7 +353,7 @@ def failure_response(job_id: str, stage: str, exc: Exception, recoverable: bool)
     except OSError:
         # Preserve the original structured error even if diagnostic storage is unavailable.
         pass
-    return JSONResponse(status_code=500, content=error)
+    return error
 
 
 @app.get("/health")
@@ -206,6 +375,293 @@ def models():
     return {"object": "list", "data": loaded}
 
 
+def _prepare_job(file: UploadFile, *, diarize: bool) -> tuple[str, Path]:
+    job_id = str(uuid.uuid4())
+    job_root = RESULTS_ROOT / job_id
+    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+    audio_path = job_root / f"input{suffix}"
+    job_root.mkdir(parents=True, exist_ok=False)
+    with audio_path.open("wb") as handle:
+        shutil.copyfileobj(file.file, handle)
+    _initialize_job(job_id, audio_duration_seconds(audio_path), diarize=diarize)
+    with _jobs_lock:
+        _job_cancellations[job_id] = threading.Event()
+    return job_id, audio_path
+
+
+def _run_transcription_job(
+    job_id: str,
+    audio_path: Path,
+    *,
+    model: str,
+    language: str | None,
+    diarize: bool,
+    chunk_duration: float,
+) -> None:
+    job_root = RESULTS_ROOT / job_id
+    with _jobs_lock:
+        cancel_event = _job_cancellations[job_id]
+    stage = "queued"
+
+    try:
+        with _processing_lock:
+            started = time.time()
+            _raise_if_cancelled(cancel_event)
+            _update_progress(
+                job_id,
+                started=started,
+                state="loading_models",
+                phase="loading_models",
+                message="Loading MLX model",
+                progress=0.01,
+            )
+
+            stage = "transcribing"
+            stt_model = model_for(model)
+            generation_started = time.time()
+            total_seconds = (_job_snapshot(job_id) or {}).get("total_seconds")
+            asr_end = 0.45 if diarize else 0.95
+
+            def on_asr_progress(fraction: float) -> None:
+                _raise_if_cancelled(cancel_event)
+                fraction = min(1.0, max(0.0, fraction))
+                processed = float(total_seconds or 0.0) * fraction
+                _update_progress(
+                    job_id,
+                    started=started,
+                    state="transcribing",
+                    phase="transcribing",
+                    message=f"Transcribing audio · {int(fraction * 100)}%",
+                    progress=0.05 + ((asr_end - 0.05) * fraction),
+                    processed_seconds=processed,
+                    asr_progress=fraction,
+                )
+
+            on_asr_progress(0.0)
+            with mlx_progress_callback(on_asr_progress):
+                result_data = normalize_stt_result(
+                    stt_model.generate(
+                        str(audio_path),
+                        verbose=None,
+                        chunk_duration=chunk_duration,
+                        language=language or None,
+                    )
+                )
+            on_asr_progress(1.0)
+            asr_seconds = time.time() - generation_started
+            segments = normalize_segments(result_data.get("segments"))
+            atomic_write_json(
+                job_root / "asr.json",
+                {
+                    "schema_version": "1.0",
+                    "job_id": job_id,
+                    "model": model,
+                    "language": result_data.get("language"),
+                    "text": str(result_data.get("text") or "").strip(),
+                    "segments": segments,
+                    "timing": {"asr": asr_seconds},
+                },
+            )
+
+            diarization_seconds = 0.0
+            if diarize:
+                stage = "diarizing"
+                diarization_started = time.time()
+
+                def on_diarization_progress(fraction: float, step_name: str) -> None:
+                    _raise_if_cancelled(cancel_event)
+                    fraction = min(1.0, max(0.0, fraction))
+                    processed = float(total_seconds or 0.0) * fraction
+                    readable_step = step_name.replace("_", " ").capitalize()
+                    _update_progress(
+                        job_id,
+                        started=started,
+                        state="diarizing",
+                        phase="diarizing",
+                        message=f"Detecting speakers · {readable_step}",
+                        progress=0.45 + (0.52 * fraction),
+                        processed_seconds=processed,
+                        diarization_progress=fraction,
+                    )
+
+                on_diarization_progress(0.0, "segmentation")
+                segments = assign_speakers(
+                    str(audio_path),
+                    segments,
+                    progress_callback=on_diarization_progress,
+                )
+                on_diarization_progress(1.0, "complete")
+                diarization_seconds = time.time() - diarization_started
+            else:
+                for segment in segments:
+                    segment.setdefault("speaker", "SPEAKER_00")
+            atomic_write_json(
+                job_root / "diarization.json",
+                {
+                    "schema_version": "1.0",
+                    "job_id": job_id,
+                    "enabled": diarize,
+                    "segments": segments,
+                    "timing": {"diarization": diarization_seconds},
+                },
+            )
+
+            _raise_if_cancelled(cancel_event)
+            stage = "serializing"
+            _update_progress(
+                job_id,
+                started=started,
+                state="merging",
+                phase="merging",
+                message="Merging and validating result",
+                progress=0.98,
+                processed_seconds=float(total_seconds or 0.0),
+            )
+            response_payload = sanitize_finite_numbers(
+                {
+                    "schema_version": "1.0",
+                    "job_id": job_id,
+                    "text": formatted_text(segments) or str(result_data.get("text") or "").strip(),
+                    "raw_text": str(result_data.get("text") or "").strip(),
+                    "segments": segments,
+                    "language": result_data.get("language"),
+                    "backend": "mlx+pyannote" if diarize else "mlx",
+                    "model": model,
+                    "timing": {
+                        "total": time.time() - started,
+                        "asr": asr_seconds,
+                        "diarization": diarization_seconds,
+                    },
+                }
+            )
+            validate_transcription_response(response_payload)
+            atomic_write_json(job_root / "result.json", response_payload)
+            _store_job_status(
+                job_id,
+                state="completed",
+                phase="completed",
+                message="Completed",
+                progress=1.0,
+                asr_progress=1.0,
+                diarization_progress=1.0,
+                processed_seconds=float(total_seconds or 0.0),
+                elapsed_seconds=max(0.0, time.time() - started),
+                eta_seconds=0.0,
+                error=None,
+            )
+    except JobCancelledError:
+        snapshot = _job_snapshot(job_id) or {}
+        _store_job_status(
+            job_id,
+            state="cancelled",
+            phase="cancelled",
+            message="Cancelled",
+            progress=float(snapshot.get("progress") or 0.0),
+            eta_seconds=None,
+            error=None,
+        )
+    except ResponseValidationError as exc:
+        error = failure_payload(job_id, stage, exc, recoverable=True)
+        _store_job_status(
+            job_id,
+            state="failed",
+            phase=stage,
+            message=str(exc),
+            eta_seconds=None,
+            error=error["error"],
+        )
+    except Exception as exc:
+        recoverable = (job_root / "asr.json").exists()
+        error = failure_payload(job_id, stage, exc, recoverable=recoverable)
+        _store_job_status(
+            job_id,
+            state="failed",
+            phase=stage,
+            message=str(exc),
+            eta_seconds=None,
+            error=error["error"],
+        )
+
+
+def _start_background_job(job_id: str, audio_path: Path, **parameters: Any) -> None:
+    async def runner():
+        try:
+            await asyncio.to_thread(_run_transcription_job, job_id, audio_path, **parameters)
+        finally:
+            with _jobs_lock:
+                _job_tasks.pop(job_id, None)
+
+    task = asyncio.create_task(runner())
+    with _jobs_lock:
+        _job_tasks[job_id] = task
+
+
+@app.post("/v1/transcription/jobs")
+async def create_transcription_job(
+    file: UploadFile = File(...),
+    model: str = Form(DEFAULT_MODEL),
+    language: str | None = Form(None),
+    diarize: bool = Form(True),
+    chunk_duration: float = Form(30.0),
+):
+    job_id, audio_path = _prepare_job(file, diarize=diarize)
+    _start_background_job(
+        job_id,
+        audio_path,
+        model=model,
+        language=language,
+        diarize=diarize,
+        chunk_duration=chunk_duration,
+    )
+    return JSONResponse(status_code=202, content=_job_snapshot(job_id))
+
+
+@app.get("/v1/transcription/jobs/{job_id}")
+def transcription_job_status(job_id: str):
+    status = _job_snapshot(job_id)
+    if status is None:
+        status_path = RESULTS_ROOT / job_id / "status.json"
+        if status_path.exists():
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+    if status is None:
+        return JSONResponse(status_code=404, content={"detail": "Job not found"})
+    return JSONResponse(content=status)
+
+
+@app.get("/v1/transcription/jobs/{job_id}/result")
+def transcription_job_result(job_id: str):
+    job_root = RESULTS_ROOT / job_id
+    result_path = job_root / "result.json"
+    if result_path.exists():
+        return Response(content=result_path.read_bytes(), media_type="application/json")
+    failure_path = job_root / "failure.json"
+    if failure_path.exists():
+        return Response(content=failure_path.read_bytes(), status_code=500, media_type="application/json")
+    status = _job_snapshot(job_id)
+    if status is None:
+        return JSONResponse(status_code=404, content={"detail": "Job not found"})
+    return JSONResponse(status_code=409, content=status)
+
+
+@app.delete("/v1/transcription/jobs/{job_id}")
+def cancel_transcription_job(job_id: str):
+    with _jobs_lock:
+        cancel_event = _job_cancellations.get(job_id)
+    if cancel_event is None:
+        return JSONResponse(status_code=404, content={"detail": "Job not found"})
+    cancel_event.set()
+    status = _job_snapshot(job_id) or {}
+    if status.get("state") not in {"completed", "failed", "cancelled"}:
+        status = _store_job_status(
+            job_id,
+            state="cancelling",
+            phase="cancelling",
+            message="Cancelling",
+            eta_seconds=None,
+        )
+    return JSONResponse(status_code=202, content=status)
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(...),
@@ -214,92 +670,25 @@ async def transcriptions(
     diarize: bool = Form(True),
     chunk_duration: float = Form(30.0),
 ):
-    job_id = str(uuid.uuid4())
-    job_root = RESULTS_ROOT / job_id
-    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
-    audio_path = job_root / f"input{suffix}"
-    job_root.mkdir(parents=True, exist_ok=False)
-    stage = "preparing"
-    started = time.time()
-
-    try:
-        with audio_path.open("wb") as handle:
-            shutil.copyfileobj(file.file, handle)
-
-        stage = "transcribing"
-        stt_model = model_for(model)
-        generation_started = time.time()
-        result_data = normalize_stt_result(
-            stt_model.generate(
-                str(audio_path),
-                verbose=None,
-                chunk_duration=chunk_duration,
-                language=language or None,
-            )
-        )
-        asr_seconds = time.time() - generation_started
-        segments = normalize_segments(result_data.get("segments"))
-        atomic_write_json(
-            job_root / "asr.json",
-            {
-                "schema_version": "1.0",
-                "job_id": job_id,
-                "model": model,
-                "language": result_data.get("language"),
-                "text": str(result_data.get("text") or "").strip(),
-                "segments": segments,
-                "timing": {"asr": asr_seconds},
-            },
-        )
-
-        diarization_seconds = 0.0
-        if diarize:
-            stage = "diarizing"
-            diarization_started = time.time()
-            segments = assign_speakers(str(audio_path), segments)
-            diarization_seconds = time.time() - diarization_started
-        else:
-            for segment in segments:
-                segment.setdefault("speaker", "SPEAKER_00")
-        atomic_write_json(
-            job_root / "diarization.json",
-            {
-                "schema_version": "1.0",
-                "job_id": job_id,
-                "enabled": diarize,
-                "segments": segments,
-                "timing": {"diarization": diarization_seconds},
-            },
-        )
-
-        stage = "serializing"
-        response_payload = sanitize_finite_numbers(
-            {
-                "schema_version": "1.0",
-                "job_id": job_id,
-                "text": formatted_text(segments) or str(result_data.get("text") or "").strip(),
-                "raw_text": str(result_data.get("text") or "").strip(),
-                "segments": segments,
-                "language": result_data.get("language"),
-                "backend": "mlx+pyannote" if diarize else "mlx",
-                "model": model,
-                "timing": {
-                    "total": time.time() - started,
-                    "asr": asr_seconds,
-                    "diarization": diarization_seconds,
-                },
-            }
-        )
-        validate_transcription_response(response_payload)
-        result_path = atomic_write_json(job_root / "result.json", response_payload)
-
-        # Serve exactly the validated, persisted artifact. A later transport failure cannot erase it.
+    """Compatibility endpoint for older Contora clients."""
+    job_id, audio_path = _prepare_job(file, diarize=diarize)
+    await asyncio.to_thread(
+        _run_transcription_job,
+        job_id,
+        audio_path,
+        model=model,
+        language=language,
+        diarize=diarize,
+        chunk_duration=chunk_duration,
+    )
+    result_path = RESULTS_ROOT / job_id / "result.json"
+    if result_path.exists():
         return Response(content=result_path.read_bytes(), media_type="application/json")
-    except ResponseValidationError as exc:
-        return failure_response(job_id, stage, exc, recoverable=True)
-    except Exception as exc:
-        recoverable = (job_root / "asr.json").exists()
-        return failure_response(job_id, stage, exc, recoverable=recoverable)
+    failure_path = RESULTS_ROOT / job_id / "failure.json"
+    if failure_path.exists():
+        return Response(content=failure_path.read_bytes(), status_code=500, media_type="application/json")
+    status = _job_snapshot(job_id) or {"detail": "Transcription did not complete"}
+    return JSONResponse(status_code=409, content=status)
 
 
 def main():
