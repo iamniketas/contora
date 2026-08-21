@@ -103,7 +103,7 @@ final class SharedMLXServerToolkitService: @unchecked Sendable {
 
         onProgress("Installing MLX runtime…")
         try installExtractedRoot(extractedRoot)
-        try refreshServerScriptFromApp()
+        _ = try refreshServerFilesFromApp()
         onProgress("MLX runtime installed")
         return status()
     }
@@ -116,15 +116,18 @@ final class SharedMLXServerToolkitService: @unchecked Sendable {
         // absolute /Library/Frameworks references. Repair existing installations
         // before importing uvicorn or contacting Hugging Face over HTTPS.
         try FasterWhisperRuntimeInstaller().repairInstalledRuntimeIfNeeded()
+        let serverFilesChanged = try refreshServerFilesFromApp()
         if await isHealthy() {
-            return "MLX server is ready"
+            if !serverFilesChanged {
+                return "MLX server is ready"
+            }
+            try stopManagedProcess()
         }
         if await isPortOccupied() {
             throw MLXRuntimeError.portInUse
         }
 
         try stopManagedProcess()
-        try refreshServerScriptFromApp()
 
         let runtime = status()
         try FileManager.default.createDirectory(at: runtime.rootURL, withIntermediateDirectories: true)
@@ -269,8 +272,24 @@ final class SharedMLXServerToolkitService: @unchecked Sendable {
         )
     }
 
-    private func refreshServerScriptFromApp() throws {
-        let resourceName = "contora_mlx_server.py"
+    @discardableResult
+    private func refreshServerFilesFromApp() throws -> Bool {
+        let resources: [(name: String, destination: URL, permissions: Int)] = [
+            ("contora_mlx_server.py", SharedRuntimePaths.mlxServerScript(), 0o755),
+            ("result_safety.py", SharedRuntimePaths.mlxResultSafetyModule(), 0o644),
+        ]
+        var changed = false
+        for resource in resources {
+            changed = try installBundledResource(
+                named: resource.name,
+                at: resource.destination,
+                permissions: resource.permissions
+            ) || changed
+        }
+        return changed
+    }
+
+    private func installBundledResource(named resourceName: String, at destination: URL, permissions: Int) throws -> Bool {
         let packageBundleName = "ContoraMac_ContoraMac.bundle"
         let executableDirectory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
         let candidates = [
@@ -279,12 +298,16 @@ final class SharedMLXServerToolkitService: @unchecked Sendable {
             executableDirectory.appendingPathComponent("\(packageBundleName)/Resources/\(resourceName)"),
         ].compactMap { $0 }
         guard let source = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
-            return
+            throw MLXRuntimeError.artifactMissing
         }
-        let destination = SharedRuntimePaths.mlxServerScript()
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data(contentsOf: source).write(to: destination, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
+        let sourceData = try Data(contentsOf: source)
+        let changed = (try? Data(contentsOf: destination)) != sourceData
+        if changed {
+            try sourceData.write(to: destination, options: .atomic)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: destination.path)
+        return changed
     }
 
     private func isPortOccupied() async -> Bool {

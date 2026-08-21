@@ -5,6 +5,15 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.5] - 2026-08-21
+
+### macOS
+- **Crash-safe MLX results**: all model output is recursively sanitized for non-finite numbers, checked against a strict response schema, and atomically persisted before it is returned to the app.
+- **Recoverable transcription artifacts**: ASR, diarization, final results, and structured failures are stored per job, so a serialization or transport failure no longer discards completed work.
+- **Previous transcripts stay intact**: failed retries write a separate `.failed.json` artifact and failure metadata instead of overwriting the last successful TXT/JSON transcript.
+- **Accurate failure UI**: transcription failures now show their actual stage and message instead of the misleading `Segment Rows Unavailable` placeholder.
+- **Runtime updates with app releases**: the managed MLX server refreshes its bundled server and result-safety modules when Contora is updated, restarting only when those resources changed.
+
 ## [0.6.4] - 2026-08-06
 
 ### macOS
