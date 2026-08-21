@@ -124,6 +124,8 @@ tools/*
 !tools/macos-mlx-runtime/**
 !tools/macos-release/
 !tools/macos-release/**
+!tools/macos-mlx-server/
+!tools/macos-mlx-server/**
 !tools/sortformer-server/
 !tools/pyannote-community-server/
 !tools/pyannote-community-server/**

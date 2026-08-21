@@ -17,6 +17,7 @@ This directory contains the native macOS client for Contora:
 - Capture source modes: `Microphone`, `System Audio`, `System + Microphone`.
 - Recorded audio is saved locally in session storage with configurable WAV/M4A retention.
 - Manual transcription workflow through the shared local Whisper/MLX server.
+- MLX results are finite-number sanitized and checkpointed before the HTTP response; failed attempts use a separate `.failed.json` and never overwrite the last successful transcript.
 - Background transcription queue with active/queued/completed/failed/cancelled states.
 - Active transcription can be stopped from the workspace.
 - Local Whisper reports live model-loading, speech transcription, diarization, formatting, percentage, and ETA events to the workspace.

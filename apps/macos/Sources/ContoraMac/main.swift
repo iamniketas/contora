@@ -59,6 +59,7 @@ private func openContoraSettingsWindow() {
 enum TranscriptionError: LocalizedError {
     case badResponse
     case serverError(statusCode: Int, message: String)
+    case structuredServerError(statusCode: Int, failure: TranscriptionServerFailureEnvelope)
     case invalidPayload
 
     var errorDescription: String? {
@@ -67,9 +68,17 @@ enum TranscriptionError: LocalizedError {
             return "Invalid response from transcription server."
         case let .serverError(statusCode, message):
             return "Transcription server error \(statusCode): \(message)"
+        case let .structuredServerError(statusCode, failure):
+            let checkpoint = failure.error.recoverable ? " A retry checkpoint was preserved." : ""
+            return "Transcription server error \(statusCode) during \(failure.error.stage): \(failure.error.message).\(checkpoint)"
         case .invalidPayload:
             return "Transcription payload is missing text."
         }
+    }
+
+    var structuredFailure: TranscriptionServerFailureEnvelope.Failure? {
+        guard case let .structuredServerError(_, failure) = self else { return nil }
+        return failure.error
     }
 }
 
@@ -257,58 +266,6 @@ struct TranscriptionJob: Identifiable, Hashable {
     }
 }
 
-struct ContoraSessionManifest: Codable {
-    struct Files: Codable {
-        let recordingWAV: String?
-        let recordingM4A: String?
-        let recordingMedia: String?
-        let recordingExternalURL: String?
-        let transcriptTXT: String?
-        let transcriptJSON: String?
-    }
-
-    struct Capture: Codable {
-        let sourceMode: String
-        let audioSeconds: Double?
-        let sampleRate: Int
-        let channels: Int
-    }
-
-    struct Transcription: Codable {
-        struct Speaker: Codable {
-            let id: String
-            let displayName: String
-        }
-
-        struct Segment: Codable {
-            let id: String
-            let startSeconds: Double
-            let endSeconds: Double
-            let speakerID: String
-            let text: String
-        }
-
-        let status: String
-        let backend: String?
-        let endpoint: String?
-        let language: String?
-        let mode: String?
-        let durationSeconds: Double?
-        let errorMessage: String?
-        let speakers: [Speaker]?
-        let segments: [Segment]?
-    }
-
-    let schemaVersion: String
-    let sessionID: String
-    let title: String
-    let createdAt: String
-    let updatedAt: String
-    let files: Files
-    let capture: Capture
-    let transcription: Transcription?
-}
-
 enum SessionLibraryError: LocalizedError {
     case recordingsDirectoryUnavailable
 
@@ -414,6 +371,9 @@ final class SessionLibraryService {
                 text: $0.text
             )
         }
+        let transcriptionSucceeded = manifest.transcription?.status == "completed"
+        let transcriptionFailed = manifest.transcription?.status == "failed"
+            || (manifest.transcription == nil && manifest.lastFailure != nil)
 
         return ContoraSession(
             id: manifest.sessionID,
@@ -429,8 +389,8 @@ final class SessionLibraryService {
                 language: manifest.transcription?.language,
                 endpoint: manifest.transcription?.endpoint,
                 audioSeconds: manifest.capture.audioSeconds,
-                success: manifest.transcription?.status == "completed" ? true : (manifest.transcription?.status == "failed" ? false : nil),
-                errorMessage: manifest.transcription?.errorMessage
+                success: transcriptionSucceeded ? true : (transcriptionFailed ? false : nil),
+                errorMessage: manifest.lastFailure?.message ?? manifest.transcription?.errorMessage
             ),
             speakers: manifestSpeakers ?? parsed.speakers,
             segments: manifestSegments ?? parsed.segments
@@ -699,7 +659,9 @@ final class RecordingArchiveService {
         recordingM4AURL: URL? = nil,
         transcriptTXT: URL? = nil,
         transcriptJSON: URL? = nil,
+        failureJSON: URL? = nil,
         transcription: ContoraSessionManifest.Transcription? = nil,
+        lastFailure: ContoraSessionManifest.Failure? = nil,
         manifestBaseURL: URL? = nil
     ) throws -> URL {
         let manifestURL = manifestBaseURL?
@@ -722,7 +684,8 @@ final class RecordingArchiveService {
                 recordingMedia: isInternalRecording ? recordingFileURL.lastPathComponent : nil,
                 recordingExternalURL: isInternalRecording ? nil : recordingFileURL.path,
                 transcriptTXT: transcriptTXT?.lastPathComponent,
-                transcriptJSON: transcriptJSON?.lastPathComponent
+                transcriptJSON: transcriptJSON?.lastPathComponent,
+                failureJSON: failureJSON?.lastPathComponent
             ),
             capture: .init(
                 sourceMode: captureSourceMode,
@@ -730,7 +693,8 @@ final class RecordingArchiveService {
                 sampleRate: sampleRate,
                 channels: channels
             ),
-            transcription: transcription
+            transcription: transcription,
+            lastFailure: lastFailure
         )
         let data = try JSONEncoder.prettyISO8601.encode(manifest)
         try data.write(to: manifestURL, options: .atomic)
@@ -773,6 +737,24 @@ final class RecordingArchiveService {
         let txtURL = artifactBaseURL?.appendingPathExtension("txt") ?? recordingFileURL.deletingPathExtension().appendingPathExtension("txt")
         try transcriptText.write(to: txtURL, atomically: true, encoding: .utf8)
         return txtURL
+    }
+
+    func saveTranscriptionFailure(
+        for recordingFileURL: URL,
+        artifactBaseURL: URL? = nil,
+        sessionID: String,
+        failure: ContoraSessionManifest.Failure,
+        previousTranscriptPreserved: Bool
+    ) throws -> URL {
+        let failedURL = artifactBaseURL?.appendingPathExtension("failed.json")
+            ?? recordingFileURL.deletingPathExtension().appendingPathExtension("failed.json")
+        return try TranscriptionFailureArtifactStore.write(
+            to: failedURL,
+            sessionID: sessionID,
+            recordingFile: recordingFileURL.lastPathComponent,
+            previousTranscriptPreserved: previousTranscriptPreserved,
+            failure: failure
+        )
     }
 
     func updateTranscriptJSONPreservingMetadata(for recordingFileURL: URL, artifactBaseURL: URL? = nil, transcriptText: String) throws -> URL {
@@ -821,11 +803,13 @@ final class RecordingArchiveService {
             try? fileManager.removeItem(at: old)
             let siblingJSON = old.deletingPathExtension().appendingPathExtension("json")
             let siblingTXT = old.deletingPathExtension().appendingPathExtension("txt")
+            let siblingFailure = old.deletingPathExtension().appendingPathExtension("failed.json")
             let siblingManifest = old.deletingPathExtension().appendingPathExtension("session.json")
             let siblingWAV = old.deletingPathExtension().appendingPathExtension("wav")
             let siblingM4A = old.deletingPathExtension().appendingPathExtension("m4a")
             try? fileManager.removeItem(at: siblingJSON)
             try? fileManager.removeItem(at: siblingTXT)
+            try? fileManager.removeItem(at: siblingFailure)
             try? fileManager.removeItem(at: siblingManifest)
             try? fileManager.removeItem(at: siblingWAV)
             try? fileManager.removeItem(at: siblingM4A)
@@ -989,6 +973,9 @@ final class MLXHTTPTranscriptionService {
             throw TranscriptionError.badResponse
         }
         guard (200...299).contains(http.statusCode) else {
+            if let failure = try? JSONDecoder().decode(TranscriptionServerFailureEnvelope.self, from: data) {
+                throw TranscriptionError.structuredServerError(statusCode: http.statusCode, failure: failure)
+            }
             let message = String(data: data, encoding: .utf8) ?? "MLX server error"
             throw TranscriptionError.serverError(statusCode: http.statusCode, message: message)
         }
@@ -3208,17 +3195,14 @@ final class AppModel: ObservableObject {
                     lastRealtimeSpeedRatio = result.durationSeconds / lastTranscriptionDurationSeconds
                 }
                 statusMessage = "Transcription failed"
-                lastTranscript = "Transcription error (\(activeTranscriptionEndpointString())): \(error.localizedDescription)"
-                persistTranscript(
-                    text: lastTranscript,
-                    mode: .normal,
-                    success: false,
-                    errorMessage: error.localizedDescription,
-                    recordingURL: session.recordingURL,
+                let structuredFailure = (error as? TranscriptionError)?.structuredFailure
+                persistTranscriptionFailure(
+                    error: error,
+                    stage: structuredFailure?.stage ?? "transcribing",
+                    recoverable: structuredFailure?.recoverable ?? false,
+                    session: session,
                     sessionIdentity: sessionIdentity,
-                    captureSourceModeString: session.metadata.mode ?? "Imported Audio",
-                    audioDurationSeconds: result.durationSeconds,
-                    transcriptionDurationSeconds: lastTranscriptionDurationSeconds > 0 ? lastTranscriptionDurationSeconds : nil
+                    audioDurationSeconds: result.durationSeconds
                 )
                 updateTranscriptionJob(jobID) { job in
                     job.state = .failed
@@ -3244,7 +3228,19 @@ final class AppModel: ObservableObject {
                 return
             }
             statusMessage = "Failed to load audio"
-            lastTranscript = "Error loading audio: \(error.localizedDescription)"
+            let sessionIdentity = RecordingArchiveService.SessionIdentity(
+                sessionID: session.id,
+                title: session.title,
+                createdAt: session.createdAt
+            )
+            persistTranscriptionFailure(
+                error: error,
+                stage: "preparing",
+                recoverable: false,
+                session: session,
+                sessionIdentity: sessionIdentity,
+                audioDurationSeconds: session.metadata.audioSeconds ?? 0
+            )
             updateTranscriptionJob(jobID) { job in
                 job.state = .failed
                 job.statusText = "Failed to load audio"
@@ -3404,6 +3400,78 @@ final class AppModel: ObservableObject {
             reloadSessions()
         } catch {
             // Keep the main flow stable even if transcript archive write fails.
+        }
+    }
+
+    private func persistTranscriptionFailure(
+        error: Error,
+        stage: String,
+        recoverable: Bool,
+        session: ContoraSession,
+        sessionIdentity: RecordingArchiveService.SessionIdentity,
+        audioDurationSeconds: Double
+    ) {
+        do {
+            let artifactBaseURL = artifactBaseURL(for: sessionIdentity.sessionID, recordingURL: session.recordingURL)
+            let structuredFailure = (error as? TranscriptionError)?.structuredFailure
+            let failure = ContoraSessionManifest.Failure(
+                code: structuredFailure?.code ?? String(reflecting: type(of: error)),
+                message: structuredFailure?.message ?? error.localizedDescription,
+                stage: stage,
+                recoverable: recoverable,
+                occurredAt: ISO8601DateFormatter().string(from: Date()),
+                endpoint: activeTranscriptionEndpointString()
+            )
+            let previousTranscriptPreserved = session.transcriptURL != nil
+            let failureURL = try recordingArchive.saveTranscriptionFailure(
+                for: session.recordingURL,
+                artifactBaseURL: artifactBaseURL,
+                sessionID: session.id,
+                failure: failure,
+                previousTranscriptPreserved: previousTranscriptPreserved
+            )
+
+            let previousTranscription: ContoraSessionManifest.Transcription?
+            if previousTranscriptPreserved, session.metadata.success != false {
+                previousTranscription = .init(
+                    status: "completed",
+                    backend: nil,
+                    endpoint: session.metadata.endpoint,
+                    language: session.metadata.language,
+                    mode: session.metadata.mode,
+                    durationSeconds: nil,
+                    errorMessage: nil,
+                    speakers: session.speakers.map { .init(id: $0.id, displayName: $0.displayName) },
+                    segments: session.segments.map {
+                        .init(
+                            id: $0.id,
+                            startSeconds: $0.startSeconds,
+                            endSeconds: $0.endSeconds,
+                            speakerID: $0.speakerID,
+                            text: $0.text
+                        )
+                    }
+                )
+            } else {
+                previousTranscription = nil
+            }
+
+            _ = try recordingArchive.saveSessionManifest(
+                sessionID: sessionIdentity,
+                recordingFileURL: session.recordingURL,
+                captureSourceMode: session.metadata.mode ?? "Imported Audio",
+                audioSeconds: audioDurationSeconds,
+                recordingM4AURL: existingSiblingM4A(for: session.recordingURL),
+                transcriptTXT: previousTranscriptPreserved ? session.transcriptURL : nil,
+                transcriptJSON: previousTranscriptPreserved ? session.jsonURL : nil,
+                failureJSON: failureURL,
+                transcription: previousTranscription,
+                lastFailure: failure,
+                manifestBaseURL: artifactBaseURL?.deletingLastPathComponent()
+            )
+            reloadSessions()
+        } catch {
+            // A failure to persist diagnostics must never modify the last successful transcript.
         }
     }
 
@@ -4871,6 +4939,12 @@ struct SessionDetailView: View {
                             SegmentReviewRowView(model: model, session: session, segment: $segment)
                         }
                     }
+                } else if let errorMessage = session.metadata.errorMessage {
+                    ContentUnavailableView(
+                        "Transcription Failed",
+                        systemImage: "exclamationmark.triangle.fill",
+                        description: Text("\(errorMessage)\n\nAny previous successful transcript was kept unchanged. Failure details are stored separately.")
+                    )
                 } else if !model.sessionEditorTranscriptDraft.isEmpty {
                     ContentUnavailableView(
                         "Segment Rows Unavailable",

@@ -91,6 +91,10 @@ enum SharedRuntimePaths {
         mlxAudioRoot().appendingPathComponent("bin/contora_mlx_server.py")
     }
 
+    static func mlxResultSafetyModule() -> URL {
+        mlxAudioRoot().appendingPathComponent("bin/result_safety.py")
+    }
+
     static func mlxServerLog() -> URL {
         mlxAudioRoot().appendingPathComponent("mlx-server.log")
     }
