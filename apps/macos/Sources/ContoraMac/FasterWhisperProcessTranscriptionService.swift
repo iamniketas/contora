@@ -27,6 +27,7 @@ struct FasterWhisperProcessProgress: Decodable, Sendable {
     let message: String
     let currentSeconds: Double?
     let totalSeconds: Double?
+    let etaSeconds: Double?
 
     var fraction: Double {
         min(1, max(0, progress))

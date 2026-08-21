@@ -13,6 +13,17 @@ Crash-safety guarantees:
 - serves the persisted `result.json` bytes;
 - stores a structured `failure.json` and keeps completed checkpoints on failure.
 
+The macOS client uses the persistent job API:
+
+- `POST /v1/transcription/jobs` creates a job and returns `202`;
+- `GET /v1/transcription/jobs/{job_id}` reports the current stage, monotonic progress,
+  processed/total audio seconds, elapsed time, and ETA;
+- `GET /v1/transcription/jobs/{job_id}/result` returns the persisted result;
+- `DELETE /v1/transcription/jobs/{job_id}` requests cancellation.
+
+ASR progress is observed from Whisper's internal seek loop, without splitting the
+recording into independent requests. Diarization progress uses pyannote's pipeline hook.
+
 Run lightweight tests with:
 
 ```bash

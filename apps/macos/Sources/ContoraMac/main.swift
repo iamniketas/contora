@@ -922,18 +922,54 @@ final class WhisperHTTPTranscriptionService {
     }
 }
 
+private final class MLXJobCancellationContext: @unchecked Sendable {
+    private let lock = NSLock()
+    private var jobURL: URL?
+    private var cancellationRequested = false
+
+    func register(jobURL: URL) {
+        let shouldCancel = lock.withLock {
+            self.jobURL = jobURL
+            return cancellationRequested
+        }
+        if shouldCancel {
+            sendCancellation(to: jobURL)
+        }
+    }
+
+    func cancel() {
+        let url = lock.withLock {
+            cancellationRequested = true
+            return jobURL
+        }
+        if let url {
+            sendCancellation(to: url)
+        }
+    }
+
+    private func sendCancellation(to url: URL) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        URLSession.shared.dataTask(with: request).resume()
+    }
+}
+
 final class MLXHTTPTranscriptionService {
     func transcribe(
         samples16kMono: [Float],
         language: String,
         endpointURL: URL,
         modelID: String,
-        enableDiarization: Bool
+        enableDiarization: Bool,
+        onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void = { _ in }
     ) async throws -> String {
         let wavData = WAVEncoder.makeWAVData(samples: samples16kMono, sampleRate: 16_000)
         let boundary = "Boundary-\(UUID().uuidString)"
         let audioSeconds = Double(samples16kMono.count) / 16_000.0
         let timeoutSeconds = max(600, (audioSeconds * 3.0) + 600)
+        guard let jobsURL = URL(string: "/v1/transcription/jobs", relativeTo: endpointURL)?.absoluteURL else {
+            throw TranscriptionError.badResponse
+        }
 
         var body = Data()
         let lineBreak = "\r\n"
@@ -961,26 +997,99 @@ final class MLXHTTPTranscriptionService {
 
         body.append("--\(boundary)--\(lineBreak)".data(using: .utf8)!)
 
-        var request = URLRequest(url: endpointURL)
+        var request = URLRequest(url: jobsURL)
         request.httpMethod = "POST"
         request.timeoutInterval = timeoutSeconds
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/x-ndjson, application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = body
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw TranscriptionError.badResponse
-        }
-        guard (200...299).contains(http.statusCode) else {
-            if let failure = try? JSONDecoder().decode(TranscriptionServerFailureEnvelope.self, from: data) {
-                throw TranscriptionError.structuredServerError(statusCode: http.statusCode, failure: failure)
+        let cancellationContext = MLXJobCancellationContext()
+        return try await withTaskCancellationHandler {
+            onProgress(
+                MLXTranscriptionProgress(
+                    phase: "uploading",
+                    fraction: 0,
+                    message: "Uploading audio to local backend",
+                    processedSeconds: 0,
+                    totalSeconds: audioSeconds,
+                    etaSeconds: nil
+                )
+            )
+            let (creationData, creationResponse) = try await URLSession.shared.data(for: request)
+            guard let creationHTTP = creationResponse as? HTTPURLResponse else {
+                throw TranscriptionError.badResponse
             }
-            let message = String(data: data, encoding: .utf8) ?? "MLX server error"
-            throw TranscriptionError.serverError(statusCode: http.statusCode, message: message)
-        }
+            guard creationHTTP.statusCode == 202 else {
+                if let failure = try? JSONDecoder().decode(TranscriptionServerFailureEnvelope.self, from: creationData) {
+                    throw TranscriptionError.structuredServerError(statusCode: creationHTTP.statusCode, failure: failure)
+                }
+                let message = String(data: creationData, encoding: .utf8) ?? "MLX server error"
+                throw TranscriptionError.serverError(statusCode: creationHTTP.statusCode, message: message)
+            }
 
-        return try parseText(from: data).trimmingCharacters(in: .whitespacesAndNewlines)
+            let created = try JSONDecoder().decode(MLXJobStatusEnvelope.self, from: creationData)
+            let jobURL = jobsURL.appendingPathComponent(created.jobID)
+            cancellationContext.register(jobURL: jobURL)
+
+            while true {
+                try Task.checkCancellation()
+                var statusRequest = URLRequest(url: jobURL)
+                statusRequest.timeoutInterval = 30
+                statusRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                let (statusData, statusResponse) = try await URLSession.shared.data(for: statusRequest)
+                guard let statusHTTP = statusResponse as? HTTPURLResponse,
+                      (200...299).contains(statusHTTP.statusCode) else {
+                    throw TranscriptionError.badResponse
+                }
+                let status = try JSONDecoder().decode(MLXJobStatusEnvelope.self, from: statusData)
+                onProgress(
+                    MLXTranscriptionProgress(
+                        phase: status.phase,
+                        fraction: min(1, max(0, status.progress)),
+                        message: status.message,
+                        processedSeconds: status.processedSeconds,
+                        totalSeconds: status.totalSeconds,
+                        etaSeconds: status.etaSeconds
+                    )
+                )
+
+                switch status.state {
+                case "completed":
+                    let resultURL = jobURL.appendingPathComponent("result")
+                    var resultRequest = URLRequest(url: resultURL)
+                    resultRequest.timeoutInterval = 60
+                    let (resultData, resultResponse) = try await URLSession.shared.data(for: resultRequest)
+                    guard let resultHTTP = resultResponse as? HTTPURLResponse else {
+                        throw TranscriptionError.badResponse
+                    }
+                    guard (200...299).contains(resultHTTP.statusCode) else {
+                        if let failure = try? JSONDecoder().decode(TranscriptionServerFailureEnvelope.self, from: resultData) {
+                            throw TranscriptionError.structuredServerError(statusCode: resultHTTP.statusCode, failure: failure)
+                        }
+                        throw TranscriptionError.serverError(
+                            statusCode: resultHTTP.statusCode,
+                            message: String(data: resultData, encoding: .utf8) ?? "MLX result unavailable"
+                        )
+                    }
+                    return try parseText(from: resultData).trimmingCharacters(in: .whitespacesAndNewlines)
+                case "failed":
+                    if let error = status.error {
+                        throw TranscriptionError.structuredServerError(
+                            statusCode: 500,
+                            failure: TranscriptionServerFailureEnvelope(jobID: status.jobID, error: error)
+                        )
+                    }
+                    throw TranscriptionError.serverError(statusCode: 500, message: status.message)
+                case "cancelled":
+                    throw CancellationError()
+                default:
+                    try await Task.sleep(for: .milliseconds(750))
+                }
+            }
+        } onCancel: {
+            cancellationContext.cancel()
+        }
     }
 
     private func parseText(from data: Data) throws -> String {
@@ -2976,13 +3085,35 @@ final class AppModel: ObservableObject {
             guard let endpointURL = URL(string: mlxTranscriptionEndpoint) else {
                 throw TranscriptionError.serverError(statusCode: 400, message: "Invalid MLX endpoint URL")
             }
+            onProgress(
+                FasterWhisperProcessProgress(
+                    phase: "starting_backend",
+                    progress: 0,
+                    message: "Starting MLX backend",
+                    currentSeconds: 0,
+                    totalSeconds: Double(samples16k.count) / 16_000.0,
+                    etaSeconds: nil
+                )
+            )
             _ = try await sharedMLXToolkitService.start(modelID: mlxModelID)
             return try await mlxTranscriber.transcribe(
                 samples16kMono: samples16k,
                 language: transcriptionLanguage,
                 endpointURL: endpointURL,
                 modelID: mlxModelID,
-                enableDiarization: mlxDiarizationEnabled
+                enableDiarization: mlxDiarizationEnabled,
+                onProgress: { progress in
+                    onProgress(
+                        FasterWhisperProcessProgress(
+                            phase: progress.phase,
+                            progress: progress.fraction,
+                            message: progress.message,
+                            currentSeconds: progress.processedSeconds,
+                            totalSeconds: progress.totalSeconds,
+                            etaSeconds: progress.etaSeconds
+                        )
+                    )
+                }
             )
 
         case .fasterWhisperProcess:
@@ -3292,7 +3423,9 @@ final class AppModel: ObservableObject {
             job.progress = progress.fraction
             job.statusText = progress.message
 
-            if progress.phase == "transcribing",
+            if let etaSeconds = progress.etaSeconds {
+                job.remainingSeconds = max(0, etaSeconds)
+            } else if progress.phase == "transcribing",
                let current = progress.currentSeconds,
                let total = progress.totalSeconds,
                current > 0,
@@ -4344,7 +4477,7 @@ struct TranscriptionProgressPanel: View {
                 WorkspaceMetricRow(label: "Elapsed", value: formatDuration(activeJob.elapsedSeconds))
                 WorkspaceMetricRow(
                     label: "Progress",
-                    value: activeJob.progress.map { "\(Int(($0 * 100).rounded()))%" } ?? "Starting backend"
+                    value: activeJob.progress.map { "\(Int(($0 * 100).rounded()))%" } ?? "Pending"
                 )
                 if let remaining = activeJob.remainingSeconds {
                     WorkspaceMetricRow(label: "Estimated remaining", value: formatDuration(remaining))

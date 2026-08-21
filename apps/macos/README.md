@@ -20,6 +20,7 @@ This directory contains the native macOS client for Contora:
 - MLX results are finite-number sanitized and checkpointed before the HTTP response; failed attempts use a separate `.failed.json` and never overwrite the last successful transcript.
 - Background transcription queue with active/queued/completed/failed/cancelled states.
 - Active transcription can be stopped from the workspace.
+- MLX transcription reports live model-loading, ASR, diarization, merge, percentage, and ETA status through a persistent local job API.
 - Local Whisper reports live model-loading, speech transcription, diarization, formatting, percentage, and ETA events to the workspace.
 - Each Local Whisper run writes a bounded diagnostic log under `~/Library/Logs/Contora/`, accessible from the `Logs` button.
 - Local `faster-whisper` process backend with a one-click setup flow, model selection, runtime install/repair, model download, and diarization toggle.

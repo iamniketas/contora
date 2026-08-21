@@ -1,7 +1,7 @@
 import Foundation
 
-struct TranscriptionServerFailureEnvelope: Decodable {
-    struct Failure: Decodable {
+struct TranscriptionServerFailureEnvelope: Decodable, Sendable {
+    struct Failure: Decodable, Sendable {
         let code: String
         let message: String
         let stage: String
@@ -15,6 +15,41 @@ struct TranscriptionServerFailureEnvelope: Decodable {
         case jobID = "job_id"
         case error
     }
+}
+
+struct MLXJobStatusEnvelope: Decodable, Sendable {
+    let jobID: String
+    let state: String
+    let phase: String
+    let message: String
+    let progress: Double
+    let processedSeconds: Double?
+    let totalSeconds: Double?
+    let elapsedSeconds: Double?
+    let etaSeconds: Double?
+    let error: TranscriptionServerFailureEnvelope.Failure?
+
+    private enum CodingKeys: String, CodingKey {
+        case jobID = "job_id"
+        case state
+        case phase
+        case message
+        case progress
+        case processedSeconds = "processed_seconds"
+        case totalSeconds = "total_seconds"
+        case elapsedSeconds = "elapsed_seconds"
+        case etaSeconds = "eta_seconds"
+        case error
+    }
+}
+
+struct MLXTranscriptionProgress: Sendable {
+    let phase: String
+    let fraction: Double
+    let message: String
+    let processedSeconds: Double?
+    let totalSeconds: Double?
+    let etaSeconds: Double?
 }
 
 struct ContoraSessionManifest: Codable {
