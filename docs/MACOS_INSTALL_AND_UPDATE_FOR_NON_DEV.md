@@ -22,7 +22,7 @@ If the release is still an unsigned pilot, the file will be named like:
 Contora-macOS-<version>-arm64-unsigned.dmg
 ```
 
-Do not ask the owner to download source code archives, Windows installers, `RELEASES`, `.nupkg`, or `ContoraMacWhisperRuntime-*.tar.gz`.
+Do not ask the owner to download source code archives, Windows installers, `RELEASES`, `.nupkg`, or `ContoraMacSpeechRuntime-*.tar.gz`.
 
 ## First installation
 
@@ -31,9 +31,11 @@ Do not ask the owner to download source code archives, Windows installers, `RELE
 3. Open `Contora` from `Applications`.
 4. If macOS blocks an unsigned pilot build, open `System Settings -> Privacy & Security`, click `Open Anyway` for Contora, then confirm `Open`.
 5. When Contora asks for permissions, allow `Microphone` and `Screen Recording`.
-6. In Contora, press `Set Up Local Whisper`.
+6. In Contora, press `Set Up Speech Runtime`.
 
-The owner does not need to install Python, ffmpeg, Homebrew, Xcode, or models manually. Contora installs its local Whisper runtime from a bundled artifact when present, otherwise from the latest GitHub Release.
+The owner does not need to install Python, Homebrew, Xcode, or speech models
+manually. Contora installs its self-contained speech runtime from a bundled
+artifact when present, otherwise from the latest GitHub Release.
 
 ## Updating later
 
@@ -44,22 +46,22 @@ The owner does not need to install Python, ffmpeg, Homebrew, Xcode, or models ma
 5. When the downloaded DMG opens, drag the new `Contora.app` to `Applications` and replace the old app.
 6. Open Contora again.
 
-Recordings, transcripts, downloaded Whisper models, and runtime files are stored in the user's Library and are not deleted by replacing `Contora.app`.
+Recordings, transcripts, downloaded models, and runtime files are stored in the user's Library and are not deleted by replacing `Contora.app`.
 
 ## Release checklist for the maintainer
 
-Build the runtime artifact first when Local Whisper should work without Python:
+Build and verify the self-contained runtime artifact first:
 
 ```bash
-export HF_TOKEN="hf_..."
-tools/macos-whisper-runtime/build-runtime.sh
+export HF_TOKEN_FILE="/secure/path/to/hf-token"
+tools/macos-mlx-runtime/build-runtime.sh
 ```
 
 Build a user-facing macOS DMG:
 
 ```bash
 CONTORA_VERSION=0.5.3 \
-CONTORA_MACOS_WHISPER_RUNTIME_ARCHIVE="/absolute/path/to/ContoraMacWhisperRuntime-arm64.tar.gz" \
+CONTORA_MACOS_SPEECH_RUNTIME_ARCHIVE="/absolute/path/to/ContoraMacSpeechRuntime-arm64.tar.gz" \
 tools/macos-release/package-pilot.sh
 ```
 
@@ -70,7 +72,7 @@ CONTORA_VERSION=0.5.3 \
 CONTORA_MACOS_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 CONTORA_MACOS_NOTARIZE=1 \
 CONTORA_MACOS_NOTARY_PROFILE="contora-notary" \
-CONTORA_MACOS_WHISPER_RUNTIME_ARCHIVE="/absolute/path/to/ContoraMacWhisperRuntime-arm64.tar.gz" \
+CONTORA_MACOS_SPEECH_RUNTIME_ARCHIVE="/absolute/path/to/ContoraMacSpeechRuntime-arm64.tar.gz" \
 tools/macos-release/package-pilot.sh
 ```
 

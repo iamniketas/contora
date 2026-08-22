@@ -111,6 +111,7 @@ recordings/
 artifacts/macos-pilot/
 artifacts/macos-publish*/
 artifacts/macos-mlx-runtime/
+artifacts/macos-speech-runtime/
 artifacts/macos-whisper-runtime/
 
 # Tools (large binaries) — ignore contents but keep the small versioned script folders.

@@ -4,6 +4,11 @@ This directory contains the tracked MLX transcription server used by the macOS a
 The app installs `contora_mlx_server.py` and `result_safety.py` into the discovered
 shared MLX toolkit before starting it.
 
+The release launcher uses only the self-contained `speech-runtime` Python and
+site-packages. `/health` reports the number of nonterminal jobs so Contora does
+not stop a server used by another client. A server-side watchdog exits after five
+globally idle minutes, including when the app closes while a persistent job finishes.
+
 Crash-safety guarantees:
 
 - recursively replaces `NaN`, `+Inf`, and `-Inf` with JSON `null`;

@@ -64,7 +64,6 @@ final class SharedModelCatalogStore {
         var entries: [SharedModelCatalogEntry] = []
 
         entries.append(contentsOf: scanWhisperKit(now: now))
-        entries.append(contentsOf: scanFasterWhisper(now: now))
         entries.append(contentsOf: scanMLX(now: now))
         entries.append(contentsOf: scanOllama(now: now))
 
@@ -129,30 +128,6 @@ final class SharedModelCatalogStore {
         return false
     }
 
-    private func scanFasterWhisper(now: String) -> [SharedModelCatalogEntry] {
-        let root = SharedRuntimePaths.modelsDirectory()
-        guard let directories = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
-            return []
-        }
-
-        return directories.compactMap {
-            let name = $0.lastPathComponent.replacingOccurrences(of: "faster-whisper-", with: "")
-            guard SharedRuntimePaths.isFasterWhisperModelInstalled(name: name) else {
-                return nil
-            }
-
-            return SharedModelCatalogEntry(
-                id: "faster-whisper::\($0.lastPathComponent)",
-                provider: .fasterWhisper,
-                modelID: $0.lastPathComponent,
-                path: $0.path,
-                source: "shared",
-                status: "available",
-                updatedAt: now
-            )
-        }
-    }
-
     private func scanMLX(now: String) -> [SharedModelCatalogEntry] {
         var entries: [SharedModelCatalogEntry] = []
         if let config = try? SharedTranscriptionServerConfigStore.shared.loadOrCreate(),
@@ -171,7 +146,7 @@ final class SharedModelCatalogStore {
             )
         }
 
-        let sharedRoot = SharedRuntimePaths.mlxAudioRoot()
+        let sharedRoot = SharedRuntimePaths.speechRuntimeRoot()
         if FileManager.default.fileExists(atPath: sharedRoot.path) {
             entries.append(
                 SharedModelCatalogEntry(

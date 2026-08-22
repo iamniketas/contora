@@ -19,30 +19,31 @@ Unsigned pilot builds are not signed with an Apple Developer ID and are not nota
 
 This is acceptable for a pilot, but not for a frictionless public release. For a smoother install/update flow, build with a Developer ID Application certificate and notarize the DMG.
 
-## Build Runtime Artifact
+## Build Speech Runtime Artifact
 
-For Whisper with diarization, build the Contora-managed runtime with pyannote assets on a release machine that has a Hugging Face token with accepted access to:
+Build the self-contained Contora speech runtime on a release machine. It includes
+relocatable Python, MLX, the pyannote fallback, and the approved model assets:
 
 - `pyannote/speaker-diarization-3.1`
 - `pyannote/segmentation-3.0`
 - `pyannote/wespeaker-voxceleb-resnet34-LM`
 
 ```bash
-export HF_TOKEN="hf_..."
-tools/macos-whisper-runtime/build-runtime.sh
+export HF_TOKEN_FILE="/secure/path/to/hf-token"
+tools/macos-mlx-runtime/build-runtime.sh
 ```
 
 Output:
 
 ```text
-artifacts/macos-whisper-runtime/dist/ContoraMacWhisperRuntime-<arch>.tar.gz
-artifacts/macos-whisper-runtime/dist/ContoraMacWhisperRuntime-<arch>.tar.gz.sha256
+artifacts/macos-speech-runtime/dist/ContoraMacSpeechRuntime-<arch>.tar.gz
+artifacts/macos-speech-runtime/dist/ContoraMacSpeechRuntime-<arch>.tar.gz.sha256
 ```
 
 Upload both files to the same GitHub release as the macOS app. If the runtime is not bundled in the app, Contora downloads it from:
 
 ```text
-https://github.com/iamniketas/contora/releases/latest/download/ContoraMacWhisperRuntime-<arch>.tar.gz
+https://github.com/iamniketas/contora/releases/latest/download/ContoraMacSpeechRuntime-<arch>.tar.gz
 ```
 
 ## Package App
@@ -57,16 +58,18 @@ The script creates a drag-to-Applications DMG by default:
 artifacts/macos-pilot/Contora-macOS-<version>-<arch>-unsigned.dmg
 ```
 
-The default DMG is intentionally slim and does not embed the ~483 MB compressed Python/Whisper runtime. `Set Up Local Whisper` downloads that runtime once from the matching GitHub release. This keeps the application update itself around a few megabytes and preserves an already installed runtime across app updates.
+The default DMG is intentionally slim. `Set Up Speech Runtime` downloads the
+runtime once from the matching GitHub release. App updates preserve the installed
+runtime; the managed server starts for transcription jobs and stops after an idle timeout.
 
 To bundle a local runtime archive inside the app:
 
 ```bash
-CONTORA_MACOS_WHISPER_RUNTIME_ARCHIVE="/absolute/path/to/ContoraMacWhisperRuntime-arm64.tar.gz" \
+CONTORA_MACOS_SPEECH_RUNTIME_ARCHIVE="/absolute/path/to/ContoraMacSpeechRuntime-arm64.tar.gz" \
   tools/macos-release/package-pilot.sh
 ```
 
-For a local build that auto-discovers the conventional runtime artifact path, set `CONTORA_MACOS_BUNDLE_WHISPER_RUNTIME=1`.
+For a local build that auto-discovers the conventional runtime artifact path, set `CONTORA_MACOS_BUNDLE_SPEECH_RUNTIME=1`.
 
 Outputs:
 
@@ -112,7 +115,7 @@ Contora-macOS-0.5.3-arm64-signed.dmg
 Contora-macOS-0.5.3-x86_64-signed.dmg
 ```
 
-The updater prefers DMG, then PKG, then ZIP. Runtime artifacts such as `ContoraMacWhisperRuntime-arm64.tar.gz` are intentionally ignored by the app updater.
+The updater prefers DMG, then PKG, then ZIP. Runtime artifacts such as `ContoraMacSpeechRuntime-arm64.tar.gz` are intentionally ignored by the app updater.
 
 If `GITHUB_TOKEN` is available, replace the macOS app assets in the existing GitHub Release with:
 
@@ -132,8 +135,7 @@ Minimum validation before uploading:
 - Record `Microphone`.
 - Record `System Audio`.
 - Record `System + Microphone`.
-- Press `Set Up Local Whisper`.
+- Press `Set Up Speech Runtime`.
 - Confirm runtime installs from bundled archive or GitHub release asset.
-- Confirm model download succeeds.
 - Transcribe a recorded session locally.
 - Confirm diarized output contains speaker labels beyond a single fallback speaker on multi-speaker audio.

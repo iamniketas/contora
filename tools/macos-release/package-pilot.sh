@@ -70,19 +70,19 @@ if [[ -d "$BIN_PATH/ContoraMac_ContoraMac.bundle" ]]; then
   ditto "$BIN_PATH/ContoraMac_ContoraMac.bundle" "$RESOURCES_DIR/ContoraMac_ContoraMac.bundle"
 fi
 
-RUNTIME_ARCHIVE="${CONTORA_MACOS_WHISPER_RUNTIME_ARCHIVE:-}"
-BUNDLE_WHISPER_RUNTIME="${CONTORA_MACOS_BUNDLE_WHISPER_RUNTIME:-0}"
-if [[ -z "$RUNTIME_ARCHIVE" && "$BUNDLE_WHISPER_RUNTIME" == "1" ]]; then
-  CANDIDATE="$REPO_ROOT/artifacts/macos-whisper-runtime/dist/ContoraMacWhisperRuntime-${ARCH}.tar.gz"
+RUNTIME_ARCHIVE="${CONTORA_MACOS_SPEECH_RUNTIME_ARCHIVE:-}"
+BUNDLE_SPEECH_RUNTIME="${CONTORA_MACOS_BUNDLE_SPEECH_RUNTIME:-0}"
+if [[ -z "$RUNTIME_ARCHIVE" && "$BUNDLE_SPEECH_RUNTIME" == "1" ]]; then
+  CANDIDATE="$REPO_ROOT/artifacts/macos-speech-runtime/dist/ContoraMacSpeechRuntime-${ARCH}.tar.gz"
   if [[ -f "$CANDIDATE" ]]; then
     RUNTIME_ARCHIVE="$CANDIDATE"
   fi
 fi
 
 if [[ -n "$RUNTIME_ARCHIVE" ]]; then
-  install -m 644 "$RUNTIME_ARCHIVE" "$RESOURCES_DIR/ContoraMacWhisperRuntime-${ARCH}.tar.gz"
+  install -m 644 "$RUNTIME_ARCHIVE" "$RESOURCES_DIR/ContoraMacSpeechRuntime-${ARCH}.tar.gz"
   if [[ -f "$RUNTIME_ARCHIVE.sha256" ]]; then
-    install -m 644 "$RUNTIME_ARCHIVE.sha256" "$RESOURCES_DIR/ContoraMacWhisperRuntime-${ARCH}.tar.gz.sha256"
+    install -m 644 "$RUNTIME_ARCHIVE.sha256" "$RESOURCES_DIR/ContoraMacSpeechRuntime-${ARCH}.tar.gz.sha256"
   fi
 fi
 
@@ -154,11 +154,11 @@ First launch:
 3. If macOS blocks it, open System Settings -> Privacy & Security.
 4. Click Open Anyway for Contora, then confirm Open.
 
-Local Whisper:
-- Press Set Up Local Whisper inside Contora.
-- If this archive contains ContoraMacWhisperRuntime-${ARCH}.tar.gz, setup installs it locally.
-- Otherwise Contora downloads the runtime from the latest GitHub release.
-- Diarization needs the Contora runtime artifact built with bundled pyannote assets.
+Managed speech backend:
+- Press Set Up Speech Runtime inside Contora once.
+- If this archive contains ContoraMacSpeechRuntime-${ARCH}.tar.gz, setup installs it locally.
+- Otherwise Contora downloads the self-contained runtime from the latest GitHub release.
+- The backend starts automatically for a transcription job and stops after an idle timeout.
 
 All recordings, models, and transcripts stay on this Mac.
 README
@@ -188,9 +188,9 @@ First launch:
 3. If macOS blocks it, open System Settings -> Privacy & Security.
 4. Click Open Anyway for Contora, then confirm Open.
 
-Local Whisper:
-- Press Set Up Local Whisper inside Contora.
-- If setup fails, use Backend -> Repair Runtime.
+Managed speech backend:
+- Press Set Up Speech Runtime inside Contora once.
+- If setup fails, use Backend -> Set Up Speech Runtime again and open the runtime log.
 README
 
   sign_app "$DMG_MOUNT_DIR/$APP_NAME.app"
