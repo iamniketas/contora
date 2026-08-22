@@ -1,0 +1,7 @@
+# Community-1 was introduced with pyannote.audio 4.x and is intentionally
+# isolated from the 3.4.0 legacy baseline environment.
+pyannote.audio==4.0.7
+torch==2.11.0
+torchaudio==2.11.0
+torchcodec==0.11.1
+huggingface-hub==1.8.0

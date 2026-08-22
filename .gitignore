@@ -129,6 +129,8 @@ tools/*
 !tools/sortformer-server/
 !tools/pyannote-community-server/
 !tools/pyannote-community-server/**
+!tools/macos-transcription-benchmark/
+!tools/macos-transcription-benchmark/**
 **/__pycache__/
 **/*.pyc
 
@@ -139,3 +141,8 @@ conversation-*.txt
 # Misc
 nul
 fixtures/
+# Private benchmark media, manual annotations, downloaded models, and run artifacts.
+tools/macos-transcription-benchmark/.local-corpus/
+tools/macos-transcription-benchmark/.runtime/
+tools/macos-transcription-benchmark/results/
+tools/macos-transcription-benchmark/native/.build/

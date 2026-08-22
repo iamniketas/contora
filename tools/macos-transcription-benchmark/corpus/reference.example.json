@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "sample_id": "example-ru-overlap",
+  "annotation": {
+    "status": "golden",
+    "annotator": "reviewer-a",
+    "reviewer": "reviewer-b",
+    "tool": "annotation-tool 1.0",
+    "reviewed_at": "2026-08-22"
+  },
+  "text": "Анна, встреча в 14:30. Да, записал.",
+  "words": [
+    {"text": "Анна,", "start": 0.12, "end": 0.48, "speaker": "SPEAKER_00", "tags": ["name"]},
+    {"text": "встреча", "start": 0.55, "end": 0.94, "speaker": "SPEAKER_00"},
+    {"text": "в", "start": 1.02, "end": 1.10, "speaker": "SPEAKER_00"},
+    {"text": "14:30.", "start": 1.13, "end": 1.68, "speaker": "SPEAKER_00", "tags": ["number"]},
+    {"text": "Да,", "start": 1.42, "end": 1.61, "speaker": "SPEAKER_01"},
+    {"text": "записал.", "start": 1.67, "end": 2.14, "speaker": "SPEAKER_01"}
+  ],
+  "speaker_turns": [
+    {"start": 0.10, "end": 1.72, "speaker": "SPEAKER_00", "confidence": 1.0},
+    {"start": 1.39, "end": 2.18, "speaker": "SPEAKER_01", "confidence": 1.0}
+  ]
+}

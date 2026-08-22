@@ -1,0 +1,11 @@
+# Direct benchmark dependencies. Candidate engine and integration versions are
+# pinned here; model snapshots are pinned independently in download-models.py.
+mlx-audio[stt]==0.3.1
+mlx-whisper==0.4.3
+mlx==0.30.6
+pyannote.audio==3.4.0
+torch==2.4.1
+torchaudio==2.4.1
+numpy==2.4.5
+huggingface-hub==1.8.0
+rapidfuzz==3.14.5
