@@ -22,7 +22,22 @@ api() {
 }
 
 release_json="$(mktemp "${TMPDIR:-/tmp}/contora-release.XXXXXX.json")"
-api "https://api.github.com/repos/$REPO/releases/tags/$TAG" > "$release_json"
+if ! api "https://api.github.com/repos/$REPO/releases/tags/$TAG" > "$release_json"; then
+  release_list="$(mktemp "${TMPDIR:-/tmp}/contora-releases.XXXXXX.json")"
+  api "https://api.github.com/repos/$REPO/releases?per_page=100" > "$release_list"
+  python3 - "$release_list" "$release_json" "$TAG" <<'PY'
+import json, sys
+
+source_path, destination_path, tag = sys.argv[1:]
+releases = json.load(open(source_path, encoding="utf-8"))
+release = next((item for item in releases if item.get("tag_name") == tag), None)
+if release is None:
+    raise SystemExit(f"GitHub release not found for tag {tag}")
+with open(destination_path, "w", encoding="utf-8") as destination:
+    json.dump(release, destination)
+PY
+  rm -f "$release_list"
+fi
 release_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$release_json")"
 upload_url="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upload_url"].split("{",1)[0])' "$release_json")"
 
