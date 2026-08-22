@@ -52,6 +52,74 @@ struct MLXTranscriptionProgress: Sendable {
     let etaSeconds: Double?
 }
 
+struct MLXJobRecoveryRecord: Codable, Sendable, Equatable {
+    let schemaVersion: String
+    let localJobID: UUID
+    let remoteJobID: String
+    let sessionID: String
+    let endpointURL: String
+    let modelID: String
+    let language: String
+    let diarizationEnabled: Bool
+    let audioSeconds: Double
+    let createdAt: Date
+}
+
+struct MLXJobRecoveryStore: Sendable {
+    let directoryURL: URL
+
+    static func live() throws -> MLXJobRecoveryStore {
+        guard let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        return MLXJobRecoveryStore(
+            directoryURL: appSupport
+                .appendingPathComponent("Contora", isDirectory: true)
+                .appendingPathComponent("PendingTranscriptionJobs", isDirectory: true)
+        )
+    }
+
+    func save(_ record: MLXJobRecoveryRecord) throws {
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let destination = fileURL(for: record.localJobID)
+        try encoder.encode(record).write(to: destination, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+    }
+
+    func loadAll() throws -> [MLXJobRecoveryRecord] {
+        guard FileManager.default.fileExists(atPath: directoryURL.path) else { return [] }
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return urls
+            .filter { $0.pathExtension == "json" }
+            .compactMap { try? decoder.decode(MLXJobRecoveryRecord.self, from: Data(contentsOf: $0)) }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
+    func remove(localJobID: UUID) {
+        try? FileManager.default.removeItem(at: fileURL(for: localJobID))
+    }
+
+    private func fileURL(for localJobID: UUID) -> URL {
+        directoryURL.appendingPathComponent(localJobID.uuidString.lowercased()).appendingPathExtension("json")
+    }
+}
+
 struct ContoraSessionManifest: Codable {
     struct Files: Codable {
         let recordingWAV: String?

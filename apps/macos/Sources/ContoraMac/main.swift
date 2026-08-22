@@ -1063,6 +1063,7 @@ final class MLXHTTPTranscriptionService {
         endpointURL: URL,
         modelID: String,
         enableDiarization: Bool,
+        onJobCreated: @escaping @Sendable (String) -> Void = { _ in },
         onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void = { _ in }
     ) async throws -> String {
         let audioSeconds = Double(samples16kMono.count) / 16_000.0
@@ -1129,64 +1130,92 @@ final class MLXHTTPTranscriptionService {
             }
             let jobURL = jobsURL.appendingPathComponent(created.jobID)
             cancellationContext.register(jobURL: jobURL)
-
-            while true {
-                try Task.checkCancellation()
-                var statusRequest = URLRequest(url: jobURL)
-                statusRequest.timeoutInterval = 30
-                statusRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-                let (statusData, statusResponse) = try await URLSession.shared.data(for: statusRequest)
-                guard let statusHTTP = statusResponse as? HTTPURLResponse,
-                      (200...299).contains(statusHTTP.statusCode) else {
-                    throw TranscriptionError.badResponse
-                }
-                let status = try JSONDecoder().decode(MLXJobStatusEnvelope.self, from: statusData)
-                onProgress(
-                    MLXTranscriptionProgress(
-                        phase: status.phase,
-                        fraction: min(1, max(0, status.progress)),
-                        message: status.message,
-                        processedSeconds: status.processedSeconds,
-                        totalSeconds: status.totalSeconds,
-                        etaSeconds: status.etaSeconds
-                    )
-                )
-
-                switch status.state {
-                case "completed":
-                    let resultURL = jobURL.appendingPathComponent("result")
-                    var resultRequest = URLRequest(url: resultURL)
-                    resultRequest.timeoutInterval = 60
-                    let (resultData, resultResponse) = try await URLSession.shared.data(for: resultRequest)
-                    guard let resultHTTP = resultResponse as? HTTPURLResponse else {
-                        throw TranscriptionError.badResponse
-                    }
-                    guard (200...299).contains(resultHTTP.statusCode) else {
-                        if let failure = try? JSONDecoder().decode(TranscriptionServerFailureEnvelope.self, from: resultData) {
-                            throw TranscriptionError.structuredServerError(statusCode: resultHTTP.statusCode, failure: failure)
-                        }
-                        throw TranscriptionError.serverError(
-                            statusCode: resultHTTP.statusCode,
-                            message: String(data: resultData, encoding: .utf8) ?? "MLX result unavailable"
-                        )
-                    }
-                    return try parseText(from: resultData).trimmingCharacters(in: .whitespacesAndNewlines)
-                case "failed":
-                    if let error = status.error {
-                        throw TranscriptionError.structuredServerError(
-                            statusCode: 500,
-                            failure: TranscriptionServerFailureEnvelope(jobID: status.jobID, error: error)
-                        )
-                    }
-                    throw TranscriptionError.serverError(statusCode: 500, message: status.message)
-                case "cancelled":
-                    throw CancellationError()
-                default:
-                    try await Task.sleep(for: .milliseconds(750))
-                }
-            }
+            onJobCreated(created.jobID)
+            return try await poll(jobURL: jobURL, onProgress: onProgress)
         } onCancel: {
             cancellationContext.cancel()
+        }
+    }
+
+    func resume(
+        jobID: String,
+        endpointURL: URL,
+        onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void = { _ in }
+    ) async throws -> String {
+        guard let jobsURL = URL(string: "/v1/transcription/jobs", relativeTo: endpointURL)?.absoluteURL else {
+            throw TranscriptionError.badResponse
+        }
+        let jobURL = jobsURL.appendingPathComponent(jobID)
+        let cancellationContext = MLXJobCancellationContext()
+        cancellationContext.register(jobURL: jobURL)
+        return try await withTaskCancellationHandler {
+            try await poll(jobURL: jobURL, onProgress: onProgress)
+        } onCancel: {
+            cancellationContext.cancel()
+        }
+    }
+
+    private func poll(
+        jobURL: URL,
+        onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void
+    ) async throws -> String {
+        while true {
+            try Task.checkCancellation()
+            var statusRequest = URLRequest(url: jobURL)
+            statusRequest.timeoutInterval = 30
+            statusRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            let (statusData, statusResponse) = try await URLSession.shared.data(for: statusRequest)
+            guard let statusHTTP = statusResponse as? HTTPURLResponse else {
+                throw TranscriptionError.badResponse
+            }
+            guard (200...299).contains(statusHTTP.statusCode) else {
+                let message = String(data: statusData, encoding: .utf8) ?? "MLX job unavailable"
+                throw TranscriptionError.serverError(statusCode: statusHTTP.statusCode, message: message)
+            }
+            let status = try JSONDecoder().decode(MLXJobStatusEnvelope.self, from: statusData)
+            onProgress(
+                MLXTranscriptionProgress(
+                    phase: status.phase,
+                    fraction: min(1, max(0, status.progress)),
+                    message: status.message,
+                    processedSeconds: status.processedSeconds,
+                    totalSeconds: status.totalSeconds,
+                    etaSeconds: status.etaSeconds
+                )
+            )
+
+            switch status.state {
+            case "completed":
+                let resultURL = jobURL.appendingPathComponent("result")
+                var resultRequest = URLRequest(url: resultURL)
+                resultRequest.timeoutInterval = 60
+                let (resultData, resultResponse) = try await URLSession.shared.data(for: resultRequest)
+                guard let resultHTTP = resultResponse as? HTTPURLResponse else {
+                    throw TranscriptionError.badResponse
+                }
+                guard (200...299).contains(resultHTTP.statusCode) else {
+                    if let failure = try? JSONDecoder().decode(TranscriptionServerFailureEnvelope.self, from: resultData) {
+                        throw TranscriptionError.structuredServerError(statusCode: resultHTTP.statusCode, failure: failure)
+                    }
+                    throw TranscriptionError.serverError(
+                        statusCode: resultHTTP.statusCode,
+                        message: String(data: resultData, encoding: .utf8) ?? "MLX result unavailable"
+                    )
+                }
+                return try parseText(from: resultData).trimmingCharacters(in: .whitespacesAndNewlines)
+            case "failed":
+                if let error = status.error {
+                    throw TranscriptionError.structuredServerError(
+                        statusCode: 500,
+                        failure: TranscriptionServerFailureEnvelope(jobID: status.jobID, error: error)
+                    )
+                }
+                throw TranscriptionError.serverError(statusCode: 500, message: status.message)
+            case "cancelled":
+                throw CancellationError()
+            default:
+                try await Task.sleep(for: .milliseconds(750))
+            }
         }
     }
 
@@ -1664,6 +1693,7 @@ final class AppModel: ObservableObject {
     private let fasterWhisperRuntimeInstaller = FasterWhisperRuntimeInstaller()
     private let appUpdateService = AppUpdateService()
     private let sessionLibrary = SessionLibraryService()
+    private let mlxJobRecoveryStore = try? MLXJobRecoveryStore.live()
     private var recordingTickerTask: Task<Void, Never>?
     private var transcriptionTickerTask: Task<Void, Never>?
     private var postStopTickerTask: Task<Void, Never>?
@@ -1679,6 +1709,7 @@ final class AppModel: ObservableObject {
     private var transcriptionJobSessions: [UUID: ContoraSession] = [:]
     private var activeTranscriptionJobID: UUID?
     private var activeTranscriptionTask: Task<Void, Never>?
+    private var pendingMLXRecoveryRecords: [MLXJobRecoveryRecord] = []
 
     private init() {
         sharedServerConfigPath = SharedTranscriptionServerConfigStore.shared.configFileURL().path
@@ -1686,7 +1717,9 @@ final class AppModel: ObservableObject {
         reloadSessions()
         refreshDiagnostics()
         refreshAudioDeviceContext()
-        autoStartMLXServerIfNeeded()
+        if !restorePendingMLXJobIfNeeded() {
+            autoStartMLXServerIfNeeded()
+        }
         checkForUpdates(silent: true)
     }
 
@@ -1708,6 +1741,170 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    @discardableResult
+    private func restorePendingMLXJobIfNeeded() -> Bool {
+        guard let recoveryStore = mlxJobRecoveryStore,
+              let records = try? recoveryStore.loadAll(),
+              !records.isEmpty else { return false }
+        pendingMLXRecoveryRecords = records.filter { record in
+            let sessionExists = sessions.contains(where: { $0.id == record.sessionID })
+            if !sessionExists {
+                recoveryStore.remove(localJobID: record.localJobID)
+            }
+            return sessionExists
+        }
+        resumeNextPendingMLXJobIfNeeded()
+        return activeTranscriptionJobID != nil || !pendingMLXRecoveryRecords.isEmpty
+    }
+
+    private func resumeNextPendingMLXJobIfNeeded() {
+        guard activeTranscriptionJobID == nil, !pendingMLXRecoveryRecords.isEmpty else { return }
+        let record = pendingMLXRecoveryRecords.removeFirst()
+        guard let session = sessions.first(where: { $0.id == record.sessionID }) else {
+            mlxJobRecoveryStore?.remove(localJobID: record.localJobID)
+            resumeNextPendingMLXJobIfNeeded()
+            return
+        }
+
+        let restoredJob = TranscriptionJob(
+            id: record.localJobID,
+            sessionID: session.id,
+            sessionTitle: session.title,
+            recordingURL: session.recordingURL,
+            createdAt: record.createdAt,
+            state: .transcribing,
+            audioSeconds: record.audioSeconds,
+            elapsedSeconds: max(0, Date().timeIntervalSince(record.createdAt)),
+            remainingSeconds: nil,
+            progress: nil,
+            speedRatio: nil,
+            statusText: "Reconnecting to saved transcription",
+            errorMessage: nil
+        )
+        if !transcriptionJobs.contains(where: { $0.id == restoredJob.id }) {
+            transcriptionJobs.insert(restoredJob, at: 0)
+        }
+        transcriptionJobSessions[record.localJobID] = session
+        activeTranscriptionJobID = record.localJobID
+        isPreparingTranscription = false
+        isTranscribing = true
+        activeTranscriptionAudioSeconds = record.audioSeconds
+        activeTranscriptionSessionTitle = session.title
+        transcriptionElapsedSeconds = restoredJob.elapsedSeconds
+        statusMessage = "Reconnecting to transcription for \(session.title)..."
+        startTranscriptionTicker(
+            from: record.createdAt,
+            jobID: record.localJobID,
+            statusText: "Reconnecting to saved transcription"
+        )
+        activeTranscriptionTask = Task { [weak self] in
+            guard let self else { return }
+            await self.executeRecoveredMLXJob(record: record, session: session)
+        }
+    }
+
+    private func executeRecoveredMLXJob(record: MLXJobRecoveryRecord, session: ContoraSession) async {
+        let jobID = record.localJobID
+        let sessionIdentity = RecordingArchiveService.SessionIdentity(
+            sessionID: session.id,
+            title: session.title,
+            createdAt: session.createdAt
+        )
+        do {
+            _ = try await sharedMLXToolkitService.start(modelID: record.modelID)
+            guard let endpointURL = URL(string: record.endpointURL) else {
+                throw TranscriptionError.serverError(statusCode: 400, message: "Invalid saved MLX endpoint URL")
+            }
+            let text = try await mlxTranscriber.resume(
+                jobID: record.remoteJobID,
+                endpointURL: endpointURL,
+                onProgress: { [weak self] progress in
+                    Task { @MainActor in
+                        self?.applyFasterWhisperProgress(
+                            FasterWhisperProcessProgress(
+                                phase: progress.phase,
+                                progress: progress.fraction,
+                                message: progress.message,
+                                currentSeconds: progress.processedSeconds,
+                                totalSeconds: progress.totalSeconds,
+                                etaSeconds: progress.etaSeconds
+                            ),
+                            jobID: jobID,
+                            startedAt: record.createdAt
+                        )
+                    }
+                }
+            )
+            try Task.checkCancellation()
+            clearMLXRecovery(jobID: jobID)
+            transcriptionTickerTask?.cancel()
+            transcriptionTickerTask = nil
+            isTranscribing = false
+            lastTranscriptionDurationSeconds = max(0, Date().timeIntervalSince(record.createdAt))
+            lastRealtimeSpeedRatio = lastTranscriptionDurationSeconds > 0
+                ? record.audioSeconds / lastTranscriptionDurationSeconds
+                : 0
+            statusMessage = "Recovered transcription complete"
+            lastTranscript = text.isEmpty ? "[Empty transcription]" : text
+            persistTranscript(
+                text: lastTranscript,
+                mode: .normal,
+                success: true,
+                errorMessage: nil,
+                recordingURL: session.recordingURL,
+                sessionIdentity: sessionIdentity,
+                captureSourceModeString: session.metadata.mode ?? "Imported Audio",
+                audioDurationSeconds: record.audioSeconds,
+                transcriptionDurationSeconds: lastTranscriptionDurationSeconds
+            )
+            updateTranscriptionJob(jobID) { job in
+                job.state = .completed
+                job.progress = 1
+                job.elapsedSeconds = lastTranscriptionDurationSeconds
+                job.remainingSeconds = 0
+                job.speedRatio = lastRealtimeSpeedRatio
+                job.statusText = "Completed after reconnect"
+                job.errorMessage = nil
+            }
+        } catch {
+            transcriptionTickerTask?.cancel()
+            transcriptionTickerTask = nil
+            isTranscribing = false
+            if isCancellationError(error) || Task.isCancelled {
+                clearMLXRecovery(jobID: jobID)
+                updateTranscriptionJob(jobID) { job in
+                    job.state = .cancelled
+                    job.statusText = "Stopped by user"
+                    job.remainingSeconds = nil
+                }
+            } else {
+                let structuredFailure = (error as? TranscriptionError)?.structuredFailure
+                let recoveryRetained = shouldRetainMLXRecovery(after: error)
+                if !recoveryRetained {
+                    clearMLXRecovery(jobID: jobID)
+                }
+                statusMessage = "Could not reconnect to transcription"
+                persistTranscriptionFailure(
+                    error: error,
+                    stage: structuredFailure?.stage ?? "reconnecting",
+                    recoverable: structuredFailure?.recoverable ?? true,
+                    session: session,
+                    sessionIdentity: sessionIdentity,
+                    audioDurationSeconds: record.audioSeconds
+                )
+                updateTranscriptionJob(jobID) { job in
+                    job.state = .failed
+                    job.statusText = recoveryRetained
+                        ? "Reconnect failed; saved job retained"
+                        : "Recovered job failed"
+                    job.remainingSeconds = nil
+                    job.errorMessage = error.localizedDescription
+                }
+            }
+        }
+        finishTranscriptionJob(jobID)
     }
 
     var selectedSession: ContoraSession? {
@@ -1946,6 +2143,7 @@ final class AppModel: ObservableObject {
         }
 
         activeTranscriptionTask?.cancel()
+        clearMLXRecovery(jobID: jobID)
         transcriptionTickerTask?.cancel()
         transcriptionTickerTask = nil
         isPreparingTranscription = false
@@ -3166,6 +3364,7 @@ final class AppModel: ObservableObject {
 
     private func transcribeWithSelectedBackend(
         samples16k: [Float],
+        onMLXJobCreated: @escaping @Sendable (String) -> Void = { _ in },
         onProgress: @escaping @Sendable (FasterWhisperProcessProgress) -> Void = { _ in }
     ) async throws -> String {
         switch transcriptionBackend {
@@ -3200,6 +3399,7 @@ final class AppModel: ObservableObject {
                 endpointURL: endpointURL,
                 modelID: mlxModelID,
                 enableDiarization: mlxDiarizationEnabled,
+                onJobCreated: onMLXJobCreated,
                 onProgress: { progress in
                     onProgress(
                         FasterWhisperProcessProgress(
@@ -3359,8 +3559,29 @@ final class AppModel: ObservableObject {
             startTranscriptionTicker(from: transcribeStartedAt, jobID: jobID, statusText: "Transcribing")
 
             do {
+                let recoveryStore = mlxJobRecoveryStore
+                let recoveryEndpoint = mlxTranscriptionEndpoint
+                let recoveryModel = mlxModelID
+                let recoveryLanguage = transcriptionLanguage
+                let recoveryDiarization = mlxDiarizationEnabled
+                let recoveryAudioSeconds = result.durationSeconds
                 let text = try await transcribeWithSelectedBackend(
                     samples16k: result.samples16kMono,
+                    onMLXJobCreated: { remoteJobID in
+                        let record = MLXJobRecoveryRecord(
+                            schemaVersion: "1.0",
+                            localJobID: jobID,
+                            remoteJobID: remoteJobID,
+                            sessionID: session.id,
+                            endpointURL: recoveryEndpoint,
+                            modelID: recoveryModel,
+                            language: recoveryLanguage,
+                            diarizationEnabled: recoveryDiarization,
+                            audioSeconds: recoveryAudioSeconds,
+                            createdAt: transcribeStartedAt
+                        )
+                        try? recoveryStore?.save(record)
+                    },
                     onProgress: { [weak self] progress in
                         Task { @MainActor in
                             self?.applyFasterWhisperProgress(
@@ -3372,6 +3593,7 @@ final class AppModel: ObservableObject {
                     }
                 )
                 try Task.checkCancellation()
+                clearMLXRecovery(jobID: jobID)
                 transcriptionTickerTask?.cancel()
                 transcriptionTickerTask = nil
                 isTranscribing = false
@@ -3406,6 +3628,7 @@ final class AppModel: ObservableObject {
                 transcriptionTickerTask = nil
                 isTranscribing = false
                 if isCancellationError(error) || Task.isCancelled {
+                    clearMLXRecovery(jobID: jobID)
                     statusMessage = "Transcription stopped"
                     updateTranscriptionJob(jobID) { job in
                         job.state = .cancelled
@@ -3425,10 +3648,14 @@ final class AppModel: ObservableObject {
                 }
                 statusMessage = "Transcription failed"
                 let structuredFailure = (error as? TranscriptionError)?.structuredFailure
+                let recoveryRetained = shouldRetainMLXRecovery(after: error)
+                if !recoveryRetained {
+                    clearMLXRecovery(jobID: jobID)
+                }
                 persistTranscriptionFailure(
                     error: error,
                     stage: structuredFailure?.stage ?? "transcribing",
-                    recoverable: structuredFailure?.recoverable ?? false,
+                    recoverable: structuredFailure?.recoverable ?? recoveryRetained,
                     session: session,
                     sessionIdentity: sessionIdentity,
                     audioDurationSeconds: result.durationSeconds
@@ -3439,7 +3666,7 @@ final class AppModel: ObservableObject {
                     job.remainingSeconds = nil
                     job.progress = nil
                     job.speedRatio = lastRealtimeSpeedRatio > 0 ? lastRealtimeSpeedRatio : nil
-                    job.statusText = "Failed"
+                    job.statusText = recoveryRetained ? "Connection lost; saved job retained" : "Failed"
                     job.errorMessage = error.localizedDescription
                 }
             }
@@ -3487,7 +3714,15 @@ final class AppModel: ObservableObject {
         activeTranscriptionTask = nil
         transcriptionJobSessions[jobID] = nil
         finishTranscriptionState()
-        processNextTranscriptionJobIfNeeded()
+        if pendingMLXRecoveryRecords.isEmpty {
+            processNextTranscriptionJobIfNeeded()
+        } else {
+            resumeNextPendingMLXJobIfNeeded()
+        }
+    }
+
+    private func clearMLXRecovery(jobID: UUID) {
+        mlxJobRecoveryStore?.remove(localJobID: jobID)
     }
 
     private func isCancellationError(_ error: Error) -> Bool {
@@ -3498,6 +3733,21 @@ final class AppModel: ObservableObject {
             return true
         }
         return false
+    }
+
+    private func shouldRetainMLXRecovery(after error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return urlError.code != .cancelled
+        }
+        guard let transcriptionError = error as? TranscriptionError else { return false }
+        switch transcriptionError {
+        case .badResponse:
+            return true
+        case let .serverError(statusCode, _):
+            return statusCode == 408 || statusCode >= 500
+        case .structuredServerError, .invalidPayload:
+            return false
+        }
     }
 
     private func updateTranscriptionJob(_ jobID: UUID, update: (inout TranscriptionJob) -> Void) {

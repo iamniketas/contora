@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import os
+import platform
 import re
 import shutil
+import statistics
 import threading
 import time
 import uuid
@@ -57,6 +60,9 @@ TERMINAL_JOB_TTL_SECONDS = max(
     JOB_TTL_SECONDS,
     float(os.getenv("CONTORA_MLX_TERMINAL_JOB_TTL_SECONDS", str(30 * 24 * 60 * 60))),
 )
+HARDWARE_PROFILE_PATH = Path(
+    os.getenv("CONTORA_MLX_HARDWARE_PROFILE_PATH", RESULTS_ROOT.parent / "hardware-profiles.json")
+).expanduser()
 CAPABILITY_TOKEN_PATTERN = re.compile(r"^[a-f0-9]{32,64}$")
 
 app = FastAPI(title="Contora MLX transcription server")
@@ -65,6 +71,7 @@ _diarization_pipeline = None
 _jobs: dict[str, dict[str, Any]] = {}
 _job_tasks: dict[str, asyncio.Task] = {}
 _job_cancellations: dict[str, threading.Event] = {}
+_job_telemetry: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _processing_lock = threading.Lock()
 
@@ -79,6 +86,40 @@ class FileHandoffRequest(BaseModel):
     language: str | None = None
     diarize: bool = True
     chunk_duration: float = Field(default=30.0, gt=0.0, le=120.0)
+
+
+class RollingRateEstimator:
+    def __init__(self, *, minimum_samples: int = 3, minimum_span: float = 1.0):
+        self.minimum_samples = minimum_samples
+        self.minimum_span = minimum_span
+        self.samples: deque[tuple[float, float]] = deque(maxlen=12)
+        self.smoothed_rate: float | None = None
+
+    def observe(self, processed_seconds: float, *, now: float | None = None) -> dict[str, float | None]:
+        observed_at = time.monotonic() if now is None else now
+        processed = max(0.0, float(processed_seconds))
+        if self.samples and processed <= self.samples[-1][1]:
+            return self.metrics()
+        self.samples.append((observed_at, processed))
+        if len(self.samples) >= self.minimum_samples and self.samples[-1][0] - self.samples[0][0] >= self.minimum_span:
+            rates = []
+            for previous, current in zip(self.samples, list(self.samples)[1:]):
+                wall_delta = current[0] - previous[0]
+                audio_delta = current[1] - previous[1]
+                if wall_delta > 0 and audio_delta > 0:
+                    rates.append(audio_delta / wall_delta)
+            if rates:
+                robust_rate = statistics.median(rates[-7:])
+                self.smoothed_rate = (
+                    robust_rate
+                    if self.smoothed_rate is None
+                    else (0.3 * robust_rate) + (0.7 * self.smoothed_rate)
+                )
+        return self.metrics()
+
+    def metrics(self) -> dict[str, float | None]:
+        processed = self.samples[-1][1] if self.samples else 0.0
+        return {"processed": processed, "rate": self.smoothed_rate}
 
 
 def timestamp(seconds: float | None) -> str:
@@ -182,6 +223,89 @@ def _job_manifest(job_id: str) -> dict[str, Any] | None:
     return manifest
 
 
+def _hardware_profile_key(model: str, diarize: bool) -> str:
+    hardware = os.getenv("CONTORA_MLX_HARDWARE_PROFILE", platform.machine())
+    return f"{hardware}|{model}|{'diarize' if diarize else 'asr-only'}"
+
+
+def _load_hardware_profile(model: str, diarize: bool) -> dict[str, Any] | None:
+    payload = _read_json(HARDWARE_PROFILE_PATH)
+    if payload is None:
+        return None
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, dict):
+        return None
+    profile = profiles.get(_hardware_profile_key(model, diarize))
+    return profile if isinstance(profile, dict) else None
+
+
+def _store_hardware_profile(
+    model: str,
+    diarize: bool,
+    *,
+    asr_seconds: float,
+    diarization_seconds: float,
+    merge_seconds: float,
+    audio_seconds: float,
+) -> None:
+    payload = _read_json(HARDWARE_PROFILE_PATH) or {"schema_version": "1.0", "profiles": {}}
+    profiles = payload.setdefault("profiles", {})
+    key = _hardware_profile_key(model, diarize)
+    previous = profiles.get(key) if isinstance(profiles.get(key), dict) else {}
+    sample_count = int(previous.get("sample_count") or 0)
+    alpha = 1.0 if sample_count == 0 else 0.25
+
+    def smoothed(field: str, current: float) -> float:
+        old = float(previous.get(field) or current)
+        return (alpha * max(0.0, current)) + ((1.0 - alpha) * old)
+
+    duration = max(0.001, audio_seconds)
+    profiles[key] = {
+        "sample_count": sample_count + 1,
+        "asr_wall_per_audio": smoothed("asr_wall_per_audio", asr_seconds / duration),
+        "diarization_wall_per_audio": smoothed(
+            "diarization_wall_per_audio", diarization_seconds / duration
+        ),
+        "merge_wall_per_audio": smoothed("merge_wall_per_audio", merge_seconds / duration),
+        "updated_at": time.time(),
+    }
+    HARDWARE_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(HARDWARE_PROFILE_PATH, payload)
+
+
+def _stage_weights(model: str, diarize: bool) -> tuple[float, float, float]:
+    profile = _load_hardware_profile(model, diarize)
+    if profile is None:
+        return (0.90, 0.0, 0.05) if not diarize else (0.40, 0.52, 0.03)
+    try:
+        asr = max(0.001, float(profile.get("asr_wall_per_audio") or 0.0))
+        diarization = (
+            max(0.0, float(profile.get("diarization_wall_per_audio") or 0.0))
+            if diarize
+            else 0.0
+        )
+        merge = max(0.001, float(profile.get("merge_wall_per_audio") or 0.0))
+    except (TypeError, ValueError):
+        return (0.90, 0.0, 0.05) if not diarize else (0.40, 0.52, 0.03)
+    scale = 0.95 / (asr + diarization + merge)
+    return asr * scale, diarization * scale, merge * scale
+
+
+def _telemetry_for(job_id: str) -> dict[str, Any]:
+    with _jobs_lock:
+        return _job_telemetry.setdefault(
+            job_id,
+            {"asr": RollingRateEstimator(), "diarization": RollingRateEstimator()},
+        )
+
+
+def _profile_rate(profile: dict[str, Any] | None, field: str) -> float:
+    try:
+        return max(0.0, float((profile or {}).get(field) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _initialize_job(job_id: str, total_seconds: float | None, *, diarize: bool) -> dict[str, Any]:
     now = time.time()
     status = {
@@ -197,6 +321,9 @@ def _initialize_job(job_id: str, total_seconds: float | None, *, diarize: bool) 
         "total_seconds": total_seconds,
         "elapsed_seconds": 0.0,
         "eta_seconds": None,
+        "asr_eta_seconds": None,
+        "diarization_eta_seconds": None,
+        "effective_rtf": None,
         "created_at": now,
         "updated_at": now,
         "error": None,
@@ -205,13 +332,6 @@ def _initialize_job(job_id: str, total_seconds: float | None, *, diarize: bool) 
         _jobs[job_id] = status
     atomic_write_json(RESULTS_ROOT / job_id / "status.json", status)
     return dict(status)
-
-
-def _estimated_remaining(started: float, progress: float) -> float | None:
-    elapsed = max(0.0, time.time() - started)
-    if progress < 0.03 or elapsed < 1.0:
-        return None
-    return max(0.0, elapsed * (1.0 - progress) / progress)
 
 
 def _update_progress(
@@ -225,6 +345,10 @@ def _update_progress(
     processed_seconds: float | None = None,
     asr_progress: float | None = None,
     diarization_progress: float | None = None,
+    eta_seconds: float | None = None,
+    effective_rtf: float | None = None,
+    asr_eta_seconds: float | None = None,
+    diarization_eta_seconds: float | None = None,
 ) -> None:
     changes: dict[str, Any] = {
         "state": state,
@@ -232,7 +356,7 @@ def _update_progress(
         "message": message,
         "progress": progress,
         "elapsed_seconds": max(0.0, time.time() - started),
-        "eta_seconds": _estimated_remaining(started, progress),
+        "eta_seconds": eta_seconds,
     }
     if processed_seconds is not None:
         changes["processed_seconds"] = processed_seconds
@@ -240,6 +364,12 @@ def _update_progress(
         changes["asr_progress"] = asr_progress
     if diarization_progress is not None:
         changes["diarization_progress"] = diarization_progress
+    if effective_rtf is not None:
+        changes["effective_rtf"] = effective_rtf
+    if asr_eta_seconds is not None:
+        changes["asr_eta_seconds"] = asr_eta_seconds
+    if diarization_eta_seconds is not None:
+        changes["diarization_eta_seconds"] = diarization_eta_seconds
     _store_job_status(job_id, **changes)
 
 
@@ -569,7 +699,13 @@ def _run_transcription_job(
             _raise_if_cancelled(cancel_event)
             stage = "transcribing"
             total_seconds = (_job_snapshot(job_id) or {}).get("total_seconds")
-            asr_end = 0.45 if diarize else 0.95
+            total_value = float(total_seconds or 0.0)
+            profile = _load_hardware_profile(model, diarize)
+            asr_weight, diarization_weight, merge_weight = _stage_weights(model, diarize)
+            asr_start = 0.05
+            asr_end = asr_start + asr_weight
+            diarization_end = asr_end + diarization_weight
+            telemetry = _telemetry_for(job_id)
 
             asr_checkpoint = _read_json(job_root / "asr.json")
             if asr_checkpoint is not None and asr_checkpoint.get("model") == model:
@@ -583,7 +719,7 @@ def _run_transcription_job(
                     phase="transcribing",
                     message="Resumed from ASR checkpoint",
                     progress=asr_end,
-                    processed_seconds=float(total_seconds or 0.0),
+                    processed_seconds=total_value,
                     asr_progress=1.0,
                 )
             else:
@@ -601,16 +737,38 @@ def _run_transcription_job(
                 def on_asr_progress(fraction: float) -> None:
                     _raise_if_cancelled(cancel_event)
                     fraction = min(1.0, max(0.0, fraction))
-                    processed = float(total_seconds or 0.0) * fraction
+                    processed = total_value * fraction
+                    rate = telemetry["asr"].observe(processed).get("rate")
+                    asr_eta = (total_value - processed) / rate if rate and total_value > processed else None
+                    remaining = asr_eta
+                    if remaining is not None:
+                        if diarize:
+                            profiled_diarization = _profile_rate(
+                                profile, "diarization_wall_per_audio"
+                            )
+                            remaining += (
+                                total_value * profiled_diarization
+                                if profiled_diarization > 0
+                                else (total_value / rate) * (diarization_weight / max(asr_weight, 0.001))
+                            )
+                        profiled_merge = _profile_rate(profile, "merge_wall_per_audio")
+                        remaining += (
+                            total_value * profiled_merge
+                            if profiled_merge > 0
+                            else (total_value / rate) * (merge_weight / max(asr_weight, 0.001))
+                        )
                     _update_progress(
                         job_id,
                         started=started,
                         state="transcribing",
                         phase="transcribing",
                         message=f"Transcribing audio · {int(fraction * 100)}%",
-                        progress=0.05 + ((asr_end - 0.05) * fraction),
+                        progress=asr_start + (asr_weight * fraction),
                         processed_seconds=processed,
                         asr_progress=fraction,
+                        eta_seconds=remaining,
+                        effective_rtf=(1.0 / rate) if rate else None,
+                        asr_eta_seconds=asr_eta,
                     )
 
                 on_asr_progress(0.0)
@@ -653,7 +811,7 @@ def _run_transcription_job(
                     phase="diarizing" if diarize else "transcribing",
                     message="Resumed from diarization checkpoint",
                     progress=0.97 if diarize else 0.95,
-                    processed_seconds=float(total_seconds or 0.0),
+                    processed_seconds=total_value,
                     diarization_progress=1.0,
                 )
             elif diarize:
@@ -663,7 +821,20 @@ def _run_transcription_job(
                 def on_diarization_progress(fraction: float, step_name: str) -> None:
                     _raise_if_cancelled(cancel_event)
                     fraction = min(1.0, max(0.0, fraction))
-                    processed = float(total_seconds or 0.0) * fraction
+                    processed = total_value * fraction
+                    rate = telemetry["diarization"].observe(processed).get("rate")
+                    diarization_eta = (
+                        (total_value - processed) / rate if rate and total_value > processed else None
+                    )
+                    remaining = diarization_eta
+                    if remaining is not None:
+                        profiled_merge = _profile_rate(profile, "merge_wall_per_audio")
+                        remaining += (
+                            total_value * profiled_merge
+                            if profiled_merge > 0
+                            else (total_value / rate)
+                            * (merge_weight / max(diarization_weight, 0.001))
+                        )
                     readable_step = step_name.replace("_", " ").capitalize()
                     _update_progress(
                         job_id,
@@ -671,9 +842,12 @@ def _run_transcription_job(
                         state="diarizing",
                         phase="diarizing",
                         message=f"Detecting speakers · {readable_step}",
-                        progress=0.45 + (0.52 * fraction),
+                        progress=asr_end + (diarization_weight * fraction),
                         processed_seconds=processed,
                         diarization_progress=fraction,
+                        eta_seconds=remaining,
+                        effective_rtf=(1.0 / rate) if rate else None,
+                        diarization_eta_seconds=diarization_eta,
                     )
 
                 on_diarization_progress(0.0, "segmentation")
@@ -700,14 +874,15 @@ def _run_transcription_job(
 
             _raise_if_cancelled(cancel_event)
             stage = "serializing"
+            merge_started = time.time()
             _update_progress(
                 job_id,
                 started=started,
                 state="merging",
                 phase="merging",
                 message="Merging and validating result",
-                progress=0.98,
-                processed_seconds=float(total_seconds or 0.0),
+                progress=max(asr_end, diarization_end),
+                processed_seconds=total_value,
             )
             response_payload = sanitize_finite_numbers(
                 {
@@ -719,15 +894,31 @@ def _run_transcription_job(
                     "language": result_data.get("language"),
                     "backend": "mlx+pyannote" if diarize else "mlx",
                     "model": model,
-                    "timing": {
-                        "total": time.time() - started,
-                        "asr": asr_seconds,
-                        "diarization": diarization_seconds,
-                    },
+                    "timing": {},
                 }
             )
+            merge_seconds = time.time() - merge_started
+            response_payload["timing"] = {
+                "total": time.time() - started,
+                "asr": asr_seconds,
+                "diarization": diarization_seconds,
+                "merge": merge_seconds,
+            }
             validate_transcription_response(response_payload)
             atomic_write_json(job_root / "result.json", response_payload)
+            if total_value > 0:
+                try:
+                    _store_hardware_profile(
+                        model,
+                        diarize,
+                        asr_seconds=asr_seconds,
+                        diarization_seconds=diarization_seconds,
+                        merge_seconds=merge_seconds,
+                        audio_seconds=total_value,
+                    )
+                except (OSError, TypeError, ValueError):
+                    # A performance-profile write must never invalidate a persisted result.
+                    pass
             _store_job_status(
                 job_id,
                 state="completed",
@@ -736,7 +927,7 @@ def _run_transcription_job(
                 progress=1.0,
                 asr_progress=1.0,
                 diarization_progress=1.0,
-                processed_seconds=float(total_seconds or 0.0),
+                processed_seconds=total_value,
                 elapsed_seconds=max(0.0, time.time() - started),
                 eta_seconds=0.0,
                 error=None,
@@ -782,6 +973,7 @@ def _start_background_job(job_id: str, audio_path: Path, **parameters: Any) -> N
         finally:
             with _jobs_lock:
                 _job_tasks.pop(job_id, None)
+                _job_telemetry.pop(job_id, None)
 
     task = asyncio.create_task(runner())
     with _jobs_lock:
@@ -863,6 +1055,7 @@ def _cleanup_expired_jobs(now: float | None = None) -> list[str]:
             _jobs.pop(job_id, None)
             _job_cancellations.pop(job_id, None)
             _job_tasks.pop(job_id, None)
+            _job_telemetry.pop(job_id, None)
         removed.append(job_id)
     return removed
 
