@@ -78,6 +78,25 @@ not as a timing result. Further ML measurements are suspended until the machine
 has a clean low-swap baseline. Failed records from an earlier misconfigured
 Python path are retained locally as failed and are not reported as measurements.
 
+## Fifty-seven-minute thermal/resource control
+
+The low-memory Core ML candidates completed two fresh-process runs against the
+3,409.6-second performance sample while the Mac remained on AC power. The
+harness did not observe a thermal warning, memory-pressure stop, or swap-growth
+stop. Semantic hashes exclude timing and diagnostic fields.
+
+| Candidate | Cold wall | Warm wall | Cold/warm speed | Peak process-tree RSS | Swap growth | Semantic cold/warm |
+|---|---:|---:|---:|---:|---:|---|
+| Argmax 1.1.0 | 260.407 s | 290.514 s | 13.09× / 11.74× | 343 / 437 MiB | 121 / 47 MiB | identical |
+| FluidAudio 0.9.1 | 29.340 s | 28.887 s | 116.21× / 118.03× | 606 / 559 MiB | 0 / 0 MiB | identical |
+
+These are performance and resource results only. They do not establish ASR
+accuracy, DER, speaker-attributed WER, or whether FluidAudio may be enabled in
+the public pipeline. The pre-existing system swap level was high, so the
+hour-long MLX candidates remain suspended until a clean post-reboot baseline is
+available; the guard evaluates per-run growth and correctly allowed these
+low-memory controls to finish.
+
 ## Quality gate and blockers
 
 No quality winner is selected because the following required evidence is not
@@ -89,8 +108,9 @@ yet available:
 2. Hugging Face access conditions have not been accepted for the pinned
    Community-1 and legacy pyannote model artifacts on this machine. Community-1
    is therefore blocked, not silently omitted.
-3. The 15-minute pinned MLX runs and 56–60-minute thermal/resource runs are not
-   complete.
+3. The 15-minute and 56–60-minute pinned MLX runs are not complete. The
+   hour-long Argmax and FluidAudio resource controls are complete, but cannot
+   substitute for the product MLX path.
 4. Native ASR word timestamps have not yet been compared with a Russian forced
    alignment pass against manual word boundaries.
 
@@ -104,8 +124,8 @@ cold/warm semantic results, peak process-tree RSS below 12 GiB, no thermal
 ## Current decision
 
 FluidAudio is the leading **performance candidate** for Core ML/ANE
-diarization, and Argmax is the leading warm-performance ASR control on the
-short/medium inputs completed so far. Neither is a product choice. Integration
+diarization, and Argmax is the leading ASR performance control on the completed
+short, medium, and hour-long inputs. Neither is a product choice. Integration
 behind a default-on path remains prohibited until the manual DER/SA-WER and
 hour-long gates pass. Pyannote/MPS remains the product fallback baseline.
 
