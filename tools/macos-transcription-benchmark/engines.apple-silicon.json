@@ -1,0 +1,188 @@
+{
+  "schema_version": "1.0",
+  "engines": [
+    {
+      "id": "mlx-audio-0.3.1-large-v3-turbo-fp16",
+      "kind": "asr",
+      "version": "0.3.1",
+      "model": "mlx-community/whisper-large-v3-turbo-asr-fp16",
+      "model_revision": "624c19c9af5603fa73b83bce14d4aeea96156d18",
+      "license": "MIT engine; OpenAI Whisper-derived weights",
+      "cwd": ".",
+      "env": {
+        "PYTHONHOME": "${CONTORA_BENCH_PYTHONHOME}",
+        "PYTHONPATH": "${CONTORA_BENCH_EXTRA_PYTHONPATH}"
+      },
+      "command": [
+        "${CONTORA_BENCH_RUNTIME_ROOT}/python/bin/python",
+        "adapters/run_mlx_audio.py",
+        "--audio",
+        "{audio}",
+        "--output",
+        "{output}",
+        "--model",
+        "${CONTORA_BENCH_RUNTIME_ROOT}/models/mlx-whisper-large-v3-turbo-fp16",
+        "--model-id",
+        "mlx-community/whisper-large-v3-turbo-asr-fp16",
+        "--model-revision",
+        "624c19c9af5603fa73b83bce14d4aeea96156d18",
+        "--language",
+        "ru",
+        "--chunk-duration",
+        "30"
+      ],
+      "timeout_seconds": 7200,
+      "sample_interval_seconds": 1
+    },
+    {
+      "id": "mlx-whisper-0.4.3-large-v3-turbo-fp16",
+      "kind": "asr",
+      "version": "0.4.3",
+      "model": "mlx-community/whisper-large-v3-turbo",
+      "model_revision": "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
+      "license": "MIT engine; OpenAI Whisper-derived weights",
+      "cwd": ".",
+      "env": {
+        "PYTHONHOME": "${CONTORA_BENCH_PYTHONHOME}",
+        "PYTHONPATH": "${CONTORA_BENCH_EXTRA_PYTHONPATH}"
+      },
+      "command": [
+        "${CONTORA_BENCH_RUNTIME_ROOT}/python/bin/python",
+        "adapters/run_mlx_whisper.py",
+        "--audio",
+        "{audio}",
+        "--output",
+        "{output}",
+        "--model",
+        "${CONTORA_BENCH_RUNTIME_ROOT}/models/mlx-whisper-official-large-v3-turbo-fp16",
+        "--model-id",
+        "mlx-community/whisper-large-v3-turbo",
+        "--model-revision",
+        "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
+        "--language",
+        "ru"
+      ],
+      "timeout_seconds": 7200,
+      "sample_interval_seconds": 1
+    },
+    {
+      "id": "argmax-1.1.0-large-v3-626mb",
+      "kind": "asr",
+      "version": "1.1.0",
+      "model": "argmaxinc/whisperkit-coreml:openai_whisper-large-v3-v20240930_626MB",
+      "model_revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "license": "MIT engine and model repository",
+      "cwd": ".",
+      "env": {
+        "PYTHONHOME": "${CONTORA_BENCH_PYTHONHOME}",
+        "PYTHONPATH": "${CONTORA_BENCH_EXTRA_PYTHONPATH}"
+      },
+      "command": [
+        "${CONTORA_BENCH_RUNTIME_ROOT}/python/bin/python",
+        "adapters/run_argmax.py",
+        "--binary",
+        "${CONTORA_BENCH_RUNTIME_ROOT}/sources/argmax-oss-swift/.build/release/argmax-cli",
+        "--audio",
+        "{audio}",
+        "--output",
+        "{output}",
+        "--model",
+        "openai_whisper-large-v3-v20240930_626MB",
+        "--model-path",
+        "${CONTORA_BENCH_RUNTIME_ROOT}/models/argmax-whisperkit-coreml/openai_whisper-large-v3-v20240930_626MB",
+        "--model-revision",
+        "0f63a7800b00dd0226abd051b906c246e1907482",
+        "--version",
+        "1.1.0",
+        "--language",
+        "ru"
+      ],
+      "timeout_seconds": 7200,
+      "sample_interval_seconds": 1
+    },
+    {
+      "id": "pyannote-3.1-mps",
+      "kind": "diarization",
+      "version": "pyannote.audio 3.4.0",
+      "model": "pyannote/speaker-diarization-3.1",
+      "model_revision": "84fd25912480287da0247647c3d2b4853cb3ee5d",
+      "license": "MIT pipeline/segmentation; CC-BY-4.0 WeSpeaker weights; gated model terms",
+      "cwd": ".",
+      "env": {
+        "PYTHONHOME": "${CONTORA_BENCH_PYTHONHOME}",
+        "PYTHONPATH": "${CONTORA_BENCH_EXTRA_PYTHONPATH}"
+      },
+      "command": [
+        "${CONTORA_BENCH_RUNTIME_ROOT}/python/bin/python",
+        "adapters/run_pyannote.py",
+        "--audio",
+        "{audio}",
+        "--output",
+        "{output}",
+        "--pipeline",
+        "${CONTORA_BENCH_RUNTIME_ROOT}/models/pyannote-legacy/pyannote/speaker-diarization-3.1",
+        "--model-id",
+        "pyannote/speaker-diarization-3.1",
+        "--legacy-runtime-root",
+        "${CONTORA_BENCH_RUNTIME_ROOT}/models/pyannote-legacy",
+        "--model-revision",
+        "84fd25912480287da0247647c3d2b4853cb3ee5d",
+        "--device",
+        "mps"
+      ],
+      "timeout_seconds": 7200,
+      "sample_interval_seconds": 1
+    },
+    {
+      "id": "pyannote-community-1-mps",
+      "kind": "diarization",
+      "version": "pyannote.audio 4.0.7",
+      "model": "pyannote/speaker-diarization-community-1",
+      "model_revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
+      "license": "MIT engine; CC-BY-4.0 model; gated model terms",
+      "cwd": ".",
+      "command": [
+        "${CONTORA_BENCH_RUNTIME_ROOT}/pyannote-community-python/bin/python",
+        "adapters/run_pyannote.py",
+        "--audio",
+        "{audio}",
+        "--output",
+        "{output}",
+        "--pipeline",
+        "${CONTORA_BENCH_RUNTIME_ROOT}/models/pyannote-community-1",
+        "--model-id",
+        "pyannote/speaker-diarization-community-1",
+        "--model-revision",
+        "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
+        "--device",
+        "mps"
+      ],
+      "timeout_seconds": 7200,
+      "sample_interval_seconds": 1
+    },
+    {
+      "id": "fluidaudio-0.9.1-offline-ane",
+      "kind": "diarization",
+      "version": "0.9.1",
+      "model": "FluidInference/speaker-diarization-coreml",
+      "model_revision": "1ed7a662fdc7109e36d822db793ee6eebdaf8594",
+      "license": "Apache-2.0 engine; CC-BY-4.0 model",
+      "cwd": ".",
+      "command": [
+        "native/.build/release/contora-fluid-diarize",
+        "--audio",
+        "{audio}",
+        "--output",
+        "{output}",
+        "--models",
+        "${CONTORA_BENCH_RUNTIME_ROOT}/models",
+        "--model-revision",
+        "1ed7a662fdc7109e36d822db793ee6eebdaf8594",
+        "--threshold",
+        "0.7045655"
+      ],
+      "timeout_seconds": 7200,
+      "sample_interval_seconds": 1
+    }
+  ]
+}

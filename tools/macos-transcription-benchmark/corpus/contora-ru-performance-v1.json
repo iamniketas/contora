@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "corpus": {
+    "id": "contora-ru-performance",
+    "revision": "1",
+    "language": "ru",
+    "reference_policy": "performance-only",
+    "description": "Private real-world Contora recordings, canonically converted to 16 kHz mono PCM. This manifest is for timing/resource measurements only and must never be used for quality claims."
+  },
+  "samples": [
+    {
+      "id": "contora-ru-2m",
+      "tags": ["real-world", "short"],
+      "audio": {
+        "path": "../.local-corpus/audio/contora-ru-2m.wav",
+        "duration_seconds": 120.0,
+        "sha256": "15513fad040a829c3db742a4726175e0843da5a667531d07d81900c084bf789a"
+      }
+    },
+    {
+      "id": "contora-ru-15m",
+      "tags": ["real-world", "medium"],
+      "audio": {
+        "path": "../.local-corpus/audio/contora-ru-15m.wav",
+        "duration_seconds": 900.0,
+        "sha256": "75e4fb7d8f06a693aec35e67be82922e39f8106223169f036fd8c8e2463f1f09"
+      }
+    },
+    {
+      "id": "contora-ru-57m",
+      "tags": ["real-world", "hour-long"],
+      "audio": {
+        "path": "../.local-corpus/audio/contora-ru-57m.wav",
+        "duration_seconds": 3409.6,
+        "sha256": "dea59daf688b62ae04bebe9b37f1b182d655fdd6c16cc494fe4d7b2a48bae0bf"
+      }
+    }
+  ]
+}

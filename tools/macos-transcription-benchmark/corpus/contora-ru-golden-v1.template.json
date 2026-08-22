@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0",
+  "corpus": {
+    "id": "contora-ru-golden",
+    "revision": "1",
+    "language": "ru",
+    "reference_policy": "manual-golden",
+    "description": "Russian Contora quality corpus. Audio and human-reviewed annotations remain private; only hashes, scoring policy and category coverage are versioned."
+  },
+  "scoring": {
+    "collar_seconds": 0.0,
+    "score_overlap": true
+  },
+  "quality_gate": {
+    "baselines": {
+      "asr": "mlx-audio-0.3.1-large-v3-turbo-fp16",
+      "diarization": "pyannote-3.1-mps"
+    },
+    "max_asr_delta_absolute_pp": 0.5,
+    "max_diarization_delta_absolute_pp": 0.0,
+    "max_punctuation_f1_drop": 0.0,
+    "max_tagged_word_recall_drop": 0.0,
+    "max_peak_memory_gib": 12.0,
+    "max_any_swap_growth_gib": 4.0,
+    "max_swap_growth_gib": 0.5
+  },
+  "samples": [
+    {
+      "id": "contora-ru-2m",
+      "tags": ["real-world", "short", "names", "numbers"],
+      "audio": {
+        "path": "../.local-corpus/audio/contora-ru-2m.wav",
+        "duration_seconds": 120.0,
+        "sha256": "15513fad040a829c3db742a4726175e0843da5a667531d07d81900c084bf789a"
+      },
+      "reference": {
+        "path": "../.local-corpus/references/contora-ru-2m.golden.json",
+        "status": "golden"
+      }
+    },
+    {
+      "id": "contora-ru-15m",
+      "tags": ["real-world", "medium", "speaker-changes", "long-pauses"],
+      "audio": {
+        "path": "../.local-corpus/audio/contora-ru-15m.wav",
+        "duration_seconds": 900.0,
+        "sha256": "75e4fb7d8f06a693aec35e67be82922e39f8106223169f036fd8c8e2463f1f09"
+      },
+      "reference": {
+        "path": "../.local-corpus/references/contora-ru-15m.golden.json",
+        "status": "golden"
+      }
+    },
+    {
+      "id": "contora-ru-57m",
+      "tags": ["real-world", "hour-long", "thermal", "memory"],
+      "audio": {
+        "path": "../.local-corpus/audio/contora-ru-57m.wav",
+        "duration_seconds": 3409.6,
+        "sha256": "dea59daf688b62ae04bebe9b37f1b182d655fdd6c16cc494fe4d7b2a48bae0bf"
+      },
+      "reference": {
+        "path": "../.local-corpus/references/contora-ru-57m.golden.json",
+        "status": "golden"
+      }
+    }
+  ]
+}
