@@ -7,6 +7,7 @@ struct ClientCrashSafetySmokeTest {
         try verifyFailureArtifactPreservesTranscript()
         try verifyStructuredServerFailure()
         try verifyMLXJobProgressStatus()
+        try verifyMLXJobRecoveryStore()
         print("Client crash-safety smoke test passed")
     }
 
@@ -128,6 +129,33 @@ struct ClientCrashSafetySmokeTest {
             throw SmokeTestError.jobProgressInvalid
         }
     }
+
+    private static func verifyMLXJobRecoveryStore() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("contora-mlx-recovery-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = MLXJobRecoveryStore(directoryURL: root)
+        let record = MLXJobRecoveryRecord(
+            schemaVersion: "1.0",
+            localJobID: UUID(),
+            remoteJobID: "remote-job",
+            sessionID: "session",
+            endpointURL: "http://127.0.0.1:8010/v1/audio/transcriptions",
+            modelID: "test-model",
+            language: "ru",
+            diarizationEnabled: true,
+            audioSeconds: 600,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        try store.save(record)
+        guard try store.loadAll() == [record] else {
+            throw SmokeTestError.recoveryStoreInvalid
+        }
+        store.remove(localJobID: record.localJobID)
+        guard try store.loadAll().isEmpty else {
+            throw SmokeTestError.recoveryStoreInvalid
+        }
+    }
 }
 
 enum SmokeTestError: Error {
@@ -136,4 +164,5 @@ enum SmokeTestError: Error {
     case failureArtifactInvalid
     case structuredFailureInvalid
     case jobProgressInvalid
+    case recoveryStoreInvalid
 }

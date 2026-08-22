@@ -36,6 +36,14 @@ use `CONTORA_MLX_TERMINAL_JOB_TTL_SECONDS` (30 days by default).
 
 ASR progress is observed from Whisper's internal seek loop, without splitting the
 recording into independent requests. Diarization progress uses pyannote's pipeline hook.
+ETA uses a robust rolling rate over recent processed-audio samples and stays hidden until
+the observation window is stable. Duration-normalized ASR, diarization, and merge timings
+are saved in `hardware-profiles.json` per hardware/model/mode and weight later jobs.
+
+The macOS client atomically stores the local-session/server-job association in
+`Application Support/Contora/PendingTranscriptionJobs`. After an app restart it starts
+the managed backend, reattaches to the same server job, and immediately resumes polling
+its real phase rather than creating a duplicate transcription.
 
 Run lightweight tests with:
 

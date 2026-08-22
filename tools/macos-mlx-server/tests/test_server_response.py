@@ -1,8 +1,10 @@
+import io
 import json
 import math
 import tempfile
 import time
 import unittest
+import wave
 from pathlib import Path
 import sys
 
@@ -57,12 +59,23 @@ class ServerResponseTests(unittest.TestCase):
             server._jobs.clear()
             server._job_tasks.clear()
             server._job_cancellations.clear()
+            server._job_telemetry.clear()
 
     def configure_roots(self, directory):
         server.RESULTS_ROOT = Path(directory) / "results"
         server.HANDOFF_ROOT = Path(directory) / "handoff"
+        server.HARDWARE_PROFILE_PATH = Path(directory) / "hardware-profiles.json"
         server.RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
         server.HANDOFF_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def wav_bytes(self):
+        output = io.BytesIO()
+        with wave.open(output, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16_000)
+            handle.writeframes(b"\x00\x00" * 1_600)
+        return output.getvalue()
 
     def test_persists_sanitized_result_before_returning_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -353,6 +366,57 @@ class ServerResponseTests(unittest.TestCase):
             self.assertFalse(job_root.exists())
             self.assertFalse(audio_path.exists())
             self.assertFalse(descriptor_path.exists())
+
+    def test_rolling_rate_waits_for_stable_window_and_uses_robust_rate(self):
+        estimator = server.RollingRateEstimator(minimum_samples=3, minimum_span=1.0)
+        self.assertIsNone(estimator.observe(0, now=0)["rate"])
+        self.assertIsNone(estimator.observe(10, now=0.5)["rate"])
+        stable = estimator.observe(20, now=1.0)
+        self.assertEqual(stable["rate"], 20.0)
+        after_outlier = estimator.observe(21, now=2.0)
+        self.assertAlmostEqual(after_outlier["rate"], 20.0)
+
+    def test_hardware_profile_uses_duration_normalized_stage_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+            server._store_hardware_profile(
+                "test",
+                True,
+                asr_seconds=50,
+                diarization_seconds=40,
+                merge_seconds=10,
+                audio_seconds=100,
+            )
+            asr, diarization, merge = server._stage_weights("test", True)
+
+            self.assertAlmostEqual(asr, 0.475)
+            self.assertAlmostEqual(diarization, 0.38)
+            self.assertAlmostEqual(merge, 0.095)
+            self.assertAlmostEqual(asr + diarization + merge, 0.95)
+
+    def test_hardware_profile_failure_cannot_invalidate_completed_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+            original_model_for = server.model_for
+            original_store_profile = server._store_hardware_profile
+
+            def fail_profile_write(*_args, **_kwargs):
+                raise OSError("profile disk unavailable")
+
+            server.model_for = lambda _name: FakeModel()
+            server._store_hardware_profile = fail_profile_write
+            try:
+                response = TestClient(server.app).post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("audio.wav", self.wav_bytes(), "audio/wav")},
+                    data={"model": "test", "language": "ru", "diarize": "false"},
+                )
+            finally:
+                server.model_for = original_model_for
+                server._store_hardware_profile = original_store_profile
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["text"].split(": ")[-1], "Привет")
 
     def test_mlx_internal_seek_progress_callback_is_monotonic(self):
         from mlx_audio.stt.models.whisper import whisper as whisper_module
