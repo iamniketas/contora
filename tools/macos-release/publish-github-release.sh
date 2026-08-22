@@ -21,9 +21,10 @@ api() {
     "$@"
 }
 
-release_json="$(mktemp "${TMPDIR:-/tmp}/contora-release.XXXXXX.json")"
+release_json="$(mktemp "${TMPDIR:-/tmp}/contora-release.XXXXXX")"
+trap 'rm -f "$release_json" "${release_list:-}"' EXIT
 if ! api "https://api.github.com/repos/$REPO/releases/tags/$TAG" > "$release_json"; then
-  release_list="$(mktemp "${TMPDIR:-/tmp}/contora-releases.XXXXXX.json")"
+  release_list="$(mktemp "${TMPDIR:-/tmp}/contora-releases.XXXXXX")"
   api "https://api.github.com/repos/$REPO/releases?per_page=100" > "$release_list"
   python3 - "$release_list" "$release_json" "$TAG" <<'PY'
 import json, sys
