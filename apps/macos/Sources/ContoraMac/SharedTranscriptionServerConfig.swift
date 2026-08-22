@@ -7,14 +7,14 @@ enum TranscriptionBackend: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
-    /// `fasterWhisperProcess` remains a decoding tombstone for settings written
-    /// by Contora 0.6.x. It must never appear as a selectable macOS backend.
-    static let allCases: [TranscriptionBackend] = [.mlxOpenAIHTTP, .whisperHTTP]
+    /// Legacy values remain decoding tombstones for settings written by older
+    /// Contora versions. The macOS product exposes only the managed MLX backend.
+    static let allCases: [TranscriptionBackend] = [.mlxOpenAIHTTP]
 
     var title: String {
         switch self {
         case .whisperHTTP:
-            return "Whisper HTTP"
+            return "Legacy backend (migrated)"
         case .mlxOpenAIHTTP:
             return "MLX OpenAI HTTP"
         case .fasterWhisperProcess:
@@ -25,7 +25,7 @@ enum TranscriptionBackend: String, CaseIterable, Identifiable, Codable {
     init(from decoder: Decoder) throws {
         let rawValue = try decoder.singleValueContainer().decode(String.self)
         let decoded = TranscriptionBackend(rawValue: rawValue) ?? .mlxOpenAIHTTP
-        self = decoded == .fasterWhisperProcess ? .mlxOpenAIHTTP : decoded
+        self = decoded == .mlxOpenAIHTTP ? decoded : .mlxOpenAIHTTP
     }
 }
 
@@ -128,7 +128,7 @@ final class SharedTranscriptionServerConfigStore {
             let rawObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             let rawBackend = rawObject?["activeBackend"] as? String
             if config.schemaVersion != "2.0"
-                || rawBackend == TranscriptionBackend.fasterWhisperProcess.rawValue
+                || rawBackend != TranscriptionBackend.mlxOpenAIHTTP.rawValue
                 || !config.fasterWhisperModelName.isEmpty
                 || config.fasterWhisperDiarizationEnabled {
                 config.schemaVersion = "2.0"
@@ -171,23 +171,12 @@ final class SharedTranscriptionServerConfigStore {
     func probe(backend: TranscriptionBackend, whisperURL: String, mlxURL: String, fasterWhisperModelName: String) async -> String {
         switch backend {
         case .whisperHTTP:
-            guard let transcribeURL = URL(string: whisperURL),
-                  var components = URLComponents(url: transcribeURL, resolvingAgainstBaseURL: false) else {
-                return "Whisper: invalid URL"
-            }
-            components.path = "/health"
-            guard let healthURL = components.url else {
-                return "Whisper: invalid health URL"
-            }
-            do {
-                let (_, response) = try await URLSession.shared.data(from: healthURL)
-                guard let http = response as? HTTPURLResponse else {
-                    return "Whisper: bad response"
-                }
-                return (200...299).contains(http.statusCode) ? "Whisper: OK (/health)" : "Whisper: HTTP \(http.statusCode)"
-            } catch {
-                return "Whisper probe failed: \(error.localizedDescription)"
-            }
+            return await probe(
+                backend: .mlxOpenAIHTTP,
+                whisperURL: whisperURL,
+                mlxURL: mlxURL,
+                fasterWhisperModelName: fasterWhisperModelName
+            )
 
         case .mlxOpenAIHTTP:
             guard let transcribeURL = URL(string: mlxURL),

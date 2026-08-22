@@ -939,68 +939,6 @@ final class AudioCompressionService {
     }
 }
 
-final class WhisperHTTPTranscriptionService {
-    func transcribe(samples16kMono: [Float], language: String, endpointURL: URL) async throws -> String {
-        let wavData = WAVEncoder.makeWAVData(samples: samples16kMono, sampleRate: 16_000)
-        let boundary = "Boundary-\(UUID().uuidString)"
-        let requestBody = makeMultipartBody(wavData: wavData, language: language, boundary: boundary)
-        let audioSeconds = Double(samples16kMono.count) / 16_000.0
-        let timeoutSeconds = max(120, min(1_800, (audioSeconds * 2.0) + 60))
-
-        var request = URLRequest(url: endpointURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = timeoutSeconds
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = requestBody
-
-        let (data, response): (Data, URLResponse)
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch let error as URLError where error.code == .timedOut {
-            throw TranscriptionError.serverError(
-                statusCode: 408,
-                message: "Client timeout after \(Int(timeoutSeconds))s. Try streaming mode or a shorter recording."
-            )
-        }
-
-        guard let http = response as? HTTPURLResponse else {
-            throw TranscriptionError.badResponse
-        }
-
-        guard (200...299).contains(http.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
-            throw TranscriptionError.serverError(statusCode: http.statusCode, message: message)
-        }
-
-        guard
-            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let text = json["text"] as? String
-        else {
-            throw TranscriptionError.invalidPayload
-        }
-
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func makeMultipartBody(wavData: Data, language: String, boundary: String) -> Data {
-        var body = Data()
-        let lineBreak = "\r\n"
-
-        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Type: audio/wav\(lineBreak)\(lineBreak)".data(using: .utf8)!)
-        body.append(wavData)
-        body.append(lineBreak.data(using: .utf8)!)
-
-        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"language\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
-        body.append("\(language)\(lineBreak)".data(using: .utf8)!)
-
-        body.append("--\(boundary)--\(lineBreak)".data(using: .utf8)!)
-        return body
-    }
-}
-
 private struct MLXAudioHandoff: Sendable {
     private struct Descriptor: Encodable {
         let schemaVersion: String
@@ -1037,8 +975,9 @@ private struct MLXAudioHandoff: Sendable {
         )
 
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        let audioURL = directory.appendingPathComponent("(token).wav")
-        let descriptorURL = directory.appendingPathComponent("(token).json")
+        let paths = MLXAudioHandoffPaths(directory: directory, capabilityToken: token)
+        let audioURL = paths.audioURL
+        let descriptorURL = paths.descriptorURL
         do {
             try WAVEncoder.writeWAVFile(samples: samples16kMono, sampleRate: 16_000, to: audioURL)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: audioURL.path)
@@ -1734,7 +1673,6 @@ final class AppModel: ObservableObject {
 
     private let audioCapture = AudioCaptureService()
     private let systemAudioCapture = SystemAudioCaptureService()
-    private let transcriber = WhisperHTTPTranscriptionService()
     private let mlxTranscriber = MLXHTTPTranscriptionService()
     private let audioFileImportService = AudioFileImportService()
     private let videoFileImportService = VideoFileImportService()
@@ -2027,7 +1965,7 @@ final class AppModel: ObservableObject {
     var activeBackendDisplay: String {
         switch transcriptionBackend {
         case .whisperHTTP:
-            return "Whisper HTTP | \(transcriptionEndpoint)"
+            return "MLX OpenAI HTTP | \(mlxModelID)"
         case .mlxOpenAIHTTP:
             return "MLX OpenAI HTTP | \(mlxModelID)"
         case .fasterWhisperProcess:
@@ -2047,8 +1985,8 @@ final class AppModel: ObservableObject {
         sharedMLXToolkitService.status().isInstalled ? "Repair Speech Runtime" : "Set Up Speech Runtime"
     }
 
-    func selectTranscriptionBackend(_ backend: TranscriptionBackend) {
-        transcriptionBackend = backend == .fasterWhisperProcess ? .mlxOpenAIHTTP : backend
+    func selectTranscriptionBackend(_: TranscriptionBackend) {
+        transcriptionBackend = .mlxOpenAIHTTP
         transcriptionEnabled = true
         saveSharedServerConfig()
         refreshDiagnostics()
@@ -2085,7 +2023,7 @@ final class AppModel: ObservableObject {
     func loadSharedServerConfig() {
         do {
             let config = try SharedTranscriptionServerConfigStore.shared.loadOrCreate()
-            transcriptionBackend = config.activeBackend == .fasterWhisperProcess ? .mlxOpenAIHTTP : config.activeBackend
+            transcriptionBackend = .mlxOpenAIHTTP
             transcriptionEndpoint = config.whisperTranscribeURL
             mlxTranscriptionEndpoint = config.mlxTranscribeURL
             mlxModelID = config.mlxModelID
@@ -2099,7 +2037,7 @@ final class AppModel: ObservableObject {
     func saveSharedServerConfig() {
         let config = SharedTranscriptionServerConfig(
             schemaVersion: "2.0",
-            activeBackend: transcriptionBackend == .fasterWhisperProcess ? .mlxOpenAIHTTP : transcriptionBackend,
+            activeBackend: .mlxOpenAIHTTP,
             whisperTranscribeURL: transcriptionEndpoint,
             mlxTranscribeURL: mlxTranscriptionEndpoint,
             mlxModelID: mlxModelID,
@@ -3229,7 +3167,7 @@ final class AppModel: ObservableObject {
     private func activeTranscriptionEndpointString() -> String {
         switch transcriptionBackend {
         case .whisperHTTP:
-            return transcriptionEndpoint
+            return mlxTranscriptionEndpoint
         case .mlxOpenAIHTTP:
             return mlxTranscriptionEndpoint
         case .fasterWhisperProcess:
@@ -3244,15 +3182,13 @@ final class AppModel: ObservableObject {
     ) async throws -> TranscriptionBackendOutput {
         switch transcriptionBackend {
         case .whisperHTTP:
-            guard let endpointURL = URL(string: transcriptionEndpoint) else {
-                throw TranscriptionError.serverError(statusCode: 400, message: "Invalid Whisper endpoint URL")
-            }
-            let text = try await transcriber.transcribe(
-                samples16kMono: samples16k,
-                language: transcriptionLanguage,
-                endpointURL: endpointURL
+            transcriptionBackend = .mlxOpenAIHTTP
+            saveSharedServerConfig()
+            return try await transcribeWithSelectedBackend(
+                samples16k: samples16k,
+                onMLXJobCreated: onMLXJobCreated,
+                onProgress: onProgress
             )
-            return TranscriptionBackendOutput(text: text)
 
         case .mlxOpenAIHTTP:
             guard let endpointURL = URL(string: mlxTranscriptionEndpoint) else {
@@ -4875,13 +4811,12 @@ struct BackendWorkspacePanel: View {
                     .frame(width: 8, height: 8)
             }
 
-            Picker("Engine", selection: backendBinding) {
-                ForEach(TranscriptionBackend.allCases) { backend in
-                    Text(backend == .mlxOpenAIHTTP ? "Managed MLX" : backend.title).tag(backend)
-                }
+            HStack {
+                Text("Managed MLX")
+                Spacer()
+                Text("Apple Silicon")
+                    .foregroundStyle(.secondary)
             }
-            .labelsHidden()
-            .disabled(model.isRecording || model.isTranscriptionBusy)
 
             HStack(spacing: 8) {
                 Button {
@@ -4892,22 +4827,8 @@ struct BackendWorkspacePanel: View {
                 .disabled(model.isRecording || model.isTranscriptionBusy)
             }
 
-            switch model.transcriptionBackend {
-            case .mlxOpenAIHTTP:
-                mlxControls
-            case .fasterWhisperProcess:
-                mlxControls
-            case .whisperHTTP:
-                WorkspaceMetricRow(label: "Endpoint", value: model.transcriptionEndpoint)
-            }
+            mlxControls
         }
-    }
-
-    private var backendBinding: Binding<TranscriptionBackend> {
-        Binding(
-            get: { model.transcriptionBackend },
-            set: { model.selectTranscriptionBackend($0) }
-        )
     }
 
     private var mlxModelBinding: Binding<String> {
@@ -5464,26 +5385,13 @@ struct SettingsView: View {
         Form {
             Section("Transcription") {
                 Toggle("Enable Transcription", isOn: $model.transcriptionEnabled)
-                Picker("Backend", selection: transcriptionBackendBinding) {
-                    ForEach(TranscriptionBackend.allCases) { backend in
-                        Text(backend.title).tag(backend)
-                    }
-                }
-                .disabled(!model.transcriptionEnabled)
+                LabeledContent("Backend", value: "Managed MLX")
                 TextField("Language", text: $model.transcriptionLanguage)
                     .disabled(!model.transcriptionEnabled)
                 statusRow("Backend status", model.backendProbeStatus)
             }
 
-            if model.transcriptionBackend == .mlxOpenAIHTTP || model.transcriptionBackend == .fasterWhisperProcess {
-                mlxSettings
-            } else {
-                Section("Whisper HTTP") {
-                    Text("Uses an external Whisper-compatible HTTP server. Configure its endpoint in Advanced.")
-                        .foregroundStyle(.secondary)
-                    Button("Check Connection") { model.probeSharedBackend() }
-                }
-            }
+            mlxSettings
         }
         .formStyle(.grouped)
     }
@@ -5570,7 +5478,6 @@ struct SettingsView: View {
     private var advancedSettings: some View {
         Form {
             Section("Server Endpoints") {
-                TextField("Whisper endpoint URL", text: $model.transcriptionEndpoint)
                 TextField("MLX endpoint URL", text: $model.mlxTranscriptionEndpoint)
                 HStack {
                     Button("Reload Config") { model.loadSharedServerConfig() }
@@ -5609,13 +5516,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-    }
-
-    private var transcriptionBackendBinding: Binding<TranscriptionBackend> {
-        Binding(
-            get: { model.transcriptionBackend },
-            set: { model.selectTranscriptionBackend($0) }
-        )
     }
 
     private var mlxDiarizationBinding: Binding<Bool> {

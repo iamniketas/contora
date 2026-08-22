@@ -5,6 +5,12 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.8] - 2026-08-22
+
+### macOS
+- **Working capability handoff**: canonical WAV and descriptor filenames now contain the actual capability token expected by the local job server, fixing `400 Audio capability is missing or invalid` on every MLX transcription in 0.6.7.
+- **Single managed backend**: Whisper HTTP is no longer exposed in the macOS workspace, settings, or advanced endpoint UI; legacy `whisper_http` and `faster_whisper_process` settings migrate to Managed MLX.
+
 ## [0.6.7] - 2026-08-22
 
 ### macOS
