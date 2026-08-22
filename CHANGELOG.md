@@ -5,7 +5,7 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.7] - 2026-08-22
 
 ### macOS
 - **Persistent crash recovery**: app and backend restarts reattach to saved jobs and reuse compatible ASR/diarization checkpoints.
