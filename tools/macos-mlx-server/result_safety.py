@@ -57,7 +57,7 @@ def _require_type(payload: dict[str, Any], key: str, expected: type | tuple[type
 
 
 def validate_transcription_response(payload: Any) -> dict[str, Any]:
-    """Validate the stable v1 response envelope before it reaches FastAPI."""
+    """Validate the stable response envelope before it reaches FastAPI."""
     if not isinstance(payload, dict):
         raise ResponseValidationError("response must be an object")
 
@@ -69,6 +69,76 @@ def validate_transcription_response(payload: Any) -> dict[str, Any]:
     _require_type(payload, "backend", str)
     _require_type(payload, "model", str)
     _require_type(payload, "timing", dict)
+
+    if payload["schema_version"].startswith("2"):
+        for key in ("words", "speaker_turns", "utterances", "asr_segments"):
+            _require_type(payload, key, list)
+
+        for index, word in enumerate(payload["words"]):
+            if not isinstance(word, dict):
+                raise ResponseValidationError(f"words[{index}] must be an object")
+            for key in ("text", "speaker"):
+                if not isinstance(word.get(key), str):
+                    raise ResponseValidationError(f"words[{index}].{key} must be a string")
+            for key in ("start", "end", "speaker_score"):
+                number = word.get(key)
+                if (
+                    not isinstance(number, (int, float))
+                    or isinstance(number, bool)
+                    or not math.isfinite(float(number))
+                ):
+                    raise ResponseValidationError(f"words[{index}].{key} must be a finite number")
+            confidence = word.get("confidence")
+            if confidence is not None and (
+                not isinstance(confidence, (int, float))
+                or isinstance(confidence, bool)
+                or not math.isfinite(float(confidence))
+            ):
+                raise ResponseValidationError(f"words[{index}].confidence must be finite or null")
+            if not isinstance(word.get("overlap"), bool):
+                raise ResponseValidationError(f"words[{index}].overlap must be a boolean")
+            if not isinstance(word.get("overlap_speakers"), list):
+                raise ResponseValidationError(f"words[{index}].overlap_speakers must be an array")
+
+        for collection_name in ("speaker_turns", "utterances"):
+            for index, item in enumerate(payload[collection_name]):
+                if not isinstance(item, dict):
+                    raise ResponseValidationError(f"{collection_name}[{index}] must be an object")
+                for key in ("start", "end"):
+                    number = item.get(key)
+                    if (
+                        not isinstance(number, (int, float))
+                        or isinstance(number, bool)
+                        or not math.isfinite(float(number))
+                    ):
+                        raise ResponseValidationError(
+                            f"{collection_name}[{index}].{key} must be a finite number"
+                        )
+                if not isinstance(item.get("speaker"), str):
+                    raise ResponseValidationError(
+                        f"{collection_name}[{index}].speaker must be a string"
+                    )
+                confidence = item.get("confidence")
+                if confidence is not None and (
+                    not isinstance(confidence, (int, float))
+                    or isinstance(confidence, bool)
+                    or not math.isfinite(float(confidence))
+                ):
+                    raise ResponseValidationError(
+                        f"{collection_name}[{index}].confidence must be finite or null"
+                    )
+                if collection_name == "utterances":
+                    if not isinstance(item.get("text"), str):
+                        raise ResponseValidationError(f"utterances[{index}].text must be a string")
+                    for key in ("word_start_index", "word_end_index"):
+                        if not isinstance(item.get(key), int) or isinstance(item.get(key), bool):
+                            raise ResponseValidationError(
+                                f"utterances[{index}].{key} must be an integer"
+                            )
+                    if not isinstance(item.get("overlap"), bool):
+                        raise ResponseValidationError(
+                            f"utterances[{index}].overlap must be a boolean"
+                        )
 
     language = payload.get("language")
     if language is not None and not isinstance(language, str):

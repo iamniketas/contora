@@ -166,6 +166,24 @@ struct ContoraSession: Identifiable, Hashable {
         }
     }
 
+    struct Word: Hashable {
+        let text: String
+        let startSeconds: Double
+        let endSeconds: Double
+        let confidence: Double?
+        let speakerID: String
+        let speakerScore: Double
+        let overlap: Bool
+        let overlapSpeakers: [String]
+    }
+
+    struct SpeakerTurn: Hashable {
+        let startSeconds: Double
+        let endSeconds: Double
+        let speakerID: String
+        let confidence: Double?
+    }
+
     struct Metadata: Hashable {
         let createdAt: String?
         let mode: String?
@@ -186,6 +204,8 @@ struct ContoraSession: Identifiable, Hashable {
     let metadata: Metadata
     let speakers: [Speaker]
     let segments: [Segment]
+    let words: [Word]
+    let speakerTurns: [SpeakerTurn]
 }
 
 struct EditableSessionSegment: Identifiable, Hashable {
@@ -333,7 +353,9 @@ final class SessionLibraryService {
                 transcriptPreview: makePreview(from: transcriptText),
                 metadata: metadata,
                 speakers: parsed.speakers,
-                segments: parsed.segments
+                segments: parsed.segments,
+                words: [],
+                speakerTurns: []
             )
         }
 
@@ -371,6 +393,26 @@ final class SessionLibraryService {
                 text: $0.text
             )
         }
+        let manifestWords = manifest.transcription?.words?.map {
+            ContoraSession.Word(
+                text: $0.text,
+                startSeconds: $0.startSeconds,
+                endSeconds: $0.endSeconds,
+                confidence: $0.confidence,
+                speakerID: $0.speakerID,
+                speakerScore: $0.speakerScore,
+                overlap: $0.overlap,
+                overlapSpeakers: $0.overlapSpeakers
+            )
+        } ?? []
+        let manifestSpeakerTurns = manifest.transcription?.speakerTurns?.map {
+            ContoraSession.SpeakerTurn(
+                startSeconds: $0.startSeconds,
+                endSeconds: $0.endSeconds,
+                speakerID: $0.speakerID,
+                confidence: $0.confidence
+            )
+        } ?? []
         let transcriptionSucceeded = manifest.transcription?.status == "completed"
         let transcriptionFailed = manifest.transcription?.status == "failed"
             || (manifest.transcription == nil && manifest.lastFailure != nil)
@@ -393,7 +435,9 @@ final class SessionLibraryService {
                 errorMessage: manifest.lastFailure?.message ?? manifest.transcription?.errorMessage
             ),
             speakers: manifestSpeakers ?? parsed.speakers,
-            segments: manifestSegments ?? parsed.segments
+            segments: manifestSegments ?? parsed.segments,
+            words: manifestWords,
+            speakerTurns: manifestSpeakerTurns
         )
     }
 
@@ -706,7 +750,7 @@ final class RecordingArchiveService {
         let recordingDirectory = recordingFileURL.deletingLastPathComponent().standardizedFileURL
         let isInternalRecording = recordingDirectory == manifestDirectory
         let manifest = ContoraSessionManifest(
-            schemaVersion: "1.0",
+            schemaVersion: transcription?.words == nil ? "1.0" : "2.0",
             sessionID: sessionID.sessionID,
             title: sessionID.title,
             createdAt: formatter.string(from: sessionID.createdAt),
@@ -745,10 +789,11 @@ final class RecordingArchiveService {
         postStopWaitSeconds: Double,
         transcriptionSeconds: Double?,
         success: Bool,
-        errorMessage: String?
+        errorMessage: String?,
+        structuredResultData: Data? = nil
     ) throws -> URL {
         let jsonURL = artifactBaseURL?.appendingPathExtension("json") ?? recordingFileURL.deletingPathExtension().appendingPathExtension("json")
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "created_at": ISO8601DateFormatter().string(from: Date()),
             "recording_file": recordingFileURL.lastPathComponent,
             "mode": mode,
@@ -761,6 +806,11 @@ final class RecordingArchiveService {
             "error": errorMessage as Any,
             "text": transcriptText
         ]
+        if let structuredResultData,
+           let result = try? JSONSerialization.jsonObject(with: structuredResultData) as? [String: Any] {
+            payload["result_schema_version"] = result["schema_version"]
+            payload["transcription_result"] = result
+        }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .withoutEscapingSlashes])
         try data.write(to: jsonURL, options: .atomic)
         return jsonURL
@@ -1065,7 +1115,7 @@ final class MLXHTTPTranscriptionService {
         enableDiarization: Bool,
         onJobCreated: @escaping @Sendable (String) -> Void = { _ in },
         onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void = { _ in }
-    ) async throws -> String {
+    ) async throws -> MLXTranscriptionResponse {
         let audioSeconds = Double(samples16kMono.count) / 16_000.0
         guard let jobsURL = URL(string: "/v1/transcription/jobs", relativeTo: endpointURL)?.absoluteURL else {
             throw TranscriptionError.badResponse
@@ -1141,7 +1191,7 @@ final class MLXHTTPTranscriptionService {
         jobID: String,
         endpointURL: URL,
         onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void = { _ in }
-    ) async throws -> String {
+    ) async throws -> MLXTranscriptionResponse {
         guard let jobsURL = URL(string: "/v1/transcription/jobs", relativeTo: endpointURL)?.absoluteURL else {
             throw TranscriptionError.badResponse
         }
@@ -1158,7 +1208,7 @@ final class MLXHTTPTranscriptionService {
     private func poll(
         jobURL: URL,
         onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void
-    ) async throws -> String {
+    ) async throws -> MLXTranscriptionResponse {
         while true {
             try Task.checkCancellation()
             var statusRequest = URLRequest(url: jobURL)
@@ -1202,7 +1252,7 @@ final class MLXHTTPTranscriptionService {
                         message: String(data: resultData, encoding: .utf8) ?? "MLX result unavailable"
                     )
                 }
-                return try parseText(from: resultData).trimmingCharacters(in: .whitespacesAndNewlines)
+                return try parseResponse(from: resultData)
             case "failed":
                 if let error = status.error {
                     throw TranscriptionError.structuredServerError(
@@ -1219,13 +1269,22 @@ final class MLXHTTPTranscriptionService {
         }
     }
 
-    private func parseText(from data: Data) throws -> String {
+    private func parseResponse(from data: Data) throws -> MLXTranscriptionResponse {
+        let resultV2 = try? JSONDecoder().decode(MLXResultV2Envelope.self, from: data)
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let text = json["text"] as? String, !text.isEmpty {
-                return text
+                return MLXTranscriptionResponse(
+                    text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+                    payloadData: data,
+                    resultV2: resultV2
+                )
             }
             if let accumulated = json["accumulated"] as? String, !accumulated.isEmpty {
-                return accumulated
+                return MLXTranscriptionResponse(
+                    text: accumulated.trimmingCharacters(in: .whitespacesAndNewlines),
+                    payloadData: data,
+                    resultV2: resultV2
+                )
             }
         }
 
@@ -1243,7 +1302,11 @@ final class MLXHTTPTranscriptionService {
             }
 
             if let accumulated = json["accumulated"] as? String, !accumulated.isEmpty {
-                return accumulated
+                return MLXTranscriptionResponse(
+                    text: accumulated.trimmingCharacters(in: .whitespacesAndNewlines),
+                    payloadData: data,
+                    resultV2: resultV2
+                )
             }
             if let text = json["text"] as? String, !text.isEmpty {
                 textParts.append(text)
@@ -1254,7 +1317,7 @@ final class MLXHTTPTranscriptionService {
         if merged.isEmpty {
             throw TranscriptionError.invalidPayload
         }
-        return merged
+        return MLXTranscriptionResponse(text: merged, payloadData: data, resultV2: resultV2)
     }
 }
 
@@ -1817,7 +1880,7 @@ final class AppModel: ObservableObject {
             guard let endpointURL = URL(string: record.endpointURL) else {
                 throw TranscriptionError.serverError(statusCode: 400, message: "Invalid saved MLX endpoint URL")
             }
-            let text = try await mlxTranscriber.resume(
+            let response = try await mlxTranscriber.resume(
                 jobID: record.remoteJobID,
                 endpointURL: endpointURL,
                 onProgress: { [weak self] progress in
@@ -1837,6 +1900,7 @@ final class AppModel: ObservableObject {
                     }
                 }
             )
+            let text = response.text
             try Task.checkCancellation()
             clearMLXRecovery(jobID: jobID)
             transcriptionTickerTask?.cancel()
@@ -1857,7 +1921,9 @@ final class AppModel: ObservableObject {
                 sessionIdentity: sessionIdentity,
                 captureSourceModeString: session.metadata.mode ?? "Imported Audio",
                 audioDurationSeconds: record.audioSeconds,
-                transcriptionDurationSeconds: lastTranscriptionDurationSeconds
+                transcriptionDurationSeconds: lastTranscriptionDurationSeconds,
+                structuredResultData: response.payloadData,
+                mlxResultV2: response.resultV2
             )
             updateTranscriptionJob(jobID) { job in
                 job.state = .completed
@@ -2798,6 +2864,26 @@ final class AppModel: ObservableObject {
                             speakerID: $0.speakerID,
                             text: $0.text
                         )
+                    },
+                    words: session.words.isEmpty ? nil : session.words.map {
+                        .init(
+                            text: $0.text,
+                            startSeconds: $0.startSeconds,
+                            endSeconds: $0.endSeconds,
+                            confidence: $0.confidence,
+                            speakerID: $0.speakerID,
+                            speakerScore: $0.speakerScore,
+                            overlap: $0.overlap,
+                            overlapSpeakers: $0.overlapSpeakers
+                        )
+                    },
+                    speakerTurns: session.speakerTurns.isEmpty ? nil : session.speakerTurns.map {
+                        .init(
+                            startSeconds: $0.startSeconds,
+                            endSeconds: $0.endSeconds,
+                            speakerID: $0.speakerID,
+                            confidence: $0.confidence
+                        )
                     }
                 ),
                 manifestBaseURL: artifactBaseURL?.deletingLastPathComponent()
@@ -3366,17 +3452,18 @@ final class AppModel: ObservableObject {
         samples16k: [Float],
         onMLXJobCreated: @escaping @Sendable (String) -> Void = { _ in },
         onProgress: @escaping @Sendable (FasterWhisperProcessProgress) -> Void = { _ in }
-    ) async throws -> String {
+    ) async throws -> TranscriptionBackendOutput {
         switch transcriptionBackend {
         case .whisperHTTP:
             guard let endpointURL = URL(string: transcriptionEndpoint) else {
                 throw TranscriptionError.serverError(statusCode: 400, message: "Invalid Whisper endpoint URL")
             }
-            return try await transcriber.transcribe(
+            let text = try await transcriber.transcribe(
                 samples16kMono: samples16k,
                 language: transcriptionLanguage,
                 endpointURL: endpointURL
             )
+            return TranscriptionBackendOutput(text: text)
 
         case .mlxOpenAIHTTP:
             guard let endpointURL = URL(string: mlxTranscriptionEndpoint) else {
@@ -3393,7 +3480,7 @@ final class AppModel: ObservableObject {
                 )
             )
             _ = try await sharedMLXToolkitService.start(modelID: mlxModelID)
-            return try await mlxTranscriber.transcribe(
+            let response = try await mlxTranscriber.transcribe(
                 samples16kMono: samples16k,
                 language: transcriptionLanguage,
                 endpointURL: endpointURL,
@@ -3413,6 +3500,11 @@ final class AppModel: ObservableObject {
                     )
                 }
             )
+            return TranscriptionBackendOutput(
+                text: response.text,
+                structuredResultData: response.payloadData,
+                mlxResultV2: response.resultV2
+            )
 
         case .fasterWhisperProcess:
             let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
@@ -3420,7 +3512,7 @@ final class AppModel: ObservableObject {
             let enableDiarization = fasterWhisperDiarizationEnabled
             let wavData = WAVEncoder.makeWAVData(samples: samples16k, sampleRate: 16_000)
             let cancellationFlag = FasterWhisperCancellationFlag()
-            return try await withTaskCancellationHandler {
+            let text = try await withTaskCancellationHandler {
                 try await Task.detached(priority: .userInitiated) {
                     let workDirectory = FileManager.default.temporaryDirectory
                         .appendingPathComponent("contora-faster-whisper-\(UUID().uuidString)", isDirectory: true)
@@ -3445,6 +3537,7 @@ final class AppModel: ObservableObject {
             } onCancel: {
                 cancellationFlag.cancel()
             }
+            return TranscriptionBackendOutput(text: text)
         }
     }
 
@@ -3565,7 +3658,7 @@ final class AppModel: ObservableObject {
                 let recoveryLanguage = transcriptionLanguage
                 let recoveryDiarization = mlxDiarizationEnabled
                 let recoveryAudioSeconds = result.durationSeconds
-                let text = try await transcribeWithSelectedBackend(
+                let output = try await transcribeWithSelectedBackend(
                     samples16k: result.samples16kMono,
                     onMLXJobCreated: { remoteJobID in
                         let record = MLXJobRecoveryRecord(
@@ -3592,6 +3685,7 @@ final class AppModel: ObservableObject {
                         }
                     }
                 )
+                let text = output.text
                 try Task.checkCancellation()
                 clearMLXRecovery(jobID: jobID)
                 transcriptionTickerTask?.cancel()
@@ -3612,7 +3706,9 @@ final class AppModel: ObservableObject {
                     sessionIdentity: sessionIdentity,
                     captureSourceModeString: session.metadata.mode ?? "Imported Audio",
                     audioDurationSeconds: result.durationSeconds,
-                    transcriptionDurationSeconds: lastTranscriptionDurationSeconds > 0 ? lastTranscriptionDurationSeconds : nil
+                    transcriptionDurationSeconds: lastTranscriptionDurationSeconds > 0 ? lastTranscriptionDurationSeconds : nil,
+                    structuredResultData: output.structuredResultData,
+                    mlxResultV2: output.mlxResultV2
                 )
                 updateTranscriptionJob(jobID) { job in
                     job.state = .completed
@@ -3818,7 +3914,9 @@ final class AppModel: ObservableObject {
         sessionIdentity: RecordingArchiveService.SessionIdentity,
         captureSourceModeString: String,
         audioDurationSeconds: Double,
-        transcriptionDurationSeconds: Double?
+        transcriptionDurationSeconds: Double?,
+        structuredResultData: Data? = nil,
+        mlxResultV2: MLXResultV2Envelope? = nil
     ) {
         do {
             let modeString: String
@@ -3844,7 +3942,8 @@ final class AppModel: ObservableObject {
                 postStopWaitSeconds: lastPostStopWaitSeconds,
                 transcriptionSeconds: transcriptionDurationSeconds,
                 success: success,
-                errorMessage: errorMessage
+                errorMessage: errorMessage,
+                structuredResultData: structuredResultData
             )
             let transcriptionStatus = success ? "completed" : "failed"
             let siblingM4A = existingSiblingM4A(for: recordingURL)
@@ -3872,6 +3971,26 @@ final class AppModel: ObservableObject {
                             endSeconds: $0.endSeconds,
                             speakerID: $0.speakerID,
                             text: $0.text
+                        )
+                    },
+                    words: mlxResultV2?.words.map {
+                        .init(
+                            text: $0.text,
+                            startSeconds: $0.start,
+                            endSeconds: $0.end,
+                            confidence: $0.confidence,
+                            speakerID: $0.speaker,
+                            speakerScore: $0.speakerScore,
+                            overlap: $0.overlap,
+                            overlapSpeakers: $0.overlapSpeakers
+                        )
+                    },
+                    speakerTurns: mlxResultV2?.speakerTurns.map {
+                        .init(
+                            startSeconds: $0.start,
+                            endSeconds: $0.end,
+                            speakerID: $0.speaker,
+                            confidence: $0.confidence
                         )
                     }
                 ),
@@ -3930,6 +4049,26 @@ final class AppModel: ObservableObject {
                             endSeconds: $0.endSeconds,
                             speakerID: $0.speakerID,
                             text: $0.text
+                        )
+                    },
+                    words: session.words.isEmpty ? nil : session.words.map {
+                        .init(
+                            text: $0.text,
+                            startSeconds: $0.startSeconds,
+                            endSeconds: $0.endSeconds,
+                            confidence: $0.confidence,
+                            speakerID: $0.speakerID,
+                            speakerScore: $0.speakerScore,
+                            overlap: $0.overlap,
+                            overlapSpeakers: $0.overlapSpeakers
+                        )
+                    },
+                    speakerTurns: session.speakerTurns.isEmpty ? nil : session.speakerTurns.map {
+                        .init(
+                            startSeconds: $0.startSeconds,
+                            endSeconds: $0.endSeconds,
+                            speakerID: $0.speakerID,
+                            confidence: $0.confidence
                         )
                     }
                 )
@@ -4059,7 +4198,7 @@ final class AppModel: ObservableObject {
         statusMessage = "Streaming chunk transcription..."
 
         do {
-            let text = try await transcribeWithSelectedBackend(samples16k: chunk16k)
+            let text = (try await transcribeWithSelectedBackend(samples16k: chunk16k)).text
 
             streamingChunksProcessed += 1
 

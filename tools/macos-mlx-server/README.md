@@ -45,6 +45,13 @@ The macOS client atomically stores the local-session/server-job association in
 the managed backend, reattaches to the same server job, and immediately resumes polling
 its real phase rather than creating a duplicate transcription.
 
+Completed jobs publish result schema v2. Whisper produces native cross-attention
+word timestamps in the ASR pass; pyannote produces one global list of speaker turns.
+The merge stage assigns speakers to `words[]` by normalized overlap with midpoint,
+nearest-boundary, and continuity fallbacks, records true simultaneous-speech overlap,
+and assembles `utterances[]` independently of the original `asr_segments[]`. The macOS
+archive preserves the full v2 payload plus words and speaker turns in the session manifest.
+
 Run lightweight tests with:
 
 ```bash

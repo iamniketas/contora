@@ -85,6 +85,77 @@ class ResultSafetyTests(unittest.TestCase):
         with self.assertRaises(ResponseValidationError):
             validate_transcription_response({"schema_version": "1.0"})
 
+    def test_validates_schema_v2_word_and_speaker_collections(self):
+        payload = {
+            "schema_version": "2.0",
+            "job_id": "job-v2",
+            "text": "text",
+            "raw_text": "text",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "text", "speaker": "SPEAKER_00"}],
+            "words": [
+                {
+                    "text": " text",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "confidence": 0.9,
+                    "speaker": "SPEAKER_00",
+                    "speaker_score": 1.0,
+                    "overlap": False,
+                    "overlap_speakers": [],
+                }
+            ],
+            "speaker_turns": [
+                {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "confidence": None}
+            ],
+            "utterances": [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "SPEAKER_00",
+                    "text": "text",
+                    "word_start_index": 0,
+                    "word_end_index": 1,
+                    "overlap": False,
+                }
+            ],
+            "asr_segments": [{"start": 0.0, "end": 1.0, "text": "text"}],
+            "backend": "mlx+pyannote",
+            "model": "test",
+            "timing": {"total": 3.0, "asr": 2.0, "diarization": 1.0},
+        }
+
+        self.assertIs(validate_transcription_response(payload), payload)
+
+    def test_rejects_schema_v2_word_without_finite_speaker_score(self):
+        payload = {
+            "schema_version": "2.0",
+            "job_id": "job-v2",
+            "text": "text",
+            "raw_text": "text",
+            "segments": [],
+            "words": [
+                {
+                    "text": "text",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "confidence": None,
+                    "speaker": "SPEAKER_00",
+                    "speaker_score": None,
+                    "overlap": False,
+                    "overlap_speakers": [],
+                }
+            ],
+            "speaker_turns": [],
+            "utterances": [],
+            "asr_segments": [],
+            "backend": "mlx",
+            "model": "test",
+            "timing": {"total": 1.0, "asr": 1.0, "diarization": 0.0},
+        }
+
+        with self.assertRaises(ResponseValidationError):
+            validate_transcription_response(payload)
+
 
 if __name__ == "__main__":
     unittest.main()

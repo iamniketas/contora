@@ -8,6 +8,7 @@ struct ClientCrashSafetySmokeTest {
         try verifyStructuredServerFailure()
         try verifyMLXJobProgressStatus()
         try verifyMLXJobRecoveryStore()
+        try verifyMLXResultV2Decoding()
         print("Client crash-safety smoke test passed")
     }
 
@@ -156,6 +157,36 @@ struct ClientCrashSafetySmokeTest {
             throw SmokeTestError.recoveryStoreInvalid
         }
     }
+
+    private static func verifyMLXResultV2Decoding() throws {
+        let data = Data(
+            """
+            {
+              "schema_version": "2.0",
+              "text": "formatted",
+              "raw_text": "Первый Второй",
+              "words": [
+                {"text":" Первый","start":0,"end":0.4,"confidence":0.9,"speaker":"SPEAKER_00","speaker_score":1,"overlap":false,"overlap_speakers":[]},
+                {"text":" Второй","start":0.6,"end":1,"confidence":0.8,"speaker":"SPEAKER_01","speaker_score":1,"overlap":false,"overlap_speakers":[]}
+              ],
+              "speaker_turns": [
+                {"start":0,"end":0.5,"speaker":"SPEAKER_00","confidence":null},
+                {"start":0.5,"end":1,"speaker":"SPEAKER_01","confidence":null}
+              ],
+              "utterances": [
+                {"start":0,"end":0.4,"speaker":"SPEAKER_00","text":"Первый","word_start_index":0,"word_end_index":1,"overlap":false},
+                {"start":0.6,"end":1,"speaker":"SPEAKER_01","text":"Второй","word_start_index":1,"word_end_index":2,"overlap":false}
+              ]
+            }
+            """.utf8
+        )
+        let result = try JSONDecoder().decode(MLXResultV2Envelope.self, from: data)
+        guard result.schemaVersion == "2.0",
+              result.words.map(\.speaker) == ["SPEAKER_00", "SPEAKER_01"],
+              result.utterances.count == 2 else {
+            throw SmokeTestError.resultV2Invalid
+        }
+    }
 }
 
 enum SmokeTestError: Error {
@@ -165,4 +196,5 @@ enum SmokeTestError: Error {
     case structuredFailureInvalid
     case jobProgressInvalid
     case recoveryStoreInvalid
+    case resultV2Invalid
 }
