@@ -494,6 +494,22 @@ def assign_speakers(
     segments: list[dict[str, Any]],
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> list[dict[str, Any]]:
+    turns = diarize_speaker_turns(audio_path, progress_callback=progress_callback)
+    labelled: list[dict[str, Any]] = []
+    for segment in segments:
+        start = float(segment.get("start") or 0.0)
+        end = float(segment.get("end") or start)
+        scores = _speaker_overlap_scores(start, end, turns)
+        labelled_segment = dict(segment)
+        labelled_segment["speaker"] = max(scores, key=scores.get) if scores else "SPEAKER_00"
+        labelled.append(labelled_segment)
+    return labelled
+
+
+def diarize_speaker_turns(
+    audio_path: str,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> list[dict[str, Any]]:
     step_ranges = {
         "segmentation": (0.0, 0.30),
         "speaker_counting": (0.30, 0.35),
@@ -515,24 +531,239 @@ def assign_speakers(
             progress_callback(observed_progress, str(step_name))
 
     diarization = diarization_pipeline()(audio_path, hook=hook if progress_callback is not None else None)
-    labelled: list[dict[str, Any]] = []
+    turns = [
+        {
+            "start": float(turn.start),
+            "end": float(turn.end),
+            "speaker": str(speaker),
+            "confidence": None,
+        }
+        for turn, _, speaker in diarization.itertracks(yield_label=True)
+        if float(turn.end) >= float(turn.start)
+    ]
+    return sorted(turns, key=lambda turn: (turn["start"], turn["end"], turn["speaker"]))
 
-    for segment in segments:
-        start = float(segment.get("start") or 0.0)
-        end = float(segment.get("end") or start)
-        best_speaker = "SPEAKER_00"
-        best_overlap = 0.0
 
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            overlap = max(0.0, min(end, float(turn.end)) - max(start, float(turn.start)))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = str(speaker)
+def extract_asr_words(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    words: list[dict[str, Any]] = []
+    for segment_index, segment in enumerate(segments):
+        for item in list(segment.get("words") or []):
+            if not isinstance(item, dict):
+                continue
+            text = item.get("word", item.get("text"))
+            start = item.get("start")
+            end = item.get("end")
+            if not isinstance(text, str) or not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+                continue
+            start_value = max(0.0, float(start))
+            end_value = max(start_value, float(end))
+            words.append(
+                {
+                    "text": text,
+                    "start": start_value,
+                    "end": end_value,
+                    "confidence": item.get("probability", item.get("confidence")),
+                    "asr_segment_index": segment_index,
+                }
+            )
+    return words
 
-        labelled_segment = dict(segment)
-        labelled_segment["speaker"] = best_speaker
-        labelled.append(labelled_segment)
-    return labelled
+
+def _speaker_overlap_scores(
+    start: float,
+    end: float,
+    turns: list[dict[str, Any]],
+) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for turn in turns:
+        overlap = max(
+            0.0,
+            min(end, float(turn.get("end") or 0.0)) - max(start, float(turn.get("start") or 0.0)),
+        )
+        if overlap > 0:
+            speaker = str(turn.get("speaker") or "SPEAKER_00")
+            scores[speaker] = scores.get(speaker, 0.0) + overlap
+    return scores
+
+
+def _concurrent_speakers(start: float, end: float, turns: list[dict[str, Any]]) -> list[str]:
+    active = [
+        turn
+        for turn in turns
+        if min(end, float(turn.get("end") or 0.0)) > max(start, float(turn.get("start") or 0.0))
+    ]
+    speakers: set[str] = set()
+    for index, first in enumerate(active):
+        for second in active[index + 1 :]:
+            if first.get("speaker") == second.get("speaker"):
+                continue
+            simultaneous = min(
+                end,
+                float(first.get("end") or 0.0),
+                float(second.get("end") or 0.0),
+            ) - max(
+                start,
+                float(first.get("start") or 0.0),
+                float(second.get("start") or 0.0),
+            )
+            if simultaneous > 0:
+                speakers.add(str(first.get("speaker") or "SPEAKER_00"))
+                speakers.add(str(second.get("speaker") or "SPEAKER_00"))
+    return sorted(speakers)
+
+
+def attribute_speakers_to_words(
+    words: list[dict[str, Any]],
+    turns: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    attributed: list[dict[str, Any]] = []
+    previous_speaker: str | None = None
+    for word in words:
+        start = float(word.get("start") or 0.0)
+        end = max(start, float(word.get("end") or start))
+        duration = max(0.001, end - start)
+        midpoint = start + ((end - start) / 2.0)
+        overlaps = _speaker_overlap_scores(start, end, turns)
+        ranked = sorted(overlaps.items(), key=lambda item: (-item[1], item[0]))
+
+        if len(ranked) >= 2:
+            top_score = ranked[0][1]
+            close_speakers = {
+                speaker_name
+                for speaker_name, score in ranked
+                if top_score > 0 and score / top_score >= 0.9
+            }
+            midpoint_speakers = {
+                str(turn.get("speaker") or "SPEAKER_00")
+                for turn in turns
+                if float(turn.get("start") or 0.0) <= midpoint <= float(turn.get("end") or 0.0)
+            }
+            midpoint_match = sorted(close_speakers & midpoint_speakers)
+            if len(midpoint_match) == 1:
+                chosen = midpoint_match[0]
+                ranked.sort(key=lambda item: (item[0] != chosen, -item[1], item[0]))
+            elif previous_speaker in close_speakers:
+                ranked.sort(key=lambda item: (item[0] != previous_speaker, -item[1], item[0]))
+
+        if ranked:
+            speaker, raw_score = ranked[0]
+        else:
+            midpoint_turn = next(
+                (
+                    turn
+                    for turn in turns
+                    if float(turn.get("start") or 0.0) <= midpoint <= float(turn.get("end") or 0.0)
+                ),
+                None,
+            )
+            if midpoint_turn is not None:
+                speaker = str(midpoint_turn.get("speaker") or "SPEAKER_00")
+                raw_score = duration * 0.5
+            elif turns:
+                nearest = min(
+                    turns,
+                    key=lambda turn: min(
+                        abs(midpoint - float(turn.get("start") or 0.0)),
+                        abs(midpoint - float(turn.get("end") or 0.0)),
+                    ),
+                )
+                nearest_distance = min(
+                    abs(midpoint - float(nearest.get("start") or 0.0)),
+                    abs(midpoint - float(nearest.get("end") or 0.0)),
+                )
+                if nearest_distance <= 0.5:
+                    speaker = str(nearest.get("speaker") or "SPEAKER_00")
+                    raw_score = duration * max(0.0, 0.5 - nearest_distance)
+                else:
+                    speaker = previous_speaker or "SPEAKER_00"
+                    raw_score = 0.0
+            else:
+                speaker = previous_speaker or "SPEAKER_00"
+                raw_score = duration
+
+        overlap_speakers = _concurrent_speakers(start, end, turns)
+        labelled = dict(word)
+        labelled["speaker"] = speaker
+        labelled["speaker_score"] = min(1.0, max(0.0, raw_score / duration))
+        labelled["overlap"] = len(overlap_speakers) > 1
+        labelled["overlap_speakers"] = overlap_speakers
+        attributed.append(sanitize_finite_numbers(labelled))
+        previous_speaker = speaker
+    return attributed
+
+
+def _join_word_text(parts: list[str]) -> str:
+    result = ""
+    punctuation = set(",.!?:;)]}»”")
+    for part in parts:
+        if not part:
+            continue
+        if not result or part[0].isspace() or part[0] in punctuation:
+            result += part
+        else:
+            result += " " + part
+    return result.strip()
+
+
+def assemble_utterances(
+    words: list[dict[str, Any]],
+    *,
+    max_gap_seconds: float = 1.5,
+    max_characters: int = 240,
+) -> list[dict[str, Any]]:
+    utterances: list[dict[str, Any]] = []
+    current_words: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if not current_words:
+            return
+        utterances.append(
+            {
+                "start": float(current_words[0]["start"]),
+                "end": float(current_words[-1]["end"]),
+                "speaker": str(current_words[0].get("speaker") or "SPEAKER_00"),
+                "text": _join_word_text([str(word.get("text") or "") for word in current_words]),
+                "word_start_index": len(words_seen) - len(current_words),
+                "word_end_index": len(words_seen),
+                "overlap": any(bool(word.get("overlap")) for word in current_words),
+            }
+        )
+        current_words.clear()
+
+    words_seen: list[dict[str, Any]] = []
+    for word in words:
+        candidate_text = _join_word_text(
+            [str(item.get("text") or "") for item in current_words] + [str(word.get("text") or "")]
+        )
+        gap = (
+            float(word.get("start") or 0.0) - float(current_words[-1].get("end") or 0.0)
+            if current_words
+            else 0.0
+        )
+        should_split = bool(
+            current_words
+            and (
+                word.get("speaker") != current_words[-1].get("speaker")
+                or bool(word.get("overlap")) != bool(current_words[-1].get("overlap"))
+                or gap > max_gap_seconds
+                or len(candidate_text) > max_characters
+            )
+        )
+        if should_split:
+            flush()
+        current_words.append(word)
+        words_seen.append(word)
+    flush()
+    return utterances
+
+
+def formatted_utterances(utterances: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        f"[{timestamp(item.get('start'))} --> {timestamp(item.get('end'))}] "
+        f"[{item.get('speaker') or 'SPEAKER_00'}]: {str(item.get('text') or '').strip()}"
+        for item in utterances
+        if str(item.get("text") or "").strip()
+    )
 
 
 def formatted_text(segments: list[dict[str, Any]]) -> str:
@@ -708,7 +939,20 @@ def _run_transcription_job(
             telemetry = _telemetry_for(job_id)
 
             asr_checkpoint = _read_json(job_root / "asr.json")
-            if asr_checkpoint is not None and asr_checkpoint.get("model") == model:
+            checkpoint_words = (
+                extract_asr_words(normalize_segments(asr_checkpoint.get("segments")))
+                if asr_checkpoint is not None
+                else []
+            )
+            checkpoint_has_words = bool(checkpoint_words) or not str(
+                (asr_checkpoint or {}).get("text") or ""
+            ).strip()
+            if (
+                asr_checkpoint is not None
+                and asr_checkpoint.get("model") == model
+                and asr_checkpoint.get("word_timestamps") is True
+                and checkpoint_has_words
+            ):
                 result_data = asr_checkpoint
                 segments = normalize_segments(asr_checkpoint.get("segments"))
                 asr_seconds = float((asr_checkpoint.get("timing") or {}).get("asr") or 0.0)
@@ -779,6 +1023,7 @@ def _run_transcription_job(
                             verbose=None,
                             chunk_duration=chunk_duration,
                             language=language or None,
+                            word_timestamps=True,
                         )
                     )
                 on_asr_progress(1.0)
@@ -787,20 +1032,26 @@ def _run_transcription_job(
                 atomic_write_json(
                     job_root / "asr.json",
                     {
-                        "schema_version": "1.0",
+                        "schema_version": "2.0",
                         "job_id": job_id,
                         "model": model,
                         "language": result_data.get("language"),
                         "text": str(result_data.get("text") or "").strip(),
                         "segments": segments,
+                        "word_timestamps": True,
                         "timing": {"asr": asr_seconds},
                     },
                 )
 
             diarization_seconds = 0.0
             diarization_checkpoint = _read_json(job_root / "diarization.json")
-            if diarization_checkpoint is not None and bool(diarization_checkpoint.get("enabled")) == diarize:
-                segments = normalize_segments(diarization_checkpoint.get("segments"))
+            if (
+                diarization_checkpoint is not None
+                and diarization_checkpoint.get("schema_version") == "2.0"
+                and bool(diarization_checkpoint.get("enabled")) == diarize
+                and isinstance(diarization_checkpoint.get("speaker_turns"), list)
+            ):
+                speaker_turns = normalize_segments(diarization_checkpoint.get("speaker_turns"))
                 diarization_seconds = float(
                     (diarization_checkpoint.get("timing") or {}).get("diarization") or 0.0
                 )
@@ -851,29 +1102,44 @@ def _run_transcription_job(
                     )
 
                 on_diarization_progress(0.0, "segmentation")
-                segments = assign_speakers(
+                speaker_turns = diarize_speaker_turns(
                     str(audio_path),
-                    segments,
                     progress_callback=on_diarization_progress,
                 )
                 on_diarization_progress(1.0, "complete")
                 diarization_seconds = time.time() - diarization_started
             else:
-                for segment in segments:
-                    segment.setdefault("speaker", "SPEAKER_00")
+                speaker_turns = []
             atomic_write_json(
                 job_root / "diarization.json",
                 {
-                    "schema_version": "1.0",
+                    "schema_version": "2.0",
                     "job_id": job_id,
                     "enabled": diarize,
-                    "segments": segments,
+                    "speaker_turns": speaker_turns,
                     "timing": {"diarization": diarization_seconds},
                 },
             )
 
             _raise_if_cancelled(cancel_event)
             stage = "serializing"
+            words = extract_asr_words(segments)
+            raw_text = str(result_data.get("text") or "").strip()
+            if raw_text and not words:
+                raise ResponseValidationError(
+                    "ASR returned text without word timestamps; schema v2 result was not published"
+                )
+            attributed_words = attribute_speakers_to_words(words, speaker_turns)
+            utterances = assemble_utterances(attributed_words)
+            legacy_segments = [
+                {
+                    "start": utterance["start"],
+                    "end": utterance["end"],
+                    "speaker": utterance["speaker"],
+                    "text": utterance["text"],
+                }
+                for utterance in utterances
+            ]
             merge_started = time.time()
             _update_progress(
                 job_id,
@@ -886,14 +1152,30 @@ def _run_transcription_job(
             )
             response_payload = sanitize_finite_numbers(
                 {
-                    "schema_version": "1.0",
+                    "schema_version": "2.0",
                     "job_id": job_id,
-                    "text": formatted_text(segments) or str(result_data.get("text") or "").strip(),
-                    "raw_text": str(result_data.get("text") or "").strip(),
-                    "segments": segments,
+                    "text": formatted_utterances(utterances) or raw_text,
+                    "raw_text": raw_text,
+                    "words": attributed_words,
+                    "speaker_turns": speaker_turns,
+                    "utterances": utterances,
+                    "asr_segments": segments,
+                    "segments": legacy_segments,
                     "language": result_data.get("language"),
                     "backend": "mlx+pyannote" if diarize else "mlx",
                     "model": model,
+                    "models": {
+                        "asr": {"id": model, "word_timestamps": "whisper-cross-attention-dtw"},
+                        "diarization": {
+                            "id": "pyannote/speaker-diarization-3.1" if diarize else None,
+                            "device": "mps" if diarize and torch.backends.mps.is_available() else "cpu",
+                        },
+                    },
+                    "parameters": {
+                        "language": language,
+                        "diarize": diarize,
+                        "chunk_duration": chunk_duration,
+                    },
                     "timing": {},
                 }
             )

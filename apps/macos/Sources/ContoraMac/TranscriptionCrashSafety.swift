@@ -52,6 +52,82 @@ struct MLXTranscriptionProgress: Sendable {
     let etaSeconds: Double?
 }
 
+struct MLXResultV2Envelope: Decodable, Sendable {
+    struct Word: Decodable, Sendable {
+        let text: String
+        let start: Double
+        let end: Double
+        let confidence: Double?
+        let speaker: String
+        let speakerScore: Double
+        let overlap: Bool
+        let overlapSpeakers: [String]
+
+        private enum CodingKeys: String, CodingKey {
+            case text, start, end, confidence, speaker, overlap
+            case speakerScore = "speaker_score"
+            case overlapSpeakers = "overlap_speakers"
+        }
+    }
+
+    struct SpeakerTurn: Decodable, Sendable {
+        let start: Double
+        let end: Double
+        let speaker: String
+        let confidence: Double?
+    }
+
+    struct Utterance: Decodable, Sendable {
+        let start: Double
+        let end: Double
+        let speaker: String
+        let text: String
+        let wordStartIndex: Int
+        let wordEndIndex: Int
+        let overlap: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case start, end, speaker, text, overlap
+            case wordStartIndex = "word_start_index"
+            case wordEndIndex = "word_end_index"
+        }
+    }
+
+    let schemaVersion: String
+    let text: String
+    let rawText: String
+    let words: [Word]
+    let speakerTurns: [SpeakerTurn]
+    let utterances: [Utterance]
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case text
+        case rawText = "raw_text"
+        case words
+        case speakerTurns = "speaker_turns"
+        case utterances
+    }
+}
+
+struct MLXTranscriptionResponse: Sendable {
+    let text: String
+    let payloadData: Data
+    let resultV2: MLXResultV2Envelope?
+}
+
+struct TranscriptionBackendOutput: Sendable {
+    let text: String
+    let structuredResultData: Data?
+    let mlxResultV2: MLXResultV2Envelope?
+
+    init(text: String, structuredResultData: Data? = nil, mlxResultV2: MLXResultV2Envelope? = nil) {
+        self.text = text
+        self.structuredResultData = structuredResultData
+        self.mlxResultV2 = mlxResultV2
+    }
+}
+
 struct MLXJobRecoveryRecord: Codable, Sendable, Equatable {
     let schemaVersion: String
     let localJobID: UUID
@@ -152,6 +228,24 @@ struct ContoraSessionManifest: Codable {
             let text: String
         }
 
+        struct Word: Codable {
+            let text: String
+            let startSeconds: Double
+            let endSeconds: Double
+            let confidence: Double?
+            let speakerID: String
+            let speakerScore: Double
+            let overlap: Bool
+            let overlapSpeakers: [String]
+        }
+
+        struct SpeakerTurn: Codable {
+            let startSeconds: Double
+            let endSeconds: Double
+            let speakerID: String
+            let confidence: Double?
+        }
+
         let status: String
         let backend: String?
         let endpoint: String?
@@ -161,6 +255,8 @@ struct ContoraSessionManifest: Codable {
         let errorMessage: String?
         let speakers: [Speaker]?
         let segments: [Segment]?
+        let words: [Word]?
+        let speakerTurns: [SpeakerTurn]?
     }
 
     struct Failure: Codable {

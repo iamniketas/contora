@@ -28,6 +28,14 @@ class FakeModel:
                     "start": 0.0,
                     "end": 1.0,
                     "text": "Привет",
+                    "words": [
+                        {
+                            "word": " Привет",
+                            "start": 0.0,
+                            "end": 1.0,
+                            "probability": math.nan,
+                        }
+                    ],
                     "avg_logprob": math.nan,
                     "diagnostics": {
                         "positive_infinity": math.inf,
@@ -93,10 +101,13 @@ class ServerResponseTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200, response.text)
             payload = response.json()
-            segment = payload["segments"][0]
+            segment = payload["asr_segments"][0]
             self.assertIsNone(segment["avg_logprob"])
             self.assertIsNone(segment["diagnostics"]["positive_infinity"])
             self.assertIsNone(segment["diagnostics"]["negative_infinity"])
+            self.assertEqual(payload["schema_version"], "2.0")
+            self.assertEqual(payload["words"][0]["speaker"], "SPEAKER_00")
+            self.assertIsNone(payload["words"][0]["confidence"])
 
             job_root = Path(directory) / payload["job_id"]
             self.assertTrue((job_root / "asr.json").exists())
@@ -305,12 +316,27 @@ class ServerResponseTests(unittest.TestCase):
             (job_root / "asr.json").write_text(
                 json.dumps(
                     {
-                        "schema_version": "1.0",
+                        "schema_version": "2.0",
                         "job_id": job_id,
                         "model": "test",
                         "language": "ru",
                         "text": "Возобновлено",
-                        "segments": [{"start": 0, "end": 1, "text": "Возобновлено"}],
+                        "segments": [
+                            {
+                                "start": 0,
+                                "end": 1,
+                                "text": "Возобновлено",
+                                "words": [
+                                    {
+                                        "word": " Возобновлено",
+                                        "start": 0,
+                                        "end": 1,
+                                        "probability": 0.9,
+                                    }
+                                ],
+                            }
+                        ],
+                        "word_timestamps": True,
                         "timing": {"asr": 2.0},
                     }
                 )
@@ -459,6 +485,69 @@ class ServerResponseTests(unittest.TestCase):
         fractions = [fraction for fraction, _ in observed]
         self.assertEqual(fractions, sorted(fractions))
         self.assertEqual(fractions[-1], 1.0)
+
+    def test_word_attribution_splits_speaker_change_inside_one_asr_segment(self):
+        segments = [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "Первый Второй",
+                "words": [
+                    {"word": " Первый", "start": 0.0, "end": 0.45, "probability": 0.9},
+                    {"word": " Второй", "start": 0.55, "end": 1.0, "probability": 0.8},
+                ],
+            }
+        ]
+        turns = [
+            {"start": 0.0, "end": 0.5, "speaker": "SPEAKER_00", "confidence": None},
+            {"start": 0.5, "end": 1.0, "speaker": "SPEAKER_01", "confidence": None},
+        ]
+
+        words = server.attribute_speakers_to_words(server.extract_asr_words(segments), turns)
+        utterances = server.assemble_utterances(words)
+
+        self.assertEqual([word["speaker"] for word in words], ["SPEAKER_00", "SPEAKER_01"])
+        self.assertEqual([item["speaker"] for item in utterances], ["SPEAKER_00", "SPEAKER_01"])
+        self.assertEqual([item["text"] for item in utterances], ["Первый", "Второй"])
+
+    def test_word_attribution_marks_true_overlapping_speech(self):
+        words = [{"text": " вместе", "start": 0.5, "end": 0.7, "confidence": 0.9}]
+        turns = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "confidence": None},
+            {"start": 0.4, "end": 0.8, "speaker": "SPEAKER_01", "confidence": None},
+        ]
+
+        attributed = server.attribute_speakers_to_words(words, turns)
+
+        self.assertTrue(attributed[0]["overlap"])
+        self.assertEqual(attributed[0]["overlap_speakers"], ["SPEAKER_00", "SPEAKER_01"])
+        self.assertEqual(attributed[0]["speaker"], "SPEAKER_00")
+
+    def test_schema_v2_requests_native_whisper_word_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+
+            class CapturingModel(FakeModel):
+                kwargs = None
+
+                def generate(self, *_args, **kwargs):
+                    self.kwargs = kwargs
+                    return super().generate(*_args, **kwargs)
+
+            model = CapturingModel()
+            original_model_for = server.model_for
+            server.model_for = lambda _name: model
+            try:
+                response = TestClient(server.app).post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("audio.wav", self.wav_bytes(), "audio/wav")},
+                    data={"model": "test", "language": "ru", "diarize": "false"},
+                )
+            finally:
+                server.model_for = original_model_for
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIs(model.kwargs["word_timestamps"], True)
 
 
 if __name__ == "__main__":
