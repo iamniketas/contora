@@ -561,15 +561,52 @@ private extension NSTextCheckingResult {
 
 enum WAVEncoder {
     static func makeWAVData(samples: [Float], sampleRate: UInt32) -> Data {
+        var data = makeWAVHeader(sampleCount: samples.count, sampleRate: sampleRate)
+        data.reserveCapacity(data.count + samples.count * MemoryLayout<Float>.size)
+        for value in samples {
+            data.appendFloat32LE(value)
+        }
+        return data
+    }
+
+    static func writeWAVFile(samples: [Float], sampleRate: UInt32, to fileURL: URL) throws {
+        let fileManager = FileManager.default
+        guard fileManager.createFile(atPath: fileURL.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let handle = try FileHandle(forWritingTo: fileURL)
+        do {
+            try handle.write(contentsOf: makeWAVHeader(sampleCount: samples.count, sampleRate: sampleRate))
+            let chunkSize = 16_384
+            var start = 0
+            while start < samples.count {
+                let end = min(samples.count, start + chunkSize)
+                var chunk = Data(capacity: (end - start) * MemoryLayout<Float>.size)
+                for value in samples[start..<end] {
+                    chunk.appendFloat32LE(value)
+                }
+                try handle.write(contentsOf: chunk)
+                start = end
+            }
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? fileManager.removeItem(at: fileURL)
+            throw error
+        }
+    }
+
+    private static func makeWAVHeader(sampleCount: Int, sampleRate: UInt32) -> Data {
         let channelCount: UInt16 = 1
         let bitsPerSample: UInt16 = 32
         let byteRate = sampleRate * UInt32(channelCount) * UInt32(bitsPerSample / 8)
         let blockAlign = channelCount * (bitsPerSample / 8)
-        let dataSize = UInt32(samples.count * MemoryLayout<Float>.size)
+        let dataSize = UInt32(sampleCount * MemoryLayout<Float>.size)
         let riffSize = UInt32(36) + dataSize
 
         var data = Data()
-        data.reserveCapacity(Int(44 + dataSize))
+        data.reserveCapacity(44)
 
         data.append("RIFF".data(using: .ascii)!)
         data.appendUInt32LE(riffSize)
@@ -586,10 +623,6 @@ enum WAVEncoder {
 
         data.append("data".data(using: .ascii)!)
         data.appendUInt32LE(dataSize)
-        for value in samples {
-            data.appendFloat32LE(value)
-        }
-
         return data
     }
 }
@@ -922,6 +955,75 @@ final class WhisperHTTPTranscriptionService {
     }
 }
 
+private struct MLXAudioHandoff: Sendable {
+    private struct Descriptor: Encodable {
+        let schemaVersion: String
+        let capabilityToken: String
+        let audioPath: String
+        let createdAt: Double
+
+        private enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case capabilityToken = "capability_token"
+            case audioPath = "audio_path"
+            case createdAt = "created_at"
+        }
+    }
+
+    let capabilityToken: String
+    let audioURL: URL
+    let descriptorURL: URL
+
+    static func create(samples16kMono: [Float]) throws -> MLXAudioHandoff {
+        guard let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw RecordingArchiveError.appSupportDirectoryUnavailable
+        }
+        let directory = appSupport
+            .appendingPathComponent("Contora", isDirectory: true)
+            .appendingPathComponent("TranscriptionHandoff", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let audioURL = directory.appendingPathComponent("(token).wav")
+        let descriptorURL = directory.appendingPathComponent("(token).json")
+        do {
+            try WAVEncoder.writeWAVFile(samples: samples16kMono, sampleRate: 16_000, to: audioURL)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: audioURL.path)
+            let descriptor = Descriptor(
+                schemaVersion: "1.0",
+                capabilityToken: token,
+                audioPath: audioURL.path,
+                createdAt: Date().timeIntervalSince1970
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            try encoder.encode(descriptor).write(to: descriptorURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: descriptorURL.path)
+            return MLXAudioHandoff(
+                capabilityToken: token,
+                audioURL: audioURL,
+                descriptorURL: descriptorURL
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: descriptorURL)
+            try? FileManager.default.removeItem(at: audioURL)
+            throw error
+        }
+    }
+
+    func discard() {
+        try? FileManager.default.removeItem(at: descriptorURL)
+        try? FileManager.default.removeItem(at: audioURL)
+    }
+}
+
 private final class MLXJobCancellationContext: @unchecked Sendable {
     private let lock = NSLock()
     private var jobURL: URL?
@@ -963,64 +1065,54 @@ final class MLXHTTPTranscriptionService {
         enableDiarization: Bool,
         onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void = { _ in }
     ) async throws -> String {
-        let wavData = WAVEncoder.makeWAVData(samples: samples16kMono, sampleRate: 16_000)
-        let boundary = "Boundary-\(UUID().uuidString)"
         let audioSeconds = Double(samples16kMono.count) / 16_000.0
-        let timeoutSeconds = max(600, (audioSeconds * 3.0) + 600)
         guard let jobsURL = URL(string: "/v1/transcription/jobs", relativeTo: endpointURL)?.absoluteURL else {
             throw TranscriptionError.badResponse
         }
-
-        var body = Data()
-        let lineBreak = "\r\n"
-        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Type: audio/wav\(lineBreak)\(lineBreak)".data(using: .utf8)!)
-        body.append(wavData)
-        body.append(lineBreak.data(using: .utf8)!)
-
-        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"model\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
-        body.append("\(modelID)\(lineBreak)".data(using: .utf8)!)
-
-        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"language\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
-        body.append("\(language)\(lineBreak)".data(using: .utf8)!)
-
-        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"diarize\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
-        body.append("\(enableDiarization ? "true" : "false")\(lineBreak)".data(using: .utf8)!)
-
-        body.append("--\(boundary)\(lineBreak)".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"chunk_duration\"\(lineBreak)\(lineBreak)".data(using: .utf8)!)
-        body.append("30\(lineBreak)".data(using: .utf8)!)
-
-        body.append("--\(boundary)--\(lineBreak)".data(using: .utf8)!)
-
-        var request = URLRequest(url: jobsURL)
+        let handoff = try await Task.detached(priority: .userInitiated) {
+            try MLXAudioHandoff.create(samples16kMono: samples16kMono)
+        }.value
+        let requestPayload: [String: Any] = [
+            "capability_token": handoff.capabilityToken,
+            "model": modelID,
+            "language": language,
+            "diarize": enableDiarization,
+            "chunk_duration": 30.0,
+        ]
+        let requestBody = try JSONSerialization.data(withJSONObject: requestPayload)
+        let creationURL = jobsURL.appendingPathComponent("from-file")
+        var request = URLRequest(url: creationURL)
         request.httpMethod = "POST"
-        request.timeoutInterval = timeoutSeconds
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.httpBody = body
+        request.httpBody = requestBody
 
         let cancellationContext = MLXJobCancellationContext()
         return try await withTaskCancellationHandler {
             onProgress(
                 MLXTranscriptionProgress(
-                    phase: "uploading",
+                    phase: "preparing",
                     fraction: 0,
-                    message: "Uploading audio to local backend",
+                    message: "Handing audio to local backend",
                     processedSeconds: 0,
                     totalSeconds: audioSeconds,
                     etaSeconds: nil
                 )
             )
-            let (creationData, creationResponse) = try await URLSession.shared.data(for: request)
+            let (creationData, creationResponse): (Data, URLResponse)
+            do {
+                (creationData, creationResponse) = try await URLSession.shared.data(for: request)
+            } catch {
+                handoff.discard()
+                throw error
+            }
             guard let creationHTTP = creationResponse as? HTTPURLResponse else {
+                handoff.discard()
                 throw TranscriptionError.badResponse
             }
             guard creationHTTP.statusCode == 202 else {
+                handoff.discard()
                 if let failure = try? JSONDecoder().decode(TranscriptionServerFailureEnvelope.self, from: creationData) {
                     throw TranscriptionError.structuredServerError(statusCode: creationHTTP.statusCode, failure: failure)
                 }
@@ -1028,7 +1120,13 @@ final class MLXHTTPTranscriptionService {
                 throw TranscriptionError.serverError(statusCode: creationHTTP.statusCode, message: message)
             }
 
-            let created = try JSONDecoder().decode(MLXJobStatusEnvelope.self, from: creationData)
+            let created: MLXJobStatusEnvelope
+            do {
+                created = try JSONDecoder().decode(MLXJobStatusEnvelope.self, from: creationData)
+            } catch {
+                handoff.discard()
+                throw error
+            }
             let jobURL = jobsURL.appendingPathComponent(created.jobID)
             cancellationContext.register(jobURL: jobURL)
 

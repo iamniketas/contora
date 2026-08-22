@@ -58,6 +58,12 @@ class ServerResponseTests(unittest.TestCase):
             server._job_tasks.clear()
             server._job_cancellations.clear()
 
+    def configure_roots(self, directory):
+        server.RESULTS_ROOT = Path(directory) / "results"
+        server.HANDOFF_ROOT = Path(directory) / "handoff"
+        server.RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
+        server.HANDOFF_ROOT.mkdir(parents=True, exist_ok=True)
+
     def test_persists_sanitized_result_before_returning_it(self):
         with tempfile.TemporaryDirectory() as directory:
             server.RESULTS_ROOT = Path(directory)
@@ -109,66 +115,244 @@ class ServerResponseTests(unittest.TestCase):
             self.assertFalse((job_root / "result.json").exists())
 
     def test_job_api_polls_persisted_monotonic_status_and_result(self):
-        with tempfile.TemporaryDirectory() as directory, TestClient(server.app) as client:
-            server.RESULTS_ROOT = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
             original_model_for = server.model_for
             server.model_for = lambda _name: SlowFakeModel()
-            try:
-                creation = client.post(
-                    "/v1/transcription/jobs",
-                    files={"file": ("audio.wav", b"RIFF", "audio/wav")},
-                    data={"model": "test", "language": "ru", "diarize": "false"},
-                )
-                self.assertEqual(creation.status_code, 202, creation.text)
-                job_id = creation.json()["job_id"]
-                statuses = [creation.json()]
-                for _ in range(100):
-                    status_response = client.get(f"/v1/transcription/jobs/{job_id}")
-                    self.assertEqual(status_response.status_code, 200, status_response.text)
-                    status = status_response.json()
-                    statuses.append(status)
-                    if status["state"] in {"completed", "failed", "cancelled"}:
-                        break
-                    time.sleep(0.01)
-            finally:
-                server.model_for = original_model_for
+            with TestClient(server.app) as client:
+                try:
+                    creation = client.post(
+                        "/v1/transcription/jobs",
+                        files={"file": ("audio.wav", b"RIFF", "audio/wav")},
+                        data={"model": "test", "language": "ru", "diarize": "false"},
+                    )
+                    self.assertEqual(creation.status_code, 202, creation.text)
+                    job_id = creation.json()["job_id"]
+                    statuses = [creation.json()]
+                    for _ in range(100):
+                        status_response = client.get(f"/v1/transcription/jobs/{job_id}")
+                        self.assertEqual(status_response.status_code, 200, status_response.text)
+                        status = status_response.json()
+                        statuses.append(status)
+                        if status["state"] in {"completed", "failed", "cancelled"}:
+                            break
+                        time.sleep(0.01)
+                finally:
+                    server.model_for = original_model_for
 
             self.assertEqual(statuses[-1]["state"], "completed", statuses[-1])
             progress = [status["progress"] for status in statuses]
             self.assertEqual(progress, sorted(progress))
             self.assertEqual(progress[-1], 1.0)
             self.assertTrue(any(status["phase"] == "transcribing" for status in statuses))
-            status_path = Path(directory) / job_id / "status.json"
+            status_path = server.RESULTS_ROOT / job_id / "status.json"
             self.assertEqual(json.loads(status_path.read_text())["state"], "completed")
             self.assertEqual(list(status_path.parent.glob("*.tmp")), [])
 
             result = client.get(f"/v1/transcription/jobs/{job_id}/result")
             self.assertEqual(result.status_code, 200, result.text)
-            self.assertEqual(result.content, (Path(directory) / job_id / "result.json").read_bytes())
+            self.assertEqual(result.content, (server.RESULTS_ROOT / job_id / "result.json").read_bytes())
 
     def test_job_api_cancel_marks_job_cancelled(self):
-        with tempfile.TemporaryDirectory() as directory, TestClient(server.app) as client:
-            server.RESULTS_ROOT = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
             original_model_for = server.model_for
             server.model_for = lambda _name: SlowFakeModel()
-            try:
-                creation = client.post(
-                    "/v1/transcription/jobs",
-                    files={"file": ("audio.wav", b"RIFF", "audio/wav")},
-                    data={"model": "test", "language": "ru", "diarize": "false"},
-                )
-                job_id = creation.json()["job_id"]
-                cancellation = client.delete(f"/v1/transcription/jobs/{job_id}")
-                self.assertEqual(cancellation.status_code, 202, cancellation.text)
-                for _ in range(100):
-                    status = client.get(f"/v1/transcription/jobs/{job_id}").json()
-                    if status["state"] == "cancelled":
-                        break
-                    time.sleep(0.01)
-            finally:
-                server.model_for = original_model_for
+            with TestClient(server.app) as client:
+                try:
+                    creation = client.post(
+                        "/v1/transcription/jobs",
+                        files={"file": ("audio.wav", b"RIFF", "audio/wav")},
+                        data={"model": "test", "language": "ru", "diarize": "false"},
+                    )
+                    job_id = creation.json()["job_id"]
+                    cancellation = client.delete(f"/v1/transcription/jobs/{job_id}")
+                    self.assertEqual(cancellation.status_code, 202, cancellation.text)
+                    for _ in range(100):
+                        status = client.get(f"/v1/transcription/jobs/{job_id}").json()
+                        if status["state"] == "cancelled":
+                            break
+                        time.sleep(0.01)
+                finally:
+                    server.model_for = original_model_for
 
             self.assertEqual(status["state"], "cancelled", status)
+
+    def test_file_handoff_is_capability_bound_and_persists_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+            token = "a" * 32
+            audio_path = server.HANDOFF_ROOT / f"{token}.wav"
+            descriptor_path = server.HANDOFF_ROOT / f"{token}.json"
+            audio_path.write_bytes(b"RIFF")
+            descriptor_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "capability_token": token,
+                        "audio_path": str(audio_path),
+                        "created_at": time.time(),
+                    }
+                )
+            )
+            original_model_for = server.model_for
+            server.model_for = lambda _name: FakeModel()
+            with TestClient(server.app) as client:
+                try:
+                    creation = client.post(
+                        "/v1/transcription/jobs/from-file",
+                        json={
+                            "capability_token": token,
+                            "model": "test",
+                            "language": "ru",
+                            "diarize": False,
+                        },
+                    )
+                    self.assertEqual(creation.status_code, 202, creation.text)
+                    job_id = creation.json()["job_id"]
+                    duplicate = client.post(
+                        "/v1/transcription/jobs/from-file",
+                        json={
+                            "capability_token": token,
+                            "model": "test",
+                            "language": "ru",
+                            "diarize": False,
+                        },
+                    )
+                    self.assertEqual(duplicate.status_code, 400, duplicate.text)
+                    for _ in range(100):
+                        status = client.get(f"/v1/transcription/jobs/{job_id}").json()
+                        if status["state"] == "completed":
+                            break
+                        time.sleep(0.01)
+                finally:
+                    server.model_for = original_model_for
+
+            self.assertEqual(status["state"], "completed", status)
+            manifest = json.loads((server.RESULTS_ROOT / job_id / "job.json").read_text())
+            self.assertEqual(manifest["capability_token"], token)
+            self.assertEqual(Path(manifest["audio_path"]), audio_path.resolve())
+            self.assertFalse((server.RESULTS_ROOT / job_id / "input.wav").exists())
+            self.assertFalse(descriptor_path.exists())
+            self.assertTrue((server.RESULTS_ROOT / job_id / "capability.json").exists())
+
+    def test_file_handoff_rejects_descriptor_for_another_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+            token = "b" * 32
+            outside = Path(directory) / "outside.wav"
+            outside.write_bytes(b"RIFF")
+            (server.HANDOFF_ROOT / f"{token}.json").write_text(
+                json.dumps({"capability_token": token, "audio_path": str(outside)})
+            )
+            with TestClient(server.app) as client:
+                response = client.post(
+                    "/v1/transcription/jobs/from-file",
+                    json={"capability_token": token, "model": "test", "diarize": False},
+                )
+            self.assertEqual(response.status_code, 400, response.text)
+
+    def test_backend_restart_resumes_from_asr_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+            job_id = "11111111-1111-4111-8111-111111111111"
+            job_root = server.RESULTS_ROOT / job_id
+            job_root.mkdir()
+            audio_path = job_root / "input.wav"
+            audio_path.write_bytes(b"RIFF")
+            now = time.time()
+            (job_root / "job.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "audio_path": str(audio_path),
+                        "model": "test",
+                        "language": "ru",
+                        "diarize": False,
+                        "chunk_duration": 30,
+                        "created_at": now,
+                    }
+                )
+            )
+            (job_root / "status.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "state": "transcribing",
+                        "phase": "transcribing",
+                        "message": "Interrupted",
+                        "progress": 0.5,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+            )
+            (job_root / "asr.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "model": "test",
+                        "language": "ru",
+                        "text": "Возобновлено",
+                        "segments": [{"start": 0, "end": 1, "text": "Возобновлено"}],
+                        "timing": {"asr": 2.0},
+                    }
+                )
+            )
+            original_model_for = server.model_for
+            server.model_for = lambda _name: self.fail("ASR model must not load when checkpoint is reusable")
+            with TestClient(server.app) as client:
+                try:
+                    for _ in range(100):
+                        status = client.get(f"/v1/transcription/jobs/{job_id}").json()
+                        if status["state"] == "completed":
+                            break
+                        time.sleep(0.01)
+                finally:
+                    server.model_for = original_model_for
+
+            self.assertEqual(status["state"], "completed", status)
+            result = json.loads((job_root / "result.json").read_text())
+            self.assertEqual(result["raw_text"], "Возобновлено")
+
+    def test_ttl_cleanup_removes_delivered_job_and_owned_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+            token = "c" * 32
+            audio_path = server.HANDOFF_ROOT / f"{token}.wav"
+            descriptor_path = server.HANDOFF_ROOT / f"{token}.json"
+            audio_path.write_bytes(b"RIFF")
+            descriptor_path.write_text("{}")
+            job_id = "22222222-2222-4222-8222-222222222222"
+            job_root = server.RESULTS_ROOT / job_id
+            job_root.mkdir()
+            (job_root / "job.json").write_text(
+                json.dumps({"job_id": job_id, "capability_token": token, "audio_path": str(audio_path)})
+            )
+            (job_root / "status.json").write_text(
+                json.dumps(
+                    {
+                        "job_id": job_id,
+                        "state": "completed",
+                        "updated_at": 10.0,
+                        "result_delivered_at": 10.0,
+                    }
+                )
+            )
+            original_ttl = server.JOB_TTL_SECONDS
+            server.JOB_TTL_SECONDS = 60
+            try:
+                removed = server._cleanup_expired_jobs(now=71.0)
+            finally:
+                server.JOB_TTL_SECONDS = original_ttl
+
+            self.assertEqual(removed, [job_id])
+            self.assertFalse(job_root.exists())
+            self.assertFalse(audio_path.exists())
+            self.assertFalse(descriptor_path.exists())
 
     def test_mlx_internal_seek_progress_callback_is_monotonic(self):
         from mlx_audio.stt.models.whisper import whisper as whisper_module
