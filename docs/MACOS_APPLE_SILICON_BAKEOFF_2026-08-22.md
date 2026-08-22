@@ -108,3 +108,18 @@ diarization, and Argmax is the leading warm-performance ASR control on the
 short/medium inputs completed so far. Neither is a product choice. Integration
 behind a default-on path remains prohibited until the manual DER/SA-WER and
 hour-long gates pass. Pyannote/MPS remains the product fallback baseline.
+
+## Feature-gated integration status
+
+The product now has an experimental parallel adapter boundary for the pinned
+FluidAudio candidate, but both `CONTORA_MLX_ENABLE_EXPERIMENTAL_ANE=1` and
+`CONTORA_MLX_ENABLE_PARALLEL_ANE=1` are required to use it. This is infrastructure,
+not a quality decision. The scheduler records its execution mode, checks memory,
+swap, and thermal state before and during the run, terminates the ANE branch on
+pressure, and falls back to sequential pyannote without discarding the ASR
+checkpoint. Release-runtime packaging also validates the exact Core ML revision
+and includes engine/model license notices.
+
+The default remains pyannote/MPS until the blockers and quality gates above are
+resolved. In particular, the feature flags must not be enabled in a public release
+based only on the current performance measurements.

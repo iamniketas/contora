@@ -1,0 +1,9 @@
+Contora optional Apple Neural Engine diarization assets
+
+Model: FluidInference/speaker-diarization-coreml
+Pinned revision: 1ed7a662fdc7109e36d822db793ee6eebdaf8594
+License declared by the model repository: Creative Commons Attribution 4.0 (CC-BY-4.0)
+Source: https://huggingface.co/FluidInference/speaker-diarization-coreml
+
+The runtime builder accepts only the pinned snapshot recorded above. Product enablement
+remains subject to Contora's transcription quality gate and is disabled by default.
