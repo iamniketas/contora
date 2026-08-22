@@ -49,12 +49,33 @@ struct SpeechRuntimeMigrationSmokeTest {
               config.mlxDiarizationEnabled,
               config.fasterWhisperModelName.isEmpty,
               !config.fasterWhisperDiarizationEnabled,
-              !TranscriptionBackend.allCases.contains(.fasterWhisperProcess) else {
+              !TranscriptionBackend.allCases.contains(.fasterWhisperProcess),
+              !TranscriptionBackend.allCases.contains(.whisperHTTP) else {
             throw SmokeTestError.settingsMigrationInvalid
         }
 
         let rewritten = try String(contentsOf: configURL, encoding: .utf8)
         guard rewritten.contains("mlx_openai_http"), !rewritten.contains("large-v2") else {
+            throw SmokeTestError.settingsMigrationInvalid
+        }
+
+        let remoteLegacy = """
+        {
+          "schemaVersion": "2.0",
+          "activeBackend": "whisper_http",
+          "whisperTranscribeURL": "http://127.0.0.1:5500/transcribe",
+          "mlxTranscribeURL": "http://127.0.0.1:8010/v1/audio/transcriptions",
+          "mlxModelID": "mlx-community/whisper-large-v3-turbo-asr-fp16",
+          "mlxDiarizationEnabled": true,
+          "fasterWhisperModelName": "",
+          "fasterWhisperDiarizationEnabled": false,
+          "updatedAt": "2026-08-22T00:00:00Z"
+        }
+        """
+        try Data(remoteLegacy.utf8).write(to: configURL, options: .atomic)
+        let migratedRemote = try SharedTranscriptionServerConfigStore.shared.loadOrCreate()
+        guard migratedRemote.activeBackend == .mlxOpenAIHTTP,
+              try String(contentsOf: configURL, encoding: .utf8).contains("mlx_openai_http") else {
             throw SmokeTestError.settingsMigrationInvalid
         }
     }
