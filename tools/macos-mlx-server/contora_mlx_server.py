@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 import platform
 import re
 import shutil
 import statistics
+import subprocess
 import threading
 import time
 import uuid
@@ -64,6 +66,13 @@ HARDWARE_PROFILE_PATH = Path(
     os.getenv("CONTORA_MLX_HARDWARE_PROFILE_PATH", RESULTS_ROOT.parent / "hardware-profiles.json")
 ).expanduser()
 CAPABILITY_TOKEN_PATTERN = re.compile(r"^[a-f0-9]{32,64}$")
+FLUID_MODEL_REVISION = "1ed7a662fdc7109e36d822db793ee6eebdaf8594"
+FLUID_BINARY = Path(
+    os.getenv("CONTORA_MLX_FLUID_BINARY", RESULTS_ROOT.parent / "bin/contora-fluid-diarize")
+).expanduser()
+FLUID_MODELS_ROOT = Path(
+    os.getenv("CONTORA_MLX_FLUID_MODELS_ROOT", RESULTS_ROOT.parent / "models")
+).expanduser()
 
 app = FastAPI(title="Contora MLX transcription server")
 _models: dict[str, Any] = {}
@@ -77,6 +86,10 @@ _processing_lock = threading.Lock()
 
 
 class JobCancelledError(Exception):
+    pass
+
+
+class ParallelDiarizationAborted(Exception):
     pass
 
 
@@ -120,6 +133,140 @@ class RollingRateEstimator:
     def metrics(self) -> dict[str, float | None]:
         processed = self.samples[-1][1] if self.samples else 0.0
         return {"processed": processed, "rate": self.smoothed_rate}
+
+
+def _command_output(arguments: list[str]) -> str:
+    try:
+        completed = subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return f"{completed.stdout}\n{completed.stderr}".strip()
+
+
+def apple_silicon_resource_snapshot() -> dict[str, Any]:
+    memory_output = _command_output(["/usr/bin/memory_pressure", "-Q"])
+    memory_match = re.search(r"System-wide memory free percentage:\s*(\d+)%", memory_output)
+    free_percent = float(memory_match.group(1)) if memory_match else None
+    swap_output = _command_output(["/usr/sbin/sysctl", "-n", "vm.swapusage"])
+    swap_match = re.search(r"used\s*=\s*([0-9.]+)([MGT])", swap_output)
+    multiplier = {"M": 1024**2, "G": 1024**3, "T": 1024**4}
+    swap_used = (
+        float(swap_match.group(1)) * multiplier[swap_match.group(2)] if swap_match else None
+    )
+    thermal_output = _command_output(["/usr/bin/pmset", "-g", "therm"])
+    thermal_warning = any(
+        marker in thermal_output.lower()
+        for marker in ("warning level = 1", "warning level = 2", "warning level = 3")
+    )
+    thermal_limits = [
+        int(value)
+        for value in re.findall(r"(?:CPU_Scheduler_Limit|CPU_Speed_Limit)\s*=\s*(\d+)", thermal_output)
+    ]
+    thermal_warning = thermal_warning or any(value < 100 for value in thermal_limits)
+    return {
+        "memory_free_percent": free_percent,
+        "swap_used_bytes": swap_used,
+        "thermal_warning": thermal_warning,
+    }
+
+
+def parallel_ane_decision(
+    *,
+    diarize: bool,
+    snapshot: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    if not diarize:
+        return False, "diarization-disabled"
+    if os.getenv("CONTORA_MLX_ENABLE_EXPERIMENTAL_ANE") != "1":
+        return False, "ane-quality-gate-disabled"
+    if os.getenv("CONTORA_MLX_ENABLE_PARALLEL_ANE") != "1":
+        return False, "parallel-feature-disabled"
+    if not FLUID_BINARY.is_file() or not os.access(FLUID_BINARY, os.X_OK):
+        return False, "fluid-binary-unavailable"
+    model_marker = FLUID_MODELS_ROOT / "speaker-diarization-coreml/.contora-model-revision"
+    try:
+        revision = model_marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False, "fluid-models-unavailable"
+    if revision != FLUID_MODEL_REVISION:
+        return False, "fluid-model-revision-mismatch"
+
+    resources = apple_silicon_resource_snapshot() if snapshot is None else snapshot
+    free_percent = resources.get("memory_free_percent")
+    swap_used = resources.get("swap_used_bytes")
+    if resources.get("thermal_warning"):
+        return False, "thermal-warning"
+    if isinstance(free_percent, (int, float)) and float(free_percent) < 20.0:
+        return False, "memory-pressure"
+    if isinstance(swap_used, (int, float)) and float(swap_used) > 4 * 1024**3:
+        return False, "swap-pressure"
+    return True, "ane-quality-gate-enabled"
+
+
+def run_fluid_diarization(
+    audio_path: Path,
+    output_path: Path,
+    *,
+    cancel_event: threading.Event,
+    abort_event: threading.Event,
+) -> list[dict[str, Any]]:
+    command = [
+        str(FLUID_BINARY),
+        "--audio",
+        str(audio_path),
+        "--output",
+        str(output_path),
+        "--models",
+        str(FLUID_MODELS_ROOT),
+        "--model-revision",
+        FLUID_MODEL_REVISION,
+        "--threshold",
+        os.getenv("CONTORA_MLX_FLUID_THRESHOLD", "0.7045655"),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    last_guard_check = 0.0
+    guard_ok = True
+    guard_reason = "cancelled"
+    while process.poll() is None:
+        check_time = time.monotonic()
+        if check_time - last_guard_check >= 2.0:
+            last_guard_check = check_time
+            guard_ok, guard_reason = parallel_ane_decision(
+                diarize=True,
+                snapshot=apple_silicon_resource_snapshot(),
+            )
+            if not guard_ok:
+                abort_event.set()
+        if cancel_event.is_set() or abort_event.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            reason = guard_reason if not guard_ok else "cancelled"
+            raise ParallelDiarizationAborted(reason)
+        time.sleep(0.25)
+    if process.returncode != 0:
+        raise RuntimeError(f"FluidAudio exited with {process.returncode}")
+    payload = _read_json(output_path)
+    if payload is None or not isinstance(payload.get("speaker_turns"), list):
+        raise RuntimeError("FluidAudio did not publish valid speaker turns")
+    engine = payload.get("engine") or {}
+    if engine.get("modelRevision", engine.get("model_revision")) != FLUID_MODEL_REVISION:
+        raise RuntimeError("FluidAudio result model revision does not match the pinned revision")
+    return normalize_segments(payload["speaker_turns"])
 
 
 def timestamp(seconds: float | None) -> str:
@@ -223,19 +370,23 @@ def _job_manifest(job_id: str) -> dict[str, Any] | None:
     return manifest
 
 
-def _hardware_profile_key(model: str, diarize: bool) -> str:
+def _hardware_profile_key(model: str, diarize: bool, execution_mode: str = "sequential") -> str:
     hardware = os.getenv("CONTORA_MLX_HARDWARE_PROFILE", platform.machine())
-    return f"{hardware}|{model}|{'diarize' if diarize else 'asr-only'}"
+    return f"{hardware}|{model}|{'diarize' if diarize else 'asr-only'}|{execution_mode}"
 
 
-def _load_hardware_profile(model: str, diarize: bool) -> dict[str, Any] | None:
+def _load_hardware_profile(
+    model: str,
+    diarize: bool,
+    execution_mode: str = "sequential",
+) -> dict[str, Any] | None:
     payload = _read_json(HARDWARE_PROFILE_PATH)
     if payload is None:
         return None
     profiles = payload.get("profiles")
     if not isinstance(profiles, dict):
         return None
-    profile = profiles.get(_hardware_profile_key(model, diarize))
+    profile = profiles.get(_hardware_profile_key(model, diarize, execution_mode))
     return profile if isinstance(profile, dict) else None
 
 
@@ -247,10 +398,11 @@ def _store_hardware_profile(
     diarization_seconds: float,
     merge_seconds: float,
     audio_seconds: float,
+    execution_mode: str = "sequential",
 ) -> None:
     payload = _read_json(HARDWARE_PROFILE_PATH) or {"schema_version": "1.0", "profiles": {}}
     profiles = payload.setdefault("profiles", {})
-    key = _hardware_profile_key(model, diarize)
+    key = _hardware_profile_key(model, diarize, execution_mode)
     previous = profiles.get(key) if isinstance(profiles.get(key), dict) else {}
     sample_count = int(previous.get("sample_count") or 0)
     alpha = 1.0 if sample_count == 0 else 0.25
@@ -273,8 +425,12 @@ def _store_hardware_profile(
     atomic_write_json(HARDWARE_PROFILE_PATH, payload)
 
 
-def _stage_weights(model: str, diarize: bool) -> tuple[float, float, float]:
-    profile = _load_hardware_profile(model, diarize)
+def _stage_weights(
+    model: str,
+    diarize: bool,
+    execution_mode: str = "sequential",
+) -> tuple[float, float, float]:
+    profile = _load_hardware_profile(model, diarize, execution_mode)
     if profile is None:
         return (0.90, 0.0, 0.05) if not diarize else (0.40, 0.52, 0.03)
     try:
@@ -323,6 +479,8 @@ def _initialize_job(job_id: str, total_seconds: float | None, *, diarize: bool) 
         "eta_seconds": None,
         "asr_eta_seconds": None,
         "diarization_eta_seconds": None,
+        "asr_elapsed_seconds": 0.0,
+        "diarization_elapsed_seconds": 0.0,
         "effective_rtf": None,
         "created_at": now,
         "updated_at": now,
@@ -349,6 +507,8 @@ def _update_progress(
     effective_rtf: float | None = None,
     asr_eta_seconds: float | None = None,
     diarization_eta_seconds: float | None = None,
+    asr_elapsed_seconds: float | None = None,
+    diarization_elapsed_seconds: float | None = None,
 ) -> None:
     changes: dict[str, Any] = {
         "state": state,
@@ -370,6 +530,10 @@ def _update_progress(
         changes["asr_eta_seconds"] = asr_eta_seconds
     if diarization_eta_seconds is not None:
         changes["diarization_eta_seconds"] = diarization_eta_seconds
+    if asr_elapsed_seconds is not None:
+        changes["asr_elapsed_seconds"] = asr_elapsed_seconds
+    if diarization_elapsed_seconds is not None:
+        changes["diarization_elapsed_seconds"] = diarization_elapsed_seconds
     _store_job_status(job_id, **changes)
 
 
@@ -807,6 +971,12 @@ def health():
         "defaultModel": DEFAULT_MODEL,
         "torchMPS": torch.backends.mps.is_available(),
         "resultSafety": "finite-v1",
+        "parallelANE": {
+            "qualityGateEnabled": os.getenv("CONTORA_MLX_ENABLE_EXPERIMENTAL_ANE") == "1",
+            "rolloutEnabled": os.getenv("CONTORA_MLX_ENABLE_PARALLEL_ANE") == "1",
+            "adapterAvailable": FLUID_BINARY.is_file() and os.access(FLUID_BINARY, os.X_OK),
+            "modelRevision": FLUID_MODEL_REVISION,
+        },
     }
 
 
@@ -916,6 +1086,11 @@ def _run_transcription_job(
     chunk_duration: float,
 ) -> None:
     job_root = RESULTS_ROOT / job_id
+    fluid_executor: ThreadPoolExecutor | None = None
+    fluid_future: Future[list[dict[str, Any]]] | None = None
+    fluid_abort_event = threading.Event()
+    execution_mode = "sequential_pyannote" if diarize else "asr_only"
+    scheduler_reason = "pyannote-fallback" if diarize else "diarization-disabled"
     with _jobs_lock:
         cancel_event = _job_cancellations[job_id]
     stage = "queued"
@@ -931,12 +1106,42 @@ def _run_transcription_job(
             stage = "transcribing"
             total_seconds = (_job_snapshot(job_id) or {}).get("total_seconds")
             total_value = float(total_seconds or 0.0)
-            profile = _load_hardware_profile(model, diarize)
-            asr_weight, diarization_weight, merge_weight = _stage_weights(model, diarize)
+            telemetry = _telemetry_for(job_id)
+            diarization_checkpoint = _read_json(job_root / "diarization.json")
+            reusable_diarization_checkpoint = bool(
+                diarization_checkpoint is not None
+                and diarization_checkpoint.get("schema_version") == "2.0"
+                and bool(diarization_checkpoint.get("enabled")) == diarize
+                and isinstance(diarization_checkpoint.get("speaker_turns"), list)
+            )
+            parallel_enabled, scheduler_reason = parallel_ane_decision(diarize=diarize)
+            if parallel_enabled and not reusable_diarization_checkpoint:
+                execution_mode = "parallel_ane"
+                fluid_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="contora-fluid")
+                fluid_future = fluid_executor.submit(
+                    run_fluid_diarization,
+                    audio_path,
+                    job_root / "fluid-diarization.json",
+                    cancel_event=cancel_event,
+                    abort_event=fluid_abort_event,
+                )
+            elif reusable_diarization_checkpoint:
+                execution_mode = "checkpoint"
+                scheduler_reason = "diarization-checkpoint-reused"
+            profile_mode = "parallel_ane" if execution_mode == "parallel_ane" else "sequential"
+            profile = _load_hardware_profile(model, diarize, profile_mode)
+            asr_weight, diarization_weight, merge_weight = _stage_weights(
+                model, diarize, profile_mode
+            )
             asr_start = 0.05
             asr_end = asr_start + asr_weight
             diarization_end = asr_end + diarization_weight
-            telemetry = _telemetry_for(job_id)
+            _store_job_status(
+                job_id,
+                execution_mode=execution_mode,
+                diarization_engine="fluidaudio" if execution_mode == "parallel_ane" else "pyannote",
+                scheduler_reason=scheduler_reason,
+            )
 
             asr_checkpoint = _read_json(job_root / "asr.json")
             checkpoint_words = (
@@ -977,23 +1182,42 @@ def _run_transcription_job(
                 )
                 stt_model = model_for(model)
                 generation_started = time.time()
+                last_guard_check = 0.0
 
                 def on_asr_progress(fraction: float) -> None:
+                    nonlocal last_guard_check, scheduler_reason
                     _raise_if_cancelled(cancel_event)
                     fraction = min(1.0, max(0.0, fraction))
                     processed = total_value * fraction
                     rate = telemetry["asr"].observe(processed).get("rate")
                     asr_eta = (total_value - processed) / rate if rate and total_value > processed else None
+                    if fluid_future is not None and not fluid_future.done():
+                        check_time = time.monotonic()
+                        if check_time - last_guard_check >= 2.0:
+                            last_guard_check = check_time
+                            guard_ok, guard_reason = parallel_ane_decision(
+                                diarize=diarize,
+                                snapshot=apple_silicon_resource_snapshot(),
+                            )
+                            if not guard_ok:
+                                scheduler_reason = guard_reason
+                                fluid_abort_event.set()
+                                _store_job_status(job_id, scheduler_reason=guard_reason)
                     remaining = asr_eta
                     if remaining is not None:
                         if diarize:
                             profiled_diarization = _profile_rate(
                                 profile, "diarization_wall_per_audio"
                             )
-                            remaining += (
+                            diarization_remaining = (
                                 total_value * profiled_diarization
                                 if profiled_diarization > 0
                                 else (total_value / rate) * (diarization_weight / max(asr_weight, 0.001))
+                            )
+                            remaining = (
+                                max(remaining, diarization_remaining)
+                                if execution_mode == "parallel_ane"
+                                else remaining + diarization_remaining
                             )
                         profiled_merge = _profile_rate(profile, "merge_wall_per_audio")
                         remaining += (
@@ -1013,6 +1237,7 @@ def _run_transcription_job(
                         eta_seconds=remaining,
                         effective_rtf=(1.0 / rate) if rate else None,
                         asr_eta_seconds=asr_eta,
+                        asr_elapsed_seconds=max(0.0, time.time() - generation_started),
                     )
 
                 on_asr_progress(0.0)
@@ -1044,13 +1269,8 @@ def _run_transcription_job(
                 )
 
             diarization_seconds = 0.0
-            diarization_checkpoint = _read_json(job_root / "diarization.json")
-            if (
-                diarization_checkpoint is not None
-                and diarization_checkpoint.get("schema_version") == "2.0"
-                and bool(diarization_checkpoint.get("enabled")) == diarize
-                and isinstance(diarization_checkpoint.get("speaker_turns"), list)
-            ):
+            speaker_turns: list[dict[str, Any]] | None = None
+            if reusable_diarization_checkpoint:
                 speaker_turns = normalize_segments(diarization_checkpoint.get("speaker_turns"))
                 diarization_seconds = float(
                     (diarization_checkpoint.get("timing") or {}).get("diarization") or 0.0
@@ -1065,7 +1285,54 @@ def _run_transcription_job(
                     processed_seconds=total_value,
                     diarization_progress=1.0,
                 )
-            elif diarize:
+            elif fluid_future is not None:
+                stage = "diarizing"
+                _update_progress(
+                    job_id,
+                    started=started,
+                    state="diarizing",
+                    phase="diarizing",
+                    message="Waiting for parallel ANE diarization",
+                    progress=asr_end,
+                    processed_seconds=total_value,
+                    asr_progress=1.0,
+                )
+                diarization_started = time.time()
+                try:
+                    speaker_turns = fluid_future.result()
+                    fluid_payload = _read_json(job_root / "fluid-diarization.json") or {}
+                    diarization_seconds = float(
+                        (fluid_payload.get("timing") or {}).get("totalSeconds")
+                        or (fluid_payload.get("timing") or {}).get("total_seconds")
+                        or time.time() - diarization_started
+                    )
+                    _update_progress(
+                        job_id,
+                        started=started,
+                        state="diarizing",
+                        phase="diarizing",
+                        message="Parallel ANE diarization complete",
+                        progress=diarization_end,
+                        processed_seconds=total_value,
+                        diarization_progress=1.0,
+                        eta_seconds=0.0,
+                        diarization_elapsed_seconds=diarization_seconds,
+                    )
+                except Exception as exc:
+                    execution_mode = "sequential_fallback"
+                    scheduler_reason = (
+                        f"guardrail:{exc}"
+                        if isinstance(exc, ParallelDiarizationAborted)
+                        else f"fluid-failed:{type(exc).__name__}"
+                    )
+                    _store_job_status(
+                        job_id,
+                        execution_mode=execution_mode,
+                        diarization_engine="pyannote",
+                        scheduler_reason=scheduler_reason,
+                    )
+
+            if speaker_turns is None and diarize:
                 stage = "diarizing"
                 diarization_started = time.time()
 
@@ -1099,6 +1366,7 @@ def _run_transcription_job(
                         eta_seconds=remaining,
                         effective_rtf=(1.0 / rate) if rate else None,
                         diarization_eta_seconds=diarization_eta,
+                        diarization_elapsed_seconds=max(0.0, time.time() - diarization_started),
                     )
 
                 on_diarization_progress(0.0, "segmentation")
@@ -1108,7 +1376,7 @@ def _run_transcription_job(
                 )
                 on_diarization_progress(1.0, "complete")
                 diarization_seconds = time.time() - diarization_started
-            else:
+            elif speaker_turns is None:
                 speaker_turns = []
             atomic_write_json(
                 job_root / "diarization.json",
@@ -1117,6 +1385,9 @@ def _run_transcription_job(
                     "job_id": job_id,
                     "enabled": diarize,
                     "speaker_turns": speaker_turns,
+                    "engine": "fluidaudio" if execution_mode == "parallel_ane" else "pyannote",
+                    "execution_mode": execution_mode,
+                    "scheduler_reason": scheduler_reason,
                     "timing": {"diarization": diarization_seconds},
                 },
             )
@@ -1162,19 +1433,33 @@ def _run_transcription_job(
                     "asr_segments": segments,
                     "segments": legacy_segments,
                     "language": result_data.get("language"),
-                    "backend": "mlx+pyannote" if diarize else "mlx",
+                    "backend": (
+                        "mlx+fluidaudio" if execution_mode == "parallel_ane"
+                        else ("mlx+pyannote" if diarize else "mlx")
+                    ),
                     "model": model,
                     "models": {
                         "asr": {"id": model, "word_timestamps": "whisper-cross-attention-dtw"},
                         "diarization": {
-                            "id": "pyannote/speaker-diarization-3.1" if diarize else None,
-                            "device": "mps" if diarize and torch.backends.mps.is_available() else "cpu",
+                            "id": (
+                                "FluidInference/speaker-diarization-coreml"
+                                if execution_mode == "parallel_ane"
+                                else ("pyannote/speaker-diarization-3.1" if diarize else None)
+                            ),
+                            "revision": FLUID_MODEL_REVISION if execution_mode == "parallel_ane" else None,
+                            "device": (
+                                "ane"
+                                if execution_mode == "parallel_ane"
+                                else ("mps" if diarize and torch.backends.mps.is_available() else "cpu")
+                            ),
                         },
                     },
                     "parameters": {
                         "language": language,
                         "diarize": diarize,
                         "chunk_duration": chunk_duration,
+                        "execution_mode": execution_mode,
+                        "scheduler_reason": scheduler_reason,
                     },
                     "timing": {},
                 }
@@ -1197,6 +1482,9 @@ def _run_transcription_job(
                         diarization_seconds=diarization_seconds,
                         merge_seconds=merge_seconds,
                         audio_seconds=total_value,
+                        execution_mode=(
+                            "parallel_ane" if execution_mode == "parallel_ane" else "sequential"
+                        ),
                     )
                 except (OSError, TypeError, ValueError):
                     # A performance-profile write must never invalidate a persisted result.
@@ -1212,6 +1500,8 @@ def _run_transcription_job(
                 processed_seconds=total_value,
                 elapsed_seconds=max(0.0, time.time() - started),
                 eta_seconds=0.0,
+                asr_elapsed_seconds=asr_seconds,
+                diarization_elapsed_seconds=diarization_seconds,
                 error=None,
             )
     except JobCancelledError:
@@ -1246,6 +1536,10 @@ def _run_transcription_job(
             eta_seconds=None,
             error=error["error"],
         )
+    finally:
+        fluid_abort_event.set()
+        if fluid_executor is not None:
+            fluid_executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _start_background_job(job_id: str, audio_path: Path, **parameters: Any) -> None:

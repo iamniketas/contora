@@ -7,6 +7,7 @@ import unittest
 import wave
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -548,6 +549,140 @@ class ServerResponseTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200, response.text)
             self.assertIs(model.kwargs["word_timestamps"], True)
+
+    def test_parallel_ane_gate_requires_assets_and_safe_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "contora-fluid-diarize"
+            binary.write_text("binary")
+            binary.chmod(0o755)
+            models = root / "models"
+            marker = models / "speaker-diarization-coreml/.contora-model-revision"
+            marker.parent.mkdir(parents=True)
+            marker.write_text(server.FLUID_MODEL_REVISION)
+            original_binary = server.FLUID_BINARY
+            original_models = server.FLUID_MODELS_ROOT
+            server.FLUID_BINARY = binary
+            server.FLUID_MODELS_ROOT = models
+            try:
+                with patch.dict(
+                    server.os.environ,
+                    {
+                        "CONTORA_MLX_ENABLE_EXPERIMENTAL_ANE": "1",
+                        "CONTORA_MLX_ENABLE_PARALLEL_ANE": "1",
+                    },
+                    clear=False,
+                ):
+                    enabled = server.parallel_ane_decision(
+                        diarize=True,
+                        snapshot={
+                            "memory_free_percent": 50,
+                            "swap_used_bytes": 0,
+                            "thermal_warning": False,
+                        },
+                    )
+                    pressured = server.parallel_ane_decision(
+                        diarize=True,
+                        snapshot={
+                            "memory_free_percent": 50,
+                            "swap_used_bytes": 5 * 1024**3,
+                            "thermal_warning": False,
+                        },
+                    )
+                    thermal = server.parallel_ane_decision(
+                        diarize=True,
+                        snapshot={
+                            "memory_free_percent": 50,
+                            "swap_used_bytes": 0,
+                            "thermal_warning": True,
+                        },
+                    )
+            finally:
+                server.FLUID_BINARY = original_binary
+                server.FLUID_MODELS_ROOT = original_models
+
+            self.assertEqual(enabled, (True, "ane-quality-gate-enabled"))
+            self.assertEqual(pressured, (False, "swap-pressure"))
+            self.assertEqual(thermal, (False, "thermal-warning"))
+
+    def test_parallel_ane_failure_falls_back_to_sequential_pyannote(self):
+        class FakeDiarization:
+            def itertracks(self, yield_label=False):
+                return iter([])
+
+        class FakePipeline:
+            def __call__(self, _audio_path, hook=None):
+                if hook is not None:
+                    hook("segmentation", None, total=1, completed=1)
+                return FakeDiarization()
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+            original_model_for = server.model_for
+            original_pipeline = server.diarization_pipeline
+            original_decision = server.parallel_ane_decision
+            original_fluid = server.run_fluid_diarization
+
+            def fail_fluid(*_args, **_kwargs):
+                raise RuntimeError("ANE failed")
+
+            server.model_for = lambda _name: FakeModel()
+            server.diarization_pipeline = lambda: FakePipeline()
+            server.parallel_ane_decision = lambda **_kwargs: (True, "test-enabled")
+            server.run_fluid_diarization = fail_fluid
+            try:
+                response = TestClient(server.app).post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("audio.wav", self.wav_bytes(), "audio/wav")},
+                    data={"model": "test", "language": "ru", "diarize": "true"},
+                )
+            finally:
+                server.model_for = original_model_for
+                server.diarization_pipeline = original_pipeline
+                server.parallel_ane_decision = original_decision
+                server.run_fluid_diarization = original_fluid
+
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(payload["backend"], "mlx+pyannote")
+            status = json.loads((server.RESULTS_ROOT / payload["job_id"] / "status.json").read_text())
+            self.assertEqual(status["execution_mode"], "sequential_fallback")
+
+    def test_parallel_ane_success_is_recorded_without_loading_pyannote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.configure_roots(directory)
+            original_model_for = server.model_for
+            original_pipeline = server.diarization_pipeline
+            original_decision = server.parallel_ane_decision
+            original_fluid = server.run_fluid_diarization
+            server.model_for = lambda _name: FakeModel()
+            server.diarization_pipeline = lambda: self.fail("pyannote fallback must not load")
+            server.parallel_ane_decision = lambda **_kwargs: (True, "test-enabled")
+            server.run_fluid_diarization = lambda *_args, **_kwargs: [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "speaker_0",
+                    "confidence": 0.9,
+                }
+            ]
+            try:
+                response = TestClient(server.app).post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("audio.wav", self.wav_bytes(), "audio/wav")},
+                    data={"model": "test", "language": "ru", "diarize": "true"},
+                )
+            finally:
+                server.model_for = original_model_for
+                server.diarization_pipeline = original_pipeline
+                server.parallel_ane_decision = original_decision
+                server.run_fluid_diarization = original_fluid
+
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(payload["backend"], "mlx+fluidaudio")
+            self.assertEqual(payload["words"][0]["speaker"], "speaker_0")
+            self.assertEqual(payload["parameters"]["execution_mode"], "parallel_ane")
 
 
 if __name__ == "__main__":

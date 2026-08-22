@@ -52,6 +52,13 @@ nearest-boundary, and continuity fallbacks, records true simultaneous-speech ove
 and assembles `utterances[]` independently of the original `asr_segments[]`. The macOS
 archive preserves the full v2 payload plus words and speaker turns in the session manifest.
 
+An experimental FluidAudio/Core ML branch can run concurrently with MLX ASR from the
+same canonical WAV. It is deliberately off unless both quality-approval and rollout
+feature flags are set. Before and during execution the scheduler checks memory pressure,
+swap, and thermal warnings. It terminates only the ANE branch on pressure or adapter
+failure, keeps the completed ASR checkpoint, and continues with sequential pyannote/MPS.
+Job status and result parameters record the selected execution mode and fallback reason.
+
 Run lightweight tests with:
 
 ```bash
