@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import re
+import signal
 import shutil
 import statistics
 import subprocess
@@ -41,8 +42,8 @@ DEFAULT_MODEL = os.getenv(
 )
 RUNTIME_ROOT = Path(
     os.getenv(
-        "CONTORA_WHISPER_RUNTIME_ROOT",
-        Path.home() / "Library/Application Support/NiketasAI/runtime/faster-whisper-xxl",
+        "CONTORA_SPEECH_RUNTIME_ROOT",
+        Path(__file__).resolve().parents[1],
     )
 ).expanduser()
 RESULTS_ROOT = Path(
@@ -58,6 +59,7 @@ HANDOFF_ROOT = Path(
     )
 ).expanduser()
 JOB_TTL_SECONDS = max(60.0, float(os.getenv("CONTORA_MLX_JOB_TTL_SECONDS", str(7 * 24 * 60 * 60))))
+IDLE_SHUTDOWN_SECONDS = max(0.0, float(os.getenv("CONTORA_MLX_IDLE_SHUTDOWN_SECONDS", "300")))
 TERMINAL_JOB_TTL_SECONDS = max(
     JOB_TTL_SECONDS,
     float(os.getenv("CONTORA_MLX_TERMINAL_JOB_TTL_SECONDS", str(30 * 24 * 60 * 60))),
@@ -83,6 +85,8 @@ _job_cancellations: dict[str, threading.Event] = {}
 _job_telemetry: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _processing_lock = threading.Lock()
+_last_job_activity = time.monotonic()
+_idle_shutdown_task: asyncio.Task | None = None
 
 
 class JobCancelledError(Exception):
@@ -347,6 +351,7 @@ def _job_snapshot(job_id: str) -> dict[str, Any] | None:
 
 
 def _store_job_status(job_id: str, **changes: Any) -> dict[str, Any]:
+    global _last_job_activity
     with _jobs_lock:
         status = _jobs.get(job_id)
         if status is None:
@@ -358,6 +363,7 @@ def _store_job_status(job_id: str, **changes: Any) -> dict[str, Any]:
             changes["progress"] = min(1.0, max(previous_progress, float(changes["progress"])))
         status.update(sanitize_finite_numbers(changes))
         status["updated_at"] = time.time()
+        _last_job_activity = time.monotonic()
         snapshot = dict(status)
     atomic_write_json(RESULTS_ROOT / job_id / "status.json", snapshot)
     return snapshot
@@ -963,6 +969,15 @@ def failure_payload(job_id: str, stage: str, exc: Exception, recoverable: bool) 
     return error
 
 
+def active_job_count() -> int:
+    with _jobs_lock:
+        return sum(
+            1
+            for status in _jobs.values()
+            if status.get("state") not in {"completed", "failed", "cancelled"}
+        )
+
+
 @app.get("/health")
 def health():
     return {
@@ -971,6 +986,7 @@ def health():
         "defaultModel": DEFAULT_MODEL,
         "torchMPS": torch.backends.mps.is_available(),
         "resultSafety": "finite-v1",
+        "activeJobs": active_job_count(),
         "parallelANE": {
             "qualityGateEnabled": os.getenv("CONTORA_MLX_ENABLE_EXPERIMENTAL_ANE") == "1",
             "rolloutEnabled": os.getenv("CONTORA_MLX_ENABLE_PARALLEL_ANE") == "1",
@@ -1716,9 +1732,37 @@ def _recover_persisted_jobs() -> list[str]:
     return resumed
 
 
+async def _shutdown_after_idle() -> None:
+    interval = min(30.0, max(1.0, IDLE_SHUTDOWN_SECONDS / 4.0))
+    while True:
+        await asyncio.sleep(interval)
+        if active_job_count() > 0:
+            continue
+        with _jobs_lock:
+            idle_seconds = time.monotonic() - _last_job_activity
+        if idle_seconds >= IDLE_SHUTDOWN_SECONDS:
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+
 @app.on_event("startup")
 async def recover_persisted_jobs_on_startup():
+    global _idle_shutdown_task
     _recover_persisted_jobs()
+    if IDLE_SHUTDOWN_SECONDS > 0:
+        _idle_shutdown_task = asyncio.create_task(_shutdown_after_idle())
+
+
+@app.on_event("shutdown")
+async def cancel_idle_shutdown_task():
+    global _idle_shutdown_task
+    if _idle_shutdown_task is not None:
+        _idle_shutdown_task.cancel()
+        try:
+            await _idle_shutdown_task
+        except asyncio.CancelledError:
+            pass
+        _idle_shutdown_task = None
 
 
 @app.post("/v1/transcription/jobs")

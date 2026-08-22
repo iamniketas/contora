@@ -16,17 +16,17 @@ This directory contains the native macOS client for Contora:
 - Start/stop recording captures real audio buffers.
 - Capture source modes: `Microphone`, `System Audio`, `System + Microphone`.
 - Recorded audio is saved locally in session storage with configurable WAV/M4A retention.
-- Manual transcription workflow through the shared local Whisper/MLX server.
+- Managed local transcription workflow through the self-contained speech runtime.
 - MLX results are finite-number sanitized and checkpointed before the HTTP response; failed attempts use a separate `.failed.json` and never overwrite the last successful transcript.
 - Background transcription queue with active/queued/completed/failed/cancelled states.
 - Active transcription can be stopped from the workspace.
 - MLX transcription reports live model-loading, ASR, diarization, merge, percentage, and ETA status through a persistent local job API.
-- Local Whisper reports live model-loading, speech transcription, diarization, formatting, percentage, and ETA events to the workspace.
-- Each Local Whisper run writes a bounded diagnostic log under `~/Library/Logs/Contora/`, accessible from the `Logs` button.
-- Local `faster-whisper` process backend with a one-click setup flow, model selection, runtime install/repair, model download, and diarization toggle.
-- Product direction for diarization is a Contora-managed runtime artifact with bundled/prepared pyannote assets, matching the Windows flow without per-user Hugging Face token setup.
-- Runtime artifact builder: `../../tools/macos-whisper-runtime/`.
-- Runtime installer accepts a bundled `ContoraMacWhisperRuntime-<arch>.tar.gz`, `CONTORA_MACOS_WHISPER_RUNTIME_ARCHIVE`, or `CONTORA_MACOS_WHISPER_RUNTIME_URL` for installing a prepared archive.
+- The backend starts automatically for transcription jobs and stops after an idle timeout.
+- The legacy `Local Whisper / faster-whisper` backend is decoded only for settings migration and is not selectable or shipped in the macOS target.
+- The runtime contains relocatable Python, MLX and the approved diarization fallback assets; no per-user Hugging Face token is required.
+- Runtime artifact builder: `../../tools/macos-mlx-runtime/`.
+- Runtime installer accepts a bundled `ContoraMacSpeechRuntime-<arch>.tar.gz`, `CONTORA_MACOS_SPEECH_RUNTIME_ARCHIVE`, or `CONTORA_MACOS_SPEECH_RUNTIME_URL`.
+- Legacy shared runtime cleanup is explicit, recoverable via Trash, and blocked when Dictator or another process may still use it.
 - Shared runtime path strategy for model reuse with Dictator.
 - Audio/video import registers external files without copying media into Contora storage.
 - Video audio extraction with `ffmpeg` is deferred until transcription starts.
@@ -53,7 +53,7 @@ For production development, open the package in Xcode and run as a macOS app tar
 
 ## Next Milestones
 
-1. Build and validate a Contora-managed macOS Faster-Whisper runtime artifact with prepared diarization assets.
+1. Complete the golden-corpus quality gate for the feature-gated Core ML/ANE diarizer.
 2. Add recovery UX for imported sessions whose original external files were moved or deleted.
 3. Stabilize real-world capture and long-call behavior for `System Audio` and `System + Microphone`.
 4. Add archive/export tooling for larger session libraries.

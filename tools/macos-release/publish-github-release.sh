@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ARTIFACT_ROOT="${CONTORA_MACOS_ARTIFACT_ROOT:-$REPO_ROOT/artifacts/macos-pilot}"
+SPEECH_RUNTIME_DIST="${CONTORA_SPEECH_DIST_ROOT:-$REPO_ROOT/artifacts/macos-speech-runtime/dist}"
 REPO="${CONTORA_GITHUB_REPO:-iamniketas/contora}"
 TAG="${CONTORA_RELEASE_TAG:-v${CONTORA_VERSION:-0.5.2-macos-pilot}}"
 
@@ -59,11 +60,23 @@ upload_asset() {
 }
 
 shopt -s nullglob
+runtime_archives=("$SPEECH_RUNTIME_DIST"/ContoraMacSpeechRuntime-*.tar.gz)
+if [[ ${#runtime_archives[@]} -eq 0 && "${CONTORA_RELEASE_SKIP_SPEECH_RUNTIME:-0}" != "1" ]]; then
+  echo "Speech runtime artifact is required before publishing: $SPEECH_RUNTIME_DIST" >&2
+  exit 1
+fi
 for dmg in "$ARTIFACT_ROOT"/Contora-macOS-*-unsigned.dmg "$ARTIFACT_ROOT"/Contora-macOS-*-signed.dmg; do
   upload_asset "$dmg" "application/x-apple-diskimage"
 done
 for zip in "$ARTIFACT_ROOT"/Contora-macOS-*-unsigned.zip "$ARTIFACT_ROOT"/Contora-macOS-*-signed.zip; do
   upload_asset "$zip" "application/zip"
+done
+for runtime in "${runtime_archives[@]}"; do
+  "$REPO_ROOT/tools/macos-mlx-runtime/verify-runtime-archive.sh" "$runtime"
+  upload_asset "$runtime" "application/gzip"
+  if [[ -f "$runtime.sha256" ]]; then
+    upload_asset "$runtime.sha256" "text/plain"
+  fi
 done
 if [[ -f "$ARTIFACT_ROOT/SHA256SUMS" ]]; then
   upload_asset "$ARTIFACT_ROOT/SHA256SUMS" "text/plain"

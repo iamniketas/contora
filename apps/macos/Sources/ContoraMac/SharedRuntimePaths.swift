@@ -3,7 +3,6 @@ import Foundation
 /// Shared runtime layout used by Contora and Dictator on macOS.
 enum SharedRuntimePaths {
     static let envRuntimeRoot = "NIKETAS_SHARED_RUNTIME_ROOT"
-    static let envWhisperExecutable = "CONTORA_WHISPER_EXE"
 
     static func sharedRuntimeRoot() -> URL {
         if let env = ProcessInfo.processInfo.environment[envRuntimeRoot], !env.isEmpty {
@@ -23,84 +22,49 @@ enum SharedRuntimePaths {
         sharedRuntimeRoot().appendingPathComponent("faster-whisper-xxl", isDirectory: true)
     }
 
-    static func whisperExecutable() -> URL {
-        if let env = ProcessInfo.processInfo.environment[envWhisperExecutable], !env.isEmpty {
-            return URL(fileURLWithPath: env)
-        }
-        return whisperRoot().appendingPathComponent("faster-whisper-xxl")
-    }
-
-    static func whisperVenvPython() -> URL {
-        whisperRoot()
-            .appendingPathComponent("venv", isDirectory: true)
-            .appendingPathComponent("bin/python")
-    }
-
-    static func whisperBundledPython() -> URL {
-        whisperRoot()
-            .appendingPathComponent("python/Python.framework/Versions/3.12/bin/python3.12")
-    }
-
-    static func whisperTranscribeScript() -> URL {
-        whisperRoot()
-            .appendingPathComponent("bin", isDirectory: true)
-            .appendingPathComponent("contora_fw_transcribe.py")
-    }
-
-    static func whisperLogsDirectory() -> URL {
-        if let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first {
-            return logs.appendingPathComponent("Logs/Contora", isDirectory: true)
-        }
-
-        return URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/Logs/Contora", isDirectory: true)
-    }
-
-    static func modelsDirectory() -> URL {
-        whisperRoot().appendingPathComponent("_models", isDirectory: true)
-    }
-
-    static func modelDirectory(name: String) -> URL {
-        modelsDirectory().appendingPathComponent("faster-whisper-\(name)", isDirectory: true)
-    }
-
-    static func isFasterWhisperModelInstalled(name: String) -> Bool {
-        let directory = modelDirectory(name: name)
-        let requiredFiles = ["config.json", "tokenizer.json", "model.bin"]
-        let hasRequiredFiles = requiredFiles.allSatisfy {
-            FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
-        }
-        let hasVocabulary = FileManager.default.fileExists(atPath: directory.appendingPathComponent("vocabulary.txt").path)
-            || FileManager.default.fileExists(atPath: directory.appendingPathComponent("vocabulary.json").path)
-        return hasRequiredFiles && hasVocabulary
-    }
-
     static func whisperKitModelsRoot() -> URL {
         sharedRuntimeRoot().appendingPathComponent("whisperkit-models", isDirectory: true)
     }
 
-    static func mlxAudioRoot() -> URL {
-        sharedRuntimeRoot().appendingPathComponent("mlx-audio", isDirectory: true)
+    /// Self-contained runtime used by the managed macOS speech backend.
+    /// The old `mlx-audio` and `faster-whisper-xxl` directories are retained
+    /// only so another NiketasAI product can continue using them until the
+    /// user explicitly removes the legacy runtime.
+    static func speechRuntimeRoot() -> URL {
+        sharedRuntimeRoot().appendingPathComponent("speech-runtime", isDirectory: true)
+    }
+
+    static func speechRuntimePython() -> URL {
+        speechRuntimeRoot()
+            .appendingPathComponent("python/Python.framework/Versions/3.12/bin/python3.12")
+    }
+
+    static func speechRuntimeSitePackages() -> URL {
+        speechRuntimeRoot().appendingPathComponent("venv/lib/python3.12/site-packages", isDirectory: true)
+    }
+
+    static func speechRuntimeManifest() -> URL {
+        speechRuntimeRoot().appendingPathComponent("runtime-manifest.json")
     }
 
     static func mlxVenvSitePackages() -> URL {
-        mlxAudioRoot().appendingPathComponent("venv/lib/python3.12/site-packages", isDirectory: true)
+        speechRuntimeSitePackages()
     }
 
     static func mlxServerScript() -> URL {
-        mlxAudioRoot().appendingPathComponent("bin/contora_mlx_server.py")
+        speechRuntimeRoot().appendingPathComponent("bin/contora_mlx_server.py")
     }
 
     static func mlxResultSafetyModule() -> URL {
-        mlxAudioRoot().appendingPathComponent("bin/result_safety.py")
+        speechRuntimeRoot().appendingPathComponent("bin/result_safety.py")
     }
 
     static func mlxServerLog() -> URL {
-        mlxAudioRoot().appendingPathComponent("mlx-server.log")
+        speechRuntimeRoot().appendingPathComponent("mlx-server.log")
     }
 
     static func mlxServerPIDFile() -> URL {
-        mlxAudioRoot().appendingPathComponent("mlx-server.pid")
+        speechRuntimeRoot().appendingPathComponent("mlx-server.pid")
     }
 
     static func localLLMRoot() -> URL {

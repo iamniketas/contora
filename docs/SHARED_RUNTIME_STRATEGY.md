@@ -16,12 +16,16 @@ Single shared runtime location for:
 `~/Library/Application Support/NiketasAI/runtime/`
 
 Inside:
-- `faster-whisper-xxl/`
-  - `faster-whisper-xxl`
-  - `_models/faster-whisper-large-v2/...`
+- `speech-runtime/`
+  - relocatable Python 3.12
+  - MLX speech server and dependencies
+  - approved diarization dependencies/assets
 - `whisperkit-models/`
-- `mlx-audio/`
 - `llm/`
+
+`faster-whisper-xxl/` and `mlx-audio/` are legacy locations. Contora does not
+read them after the speech-runtime migration and never removes shared data
+automatically.
 
 Also:
 - `model-catalog.json`
@@ -29,10 +33,8 @@ Also:
 ## Environment Variables
 
 - `NIKETAS_SHARED_RUNTIME_ROOT` (optional override root)
-- `CONTORA_WHISPER_EXE`
-- `CONTORA_WHISPER_ROOT`
-- `CONTORA_WHISPER_MODELS_DIR`
-- `CONTORA_WHISPER_MODEL_LARGE_V2_DIR`
+- `CONTORA_MACOS_SPEECH_RUNTIME_ARCHIVE`
+- `CONTORA_MACOS_SPEECH_RUNTIME_URL`
 
 ## Implementation in this repo
 
@@ -43,21 +45,21 @@ Also:
 2. macOS app path resolver added:
 - `apps/macos/Sources/ContoraMac/SharedRuntimePaths.swift`
 
-3. Local process transcription service added:
-- `apps/macos/Sources/ContoraMac/FasterWhisperProcessTranscriptionService.swift`
+3. Managed speech runtime and server lifecycle:
+- `apps/macos/Sources/ContoraMac/SharedMLXServerToolkit.swift`
 
 ## Installer/Updater Contract
 
 For both apps:
 1. Check canonical shared root.
-2. If runtime exists and checksum is valid: reuse.
+2. If the self-contained runtime exists and its manifest is valid: reuse.
 3. If missing: download once into shared root.
 4. Register env vars for both app processes.
 
 ## Future Local LLM Extension
 
 Use the same root with versioned namespaces:
-- `runtime/faster-whisper-xxl/...`
+- `runtime/speech-runtime/...`
 - `runtime/llm/gguf/...`
 - `runtime/llm/onnx/...`
 
@@ -74,7 +76,6 @@ The shared runtime now also defines a catalog file:
 Its role is to describe discovered/shared resources across providers such as:
 
 - `whisperkit`
-- `faster-whisper`
 - `mlx-audio`
 - `ollama`
 
@@ -83,5 +84,6 @@ This is the direction for `DictatorMac` + `ContoraMac`: both apps should eventua
 ## Migration
 
 - Keep existing Windows paths untouched.
-- On macOS first run, if app-private runtime exists, move/symlink into shared root.
-- Maintain backward compatibility with current `CONTORA_*` variables.
+- Decode old macOS backend settings and rewrite them to managed MLX Turbo.
+- Keep the legacy runtime untouched until the user explicitly requests cleanup.
+- Before cleanup, audit Dictator installation/configuration and running process references.

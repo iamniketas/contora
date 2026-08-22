@@ -86,6 +86,13 @@ class ServerResponseTests(unittest.TestCase):
             handle.writeframes(b"\x00\x00" * 1_600)
         return output.getvalue()
 
+    def test_health_reports_only_nonterminal_jobs_as_active(self):
+        with server._jobs_lock:
+            server._jobs["running"] = {"state": "transcribing"}
+            server._jobs["done"] = {"state": "completed"}
+            server._jobs["failed"] = {"state": "failed"}
+        self.assertEqual(server.health()["activeJobs"], 1)
+
     def test_persists_sanitized_result_before_returning_it(self):
         with tempfile.TemporaryDirectory() as directory:
             server.RESULTS_ROOT = Path(directory)

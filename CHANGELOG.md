@@ -5,6 +5,18 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### macOS
+- **Persistent crash recovery**: app and backend restarts reattach to saved jobs and reuse compatible ASR/diarization checkpoints.
+- **Safe local file handoff**: transcription jobs claim capability-bound canonical WAV files instead of copying large multipart payloads.
+- **Real rolling ETA**: duration-normalized hardware/model profiles combine robust recent-window rates with separate ASR and diarization progress.
+- **Word-level speakers**: result schema v2 stores native Whisper word timestamps, global speaker turns, overlap-aware speaker attribution, and independently assembled utterances.
+- **Guarded Apple Silicon parallelism**: the feature-gated FluidAudio/Core ML branch can run beside MLX ASR, with memory/swap/thermal guardrails and sequential pyannote fallback.
+- **Self-contained speech runtime**: macOS now uses relocatable Python, MLX, and diarization assets from `speech-runtime`; the selectable Local Faster Whisper backend and `large-v2` payload are removed.
+- **Job-owned server lifecycle**: backend launch status refreshes during startup, active jobs prevent unsafe shutdown/repair, and a server watchdog exits after five globally idle minutes.
+- **Safe legacy cleanup**: old shared runtime data is never deleted automatically and can be moved to Trash only after Dictator/process/path checks and explicit confirmation.
+
 ## [0.6.6] - 2026-08-22
 
 ### macOS

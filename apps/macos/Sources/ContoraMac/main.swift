@@ -130,10 +130,6 @@ struct RuntimeDiagnostics {
     var ffmpegVersion = ""
     var sharedRuntimeRoot = ""
     var sharedRuntimeRootStatus = "Unknown"
-    var whisperExecutablePath = ""
-    var whisperExecutableStatus = "Unknown"
-    var modelsDirectoryPath = ""
-    var modelsDirectoryStatus = "Unknown"
     var sharedConfigPath = ""
     var sharedConfigStatus = "Unknown"
     var activeBackend = ""
@@ -1671,22 +1667,13 @@ final class AppModel: ObservableObject {
     @Published var chunkSeconds = 8
     @Published var recordingStoragePolicy: RecordingStoragePolicy = .wavOnly
     @Published var transcriptionLanguage = "ru"
-    @Published var transcriptionBackend: TranscriptionBackend = .fasterWhisperProcess
+    @Published var transcriptionBackend: TranscriptionBackend = .mlxOpenAIHTTP
     @Published var transcriptionEndpoint = "http://127.0.0.1:5500/transcribe"
     @Published var mlxTranscriptionEndpoint = "http://127.0.0.1:8010/v1/audio/transcriptions"
     @Published var mlxModelID = "mlx-community/whisper-large-v3-turbo-asr-fp16"
     @Published var mlxDiarizationEnabled = false
     @Published var mlxSetupStatus = "Not configured"
     @Published var isSettingUpMLX = false
-    @Published var fasterWhisperModelName = "large-v2"
-    @Published var fasterWhisperDiarizationEnabled = true
-    @Published var fasterWhisperDownloadStatus = "Not checked"
-    @Published var isDownloadingFasterWhisperModel = false
-    @Published var fasterWhisperRuntimeStatus = "Not checked"
-    @Published var isInstallingFasterWhisperRuntime = false
-    @Published var localWhisperSetupStatus = "Not configured"
-    @Published var isSettingUpLocalWhisper = false
-
     @Published var recordingSeconds: Double = 0
     @Published var lastCaptureSamples: Int = 0
     @Published var isTranscribing = false
@@ -1729,6 +1716,8 @@ final class AppModel: ObservableObject {
     @Published var storageStatus = "WAV only"
     @Published var diagnostics = RuntimeDiagnostics()
     @Published var sharedMLXToolkitActionStatus = "Idle"
+    @Published var legacyRuntimeCleanupStatus = "Not checked"
+    @Published var canCleanLegacyRuntime = false
     @Published var sharedModelCatalogEntries: [SharedModelCatalogEntry] = []
     @Published var activeMicrophoneName = "Unknown microphone"
     @Published var activeOutputDeviceName = "Unknown output"
@@ -1752,8 +1741,8 @@ final class AppModel: ObservableObject {
     private let audioCompressionService = AudioCompressionService()
     private let recordingArchive = RecordingArchiveService()
     private let sharedMLXToolkitService = SharedMLXServerToolkitService()
+    private let legacyRuntimeCleanupService = LegacySpeechRuntimeCleanupService()
     private let sharedModelCatalogStore = SharedModelCatalogStore.shared
-    private let fasterWhisperRuntimeInstaller = FasterWhisperRuntimeInstaller()
     private let appUpdateService = AppUpdateService()
     private let sessionLibrary = SessionLibraryService()
     private let mlxJobRecoveryStore = try? MLXJobRecoveryStore.live()
@@ -1772,6 +1761,7 @@ final class AppModel: ObservableObject {
     private var transcriptionJobSessions: [UUID: ContoraSession] = [:]
     private var activeTranscriptionJobID: UUID?
     private var activeTranscriptionTask: Task<Void, Never>?
+    private var speechBackendIdleStopTask: Task<Void, Never>?
     private var pendingMLXRecoveryRecords: [MLXJobRecoveryRecord] = []
 
     private init() {
@@ -1780,30 +1770,8 @@ final class AppModel: ObservableObject {
         reloadSessions()
         refreshDiagnostics()
         refreshAudioDeviceContext()
-        if !restorePendingMLXJobIfNeeded() {
-            autoStartMLXServerIfNeeded()
-        }
+        _ = restorePendingMLXJobIfNeeded()
         checkForUpdates(silent: true)
-    }
-
-    private func autoStartMLXServerIfNeeded() {
-        guard transcriptionBackend == .mlxOpenAIHTTP,
-              sharedMLXToolkitService.status().isInstalled else { return }
-        let service = sharedMLXToolkitService
-        let modelID = mlxModelID
-        Task { [weak self] in
-            do {
-                let status = try await service.start(modelID: modelID)
-                await MainActor.run {
-                    self?.sharedMLXToolkitActionStatus = status
-                    self?.backendProbeStatus = "MLX: OK (/health)"
-                }
-            } catch {
-                await MainActor.run {
-                    self?.sharedMLXToolkitActionStatus = error.localizedDescription
-                }
-            }
-        }
     }
 
     @discardableResult
@@ -1876,7 +1844,22 @@ final class AppModel: ObservableObject {
             createdAt: session.createdAt
         )
         do {
-            _ = try await sharedMLXToolkitService.start(modelID: record.modelID)
+            _ = try await sharedMLXToolkitService.start(modelID: record.modelID) { [weak self] message in
+                Task { @MainActor in
+                    self?.applyTranscriptionProgress(
+                        TranscriptionProgress(
+                            phase: "starting_backend",
+                            progress: 0,
+                            message: message,
+                            currentSeconds: 0,
+                            totalSeconds: record.audioSeconds,
+                            etaSeconds: nil
+                        ),
+                        jobID: jobID,
+                        startedAt: record.createdAt
+                    )
+                }
+            }
             guard let endpointURL = URL(string: record.endpointURL) else {
                 throw TranscriptionError.serverError(statusCode: 400, message: "Invalid saved MLX endpoint URL")
             }
@@ -1885,8 +1868,8 @@ final class AppModel: ObservableObject {
                 endpointURL: endpointURL,
                 onProgress: { [weak self] progress in
                     Task { @MainActor in
-                        self?.applyFasterWhisperProgress(
-                            FasterWhisperProcessProgress(
+                        self?.applyTranscriptionProgress(
+                            TranscriptionProgress(
                                 phase: progress.phase,
                                 progress: progress.fraction,
                                 message: progress.message,
@@ -2048,13 +2031,8 @@ final class AppModel: ObservableObject {
         case .mlxOpenAIHTTP:
             return "MLX OpenAI HTTP | \(mlxModelID)"
         case .fasterWhisperProcess:
-            let diarization = fasterWhisperDiarizationEnabled ? "diarization on" : "diarization off"
-            return "Local Faster Whisper | \(fasterWhisperModelName), \(diarization)"
+            return "MLX OpenAI HTTP | \(mlxModelID)"
         }
-    }
-
-    var isLocalWhisperBusy: Bool {
-        isSettingUpLocalWhisper || isInstallingFasterWhisperRuntime || isDownloadingFasterWhisperModel
     }
 
     var isMLXBusy: Bool {
@@ -2066,41 +2044,15 @@ final class AppModel: ObservableObject {
     }
 
     var mlxPrimaryActionTitle: String {
-        sharedMLXToolkitService.status().isInstalled ? "Repair MLX" : "Set Up MLX"
-    }
-
-    var localWhisperPrimaryActionTitle: String {
-        let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
-        let runtimeInstalled = fasterWhisperRuntimeInstaller.status().isInstalled
-        let modelInstalled = SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName)
-        if runtimeInstalled && modelInstalled {
-            return "Repair Local Whisper"
-        }
-        if runtimeInstalled {
-            return "Download Model"
-        }
-        return "Set Up Local Whisper"
+        sharedMLXToolkitService.status().isInstalled ? "Repair Speech Runtime" : "Set Up Speech Runtime"
     }
 
     func selectTranscriptionBackend(_ backend: TranscriptionBackend) {
-        transcriptionBackend = backend
+        transcriptionBackend = backend == .fasterWhisperProcess ? .mlxOpenAIHTTP : backend
         transcriptionEnabled = true
         saveSharedServerConfig()
         refreshDiagnostics()
-        autoStartMLXServerIfNeeded()
         probeSharedBackend()
-    }
-
-    func updateFasterWhisperModelName(_ modelName: String) {
-        fasterWhisperModelName = WhisperModelOption.normalizedName(modelName)
-        saveSharedServerConfig()
-        refreshDiagnostics()
-    }
-
-    func updateFasterWhisperDiarization(_ enabled: Bool) {
-        fasterWhisperDiarizationEnabled = enabled
-        saveSharedServerConfig()
-        refreshDiagnostics()
     }
 
     func updateMLXModelID(_ modelID: String) {
@@ -2133,13 +2085,11 @@ final class AppModel: ObservableObject {
     func loadSharedServerConfig() {
         do {
             let config = try SharedTranscriptionServerConfigStore.shared.loadOrCreate()
-            transcriptionBackend = config.activeBackend
+            transcriptionBackend = config.activeBackend == .fasterWhisperProcess ? .mlxOpenAIHTTP : config.activeBackend
             transcriptionEndpoint = config.whisperTranscribeURL
             mlxTranscriptionEndpoint = config.mlxTranscribeURL
             mlxModelID = config.mlxModelID
             mlxDiarizationEnabled = config.mlxDiarizationEnabled
-            fasterWhisperModelName = WhisperModelOption.normalizedName(config.fasterWhisperModelName)
-            fasterWhisperDiarizationEnabled = config.fasterWhisperDiarizationEnabled
             sharedServerConfigStatus = "Loaded (\(config.schemaVersion))"
         } catch {
             sharedServerConfigStatus = "Load failed: \(error.localizedDescription)"
@@ -2148,14 +2098,14 @@ final class AppModel: ObservableObject {
 
     func saveSharedServerConfig() {
         let config = SharedTranscriptionServerConfig(
-            schemaVersion: "1.0",
-            activeBackend: transcriptionBackend,
+            schemaVersion: "2.0",
+            activeBackend: transcriptionBackend == .fasterWhisperProcess ? .mlxOpenAIHTTP : transcriptionBackend,
             whisperTranscribeURL: transcriptionEndpoint,
             mlxTranscribeURL: mlxTranscriptionEndpoint,
             mlxModelID: mlxModelID,
             mlxDiarizationEnabled: mlxDiarizationEnabled,
-            fasterWhisperModelName: fasterWhisperModelName,
-            fasterWhisperDiarizationEnabled: fasterWhisperDiarizationEnabled,
+            fasterWhisperModelName: "",
+            fasterWhisperDiarizationEnabled: false,
             updatedAt: ISO8601DateFormatter().string(from: Date())
         )
         do {
@@ -2199,6 +2149,8 @@ final class AppModel: ObservableObject {
         transcriptionQueue.append(job.id)
         transcriptionJobSessions[job.id] = session
         statusMessage = isTranscriptionBusy ? "Queued \(session.title)" : "Queued \(session.title), starting..."
+        speechBackendIdleStopTask?.cancel()
+        speechBackendIdleStopTask = nil
         processNextTranscriptionJobIfNeeded()
     }
 
@@ -2224,6 +2176,7 @@ final class AppModel: ObservableObject {
             job.errorMessage = nil
         }
         finishTranscriptionState()
+        scheduleSpeechBackendIdleStop()
     }
 
     func probeSharedBackend() {
@@ -2234,7 +2187,7 @@ final class AppModel: ObservableObject {
                 backend: transcriptionBackend,
                 whisperURL: transcriptionEndpoint,
                 mlxURL: mlxTranscriptionEndpoint,
-                fasterWhisperModelName: fasterWhisperModelName
+                fasterWhisperModelName: ""
             )
             await MainActor.run {
                 self.backendProbeStatus = status
@@ -2245,8 +2198,6 @@ final class AppModel: ObservableObject {
 
     func refreshDiagnostics() {
         diagnostics.sharedRuntimeRoot = SharedRuntimePaths.sharedRuntimeRoot().path
-        diagnostics.whisperExecutablePath = SharedRuntimePaths.whisperExecutable().path
-        diagnostics.modelsDirectoryPath = SharedRuntimePaths.modelsDirectory().path
         diagnostics.sharedConfigPath = SharedTranscriptionServerConfigStore.shared.configFileURL().path
         diagnostics.sharedModelCatalogPath = sharedModelCatalogStore.catalogURL().path
         diagnostics.activeBackend = transcriptionBackend.rawValue
@@ -2256,23 +2207,13 @@ final class AppModel: ObservableObject {
         diagnostics.sharedMLXLogPath = mlxRuntime.logURL.path
         diagnostics.sharedMLXToolkitStatus = mlxRuntime.displayText
         mlxSetupStatus = mlxRuntime.isInstalled ? "Ready" : "Needs setup"
+        refreshLegacyRuntimeCleanupStatus()
 
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false
         diagnostics.sharedRuntimeRootStatus = fileManager.fileExists(atPath: diagnostics.sharedRuntimeRoot, isDirectory: &isDirectory) && isDirectory.boolValue ? "Present" : "Missing"
-        diagnostics.whisperExecutableStatus = fileManager.isExecutableFile(atPath: diagnostics.whisperExecutablePath) ? "Executable" : "Missing"
-        isDirectory = false
-        diagnostics.modelsDirectoryStatus = fileManager.fileExists(atPath: diagnostics.modelsDirectoryPath, isDirectory: &isDirectory) && isDirectory.boolValue ? "Present" : "Missing"
         diagnostics.sharedConfigStatus = fileManager.fileExists(atPath: diagnostics.sharedConfigPath) ? "Present" : "Missing"
         diagnostics.sharedModelCatalogStatus = fileManager.fileExists(atPath: diagnostics.sharedModelCatalogPath) ? "Present" : "Missing"
-        fasterWhisperRuntimeStatus = fasterWhisperRuntimeInstaller.status().displayText
-        let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
-        fasterWhisperDownloadStatus = SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName)
-            ? "\(modelName) installed"
-            : "\(modelName) not installed"
-        localWhisperSetupStatus = fasterWhisperRuntimeInstaller.status().isInstalled && SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName)
-            ? "Ready with \(modelName)"
-            : "Needs setup"
 
         refreshFFmpegDiagnostics()
         refreshSharedModelCatalog()
@@ -2297,34 +2238,45 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func startSharedMLXToolkitServer() {
-        guard sharedMLXToolkitService.status().isInstalled else {
-            sharedMLXToolkitActionStatus = "MLX is not installed. Click Set Up MLX."
-            return
-        }
-
-        sharedMLXToolkitActionStatus = "Starting MLX server…"
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let output = try await self.sharedMLXToolkitService.start(modelID: self.mlxModelID)
-                self.sharedMLXToolkitActionStatus = output
-                self.backendProbeStatus = "MLX: OK (/health)"
-                self.refreshDiagnostics()
-            } catch {
-                self.sharedMLXToolkitActionStatus = error.localizedDescription
-                self.backendProbeStatus = "MLX: failed to start"
-            }
-        }
-    }
-
     func stopSharedMLXToolkitServer() {
+        speechBackendIdleStopTask?.cancel()
+        speechBackendIdleStopTask = nil
         do {
             sharedMLXToolkitActionStatus = try sharedMLXToolkitService.stop()
             backendProbeStatus = "MLX: stopped"
             refreshDiagnostics()
         } catch {
             sharedMLXToolkitActionStatus = error.localizedDescription
+        }
+    }
+
+    func prepareForApplicationTermination() {
+        speechBackendIdleStopTask?.cancel()
+        speechBackendIdleStopTask = nil
+        // Keep an active persistent job and its recovery record alive. When no
+        // local job is active, stop only if the server reports global idleness.
+        guard activeTranscriptionJobID == nil else { return }
+        _ = try? sharedMLXToolkitService.stop()
+    }
+
+    private func scheduleSpeechBackendIdleStop() {
+        speechBackendIdleStopTask?.cancel()
+        guard transcriptionBackend == .mlxOpenAIHTTP,
+              sharedMLXToolkitService.status().isInstalled else { return }
+        let service = sharedMLXToolkitService
+        speechBackendIdleStopTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(300))
+            guard !Task.isCancelled, let self,
+                  self.activeTranscriptionJobID == nil,
+                  self.transcriptionQueue.isEmpty,
+                  await service.isIdle() else { return }
+            do {
+                self.sharedMLXToolkitActionStatus = try service.stop()
+                self.backendProbeStatus = "MLX: stopped after idle timeout"
+            } catch {
+                self.sharedMLXToolkitActionStatus = error.localizedDescription
+            }
+            self.speechBackendIdleStopTask = nil
         }
     }
 
@@ -2343,16 +2295,47 @@ final class AppModel: ObservableObject {
         if FileManager.default.fileExists(atPath: logURL.path) {
             NSWorkspace.shared.activateFileViewerSelecting([logURL])
         } else {
-            let root = SharedRuntimePaths.mlxAudioRoot()
+            let root = SharedRuntimePaths.speechRuntimeRoot()
             try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             NSWorkspace.shared.open(root)
+        }
+    }
+
+    func refreshLegacyRuntimeCleanupStatus() {
+        let report = legacyRuntimeCleanupService.audit()
+        legacyRuntimeCleanupStatus = report.displayText
+        canCleanLegacyRuntime = report.canMoveToTrash
+    }
+
+    func requestLegacyRuntimeCleanup() {
+        let report = legacyRuntimeCleanupService.audit()
+        legacyRuntimeCleanupStatus = report.displayText
+        canCleanLegacyRuntime = report.canMoveToTrash
+        guard report.canMoveToTrash else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Move legacy speech runtime to Trash?"
+        alert.informativeText = "Contora no longer uses faster-whisper-xxl. The audited folder will be moved to Trash and can be recovered there. No shared runtime is ever removed automatically."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            let destination = try legacyRuntimeCleanupService.moveToTrash()
+            legacyRuntimeCleanupStatus = destination.map { "Moved to Trash: \($0.path)" } ?? "No legacy runtime found"
+            canCleanLegacyRuntime = false
+            refreshSharedModelCatalog()
+        } catch {
+            legacyRuntimeCleanupStatus = "Cleanup failed: \(error.localizedDescription)"
+            canCleanLegacyRuntime = false
         }
     }
 
     func setUpMLX() {
         guard !isSettingUpMLX else { return }
         isSettingUpMLX = true
-        mlxSetupStatus = "Preparing shared Python runtime…"
+        mlxSetupStatus = "Preparing self-contained speech runtime…"
         transcriptionBackend = .mlxOpenAIHTTP
         transcriptionEnabled = true
         saveSharedServerConfig()
@@ -2360,12 +2343,6 @@ final class AppModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                if !self.fasterWhisperRuntimeInstaller.status().isInstalled {
-                    _ = try await self.fasterWhisperRuntimeInstaller.install { message in
-                        Task { @MainActor in self.mlxSetupStatus = message }
-                    }
-                }
-
                 let service = self.sharedMLXToolkitService
                 _ = try await Task.detached(priority: .userInitiated) {
                     try await service.install { message in
@@ -2374,7 +2351,9 @@ final class AppModel: ObservableObject {
                 }.value
 
                 self.mlxSetupStatus = "Starting MLX server…"
-                self.sharedMLXToolkitActionStatus = try await service.start(modelID: self.mlxModelID)
+                self.sharedMLXToolkitActionStatus = try await service.start(modelID: self.mlxModelID) { message in
+                    Task { @MainActor in self.mlxSetupStatus = message }
+                }
                 self.isSettingUpMLX = false
                 self.mlxSetupStatus = "Ready"
                 self.backendProbeStatus = "MLX: OK (/health)"
@@ -2471,24 +2450,6 @@ final class AppModel: ObservableObject {
         openRecordingsFolder()
     }
 
-    func openFasterWhisperRuntimeFolder() {
-        let root = SharedRuntimePaths.whisperRoot()
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(root)
-    }
-
-    func openFasterWhisperLogsFolder() {
-        let logs = SharedRuntimePaths.whisperLogsDirectory()
-        try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(logs)
-    }
-
-    func openFasterWhisperRuntimeReleases() {
-        if let url = URL(string: "https://github.com/iamniketas/contora/releases") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
     func checkForUpdates(silent: Bool = false) {
         guard !isCheckingForUpdates else { return }
 
@@ -2578,178 +2539,6 @@ final class AppModel: ObservableObject {
         }
         if let url = URL(string: "https://github.com/iamniketas/contora/releases") {
             NSWorkspace.shared.open(url)
-        }
-    }
-
-    func installFasterWhisperRuntime() {
-        guard !isInstallingFasterWhisperRuntime else { return }
-
-        isInstallingFasterWhisperRuntime = true
-        fasterWhisperRuntimeStatus = "Starting runtime install..."
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let status = try await self.fasterWhisperRuntimeInstaller.install { message in
-                    Task { @MainActor in
-                        self.fasterWhisperRuntimeStatus = message
-                    }
-                }
-                await MainActor.run {
-                    self.isInstallingFasterWhisperRuntime = false
-                    self.fasterWhisperRuntimeStatus = status.displayText
-                    self.refreshDiagnostics()
-                    self.probeSharedBackend()
-                }
-            } catch {
-                await MainActor.run {
-                    self.isInstallingFasterWhisperRuntime = false
-                    self.fasterWhisperRuntimeStatus = "Install failed: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    func setUpLocalWhisper() {
-        guard !isSettingUpLocalWhisper else { return }
-
-        let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
-        fasterWhisperModelName = modelName
-        transcriptionEnabled = true
-        transcriptionBackend = .fasterWhisperProcess
-
-        let runtimeStatus = fasterWhisperRuntimeInstaller.status()
-        if runtimeStatus.isInstalled && SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName) {
-            fasterWhisperRuntimeStatus = runtimeStatus.displayText
-            fasterWhisperDownloadStatus = "\(modelName) installed"
-            localWhisperSetupStatus = "Ready with \(modelName)"
-            saveSharedServerConfig()
-            refreshDiagnostics()
-            probeSharedBackend()
-            return
-        }
-
-        isSettingUpLocalWhisper = true
-        isInstallingFasterWhisperRuntime = true
-        localWhisperSetupStatus = "Preparing Local Whisper..."
-        fasterWhisperRuntimeStatus = "Checking runtime..."
-        fasterWhisperDownloadStatus = "Checking \(modelName)..."
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let runtimeStatus = self.fasterWhisperRuntimeInstaller.status()
-                if runtimeStatus.isInstalled {
-                    await MainActor.run {
-                        self.isInstallingFasterWhisperRuntime = false
-                        self.fasterWhisperRuntimeStatus = runtimeStatus.displayText
-                        self.localWhisperSetupStatus = "Runtime already installed"
-                    }
-                } else {
-                    _ = try await self.fasterWhisperRuntimeInstaller.install { message in
-                        Task { @MainActor in
-                            self.fasterWhisperRuntimeStatus = message
-                            self.localWhisperSetupStatus = message
-                        }
-                    }
-                    await MainActor.run {
-                        self.isInstallingFasterWhisperRuntime = false
-                    }
-                }
-
-                if SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName) {
-                    await MainActor.run {
-                        self.fasterWhisperDownloadStatus = "\(modelName) installed"
-                        self.localWhisperSetupStatus = "Model already installed"
-                    }
-                } else {
-                    await MainActor.run {
-                        self.isDownloadingFasterWhisperModel = true
-                        self.fasterWhisperDownloadStatus = "Preparing \(modelName)..."
-                        self.localWhisperSetupStatus = "Downloading \(modelName)..."
-                    }
-                    let modelService = FasterWhisperModelDownloadService(modelName: modelName)
-                    try await modelService.download { progress in
-                        Task { @MainActor in
-                            let total = progress.totalBytes > 0 ? " / \(Self.formatBytes(progress.totalBytes))" : ""
-                            let message = "\(modelName): \(progress.percent)% \(Self.formatBytes(progress.downloadedBytes))\(total)"
-                            self.fasterWhisperDownloadStatus = "\(message) (\(progress.currentFile))"
-                            self.localWhisperSetupStatus = message
-                        }
-                    }
-                }
-
-                await MainActor.run {
-                    self.isDownloadingFasterWhisperModel = false
-                    self.isInstallingFasterWhisperRuntime = false
-                    self.isSettingUpLocalWhisper = false
-                    self.fasterWhisperDownloadStatus = "\(modelName) installed"
-                    self.localWhisperSetupStatus = "Ready with \(modelName)"
-                    self.saveSharedServerConfig()
-                    self.refreshDiagnostics()
-                    self.refreshSharedModelCatalog()
-                    self.probeSharedBackend()
-                }
-            } catch {
-                await MainActor.run {
-                    self.isDownloadingFasterWhisperModel = false
-                    self.isInstallingFasterWhisperRuntime = false
-                    self.isSettingUpLocalWhisper = false
-                    self.fasterWhisperRuntimeStatus = self.fasterWhisperRuntimeInstaller.status().displayText
-                    self.localWhisperSetupStatus = "Setup failed: \(error.localizedDescription)"
-                    self.backendProbeStatus = "Local Whisper setup failed"
-                }
-            }
-        }
-    }
-
-    func resetLocalWhisperRuntime(preservingModels: Bool = true) {
-        guard !isLocalWhisperBusy else { return }
-
-        do {
-            try fasterWhisperRuntimeInstaller.resetRuntime(preservingModels: preservingModels)
-            refreshDiagnostics()
-            let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
-            fasterWhisperDownloadStatus = SharedRuntimePaths.isFasterWhisperModelInstalled(name: modelName)
-                ? "\(modelName) installed"
-                : "\(modelName) not installed"
-            localWhisperSetupStatus = preservingModels ? "Runtime reset; press Set Up Local Whisper" : "Local Whisper deleted"
-            backendProbeStatus = "Local Whisper reset"
-        } catch {
-            localWhisperSetupStatus = "Reset failed: \(error.localizedDescription)"
-        }
-    }
-
-    func downloadSelectedFasterWhisperModel() {
-        guard !isDownloadingFasterWhisperModel else { return }
-
-        let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
-        fasterWhisperModelName = modelName
-        isDownloadingFasterWhisperModel = true
-        fasterWhisperDownloadStatus = "Preparing \(modelName)..."
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let service = FasterWhisperModelDownloadService(modelName: modelName)
-                try await service.download { progress in
-                    Task { @MainActor in
-                        let total = progress.totalBytes > 0 ? " / \(Self.formatBytes(progress.totalBytes))" : ""
-                        self.fasterWhisperDownloadStatus = "\(modelName): \(progress.percent)% \(Self.formatBytes(progress.downloadedBytes))\(total) (\(progress.currentFile))"
-                    }
-                }
-                await MainActor.run {
-                    self.isDownloadingFasterWhisperModel = false
-                    self.fasterWhisperDownloadStatus = "\(modelName) installed"
-                    self.refreshSharedModelCatalog()
-                    self.probeSharedBackend()
-                }
-            } catch {
-                await MainActor.run {
-                    self.isDownloadingFasterWhisperModel = false
-                    self.fasterWhisperDownloadStatus = error.localizedDescription
-                }
-            }
         }
     }
 
@@ -3444,14 +3233,14 @@ final class AppModel: ObservableObject {
         case .mlxOpenAIHTTP:
             return mlxTranscriptionEndpoint
         case .fasterWhisperProcess:
-            return SharedRuntimePaths.whisperExecutable().path
+            return mlxTranscriptionEndpoint
         }
     }
 
     private func transcribeWithSelectedBackend(
         samples16k: [Float],
         onMLXJobCreated: @escaping @Sendable (String) -> Void = { _ in },
-        onProgress: @escaping @Sendable (FasterWhisperProcessProgress) -> Void = { _ in }
+        onProgress: @escaping @Sendable (TranscriptionProgress) -> Void = { _ in }
     ) async throws -> TranscriptionBackendOutput {
         switch transcriptionBackend {
         case .whisperHTTP:
@@ -3470,7 +3259,7 @@ final class AppModel: ObservableObject {
                 throw TranscriptionError.serverError(statusCode: 400, message: "Invalid MLX endpoint URL")
             }
             onProgress(
-                FasterWhisperProcessProgress(
+                TranscriptionProgress(
                     phase: "starting_backend",
                     progress: 0,
                     message: "Starting MLX backend",
@@ -3479,7 +3268,20 @@ final class AppModel: ObservableObject {
                     etaSeconds: nil
                 )
             )
-            _ = try await sharedMLXToolkitService.start(modelID: mlxModelID)
+            speechBackendIdleStopTask?.cancel()
+            speechBackendIdleStopTask = nil
+            _ = try await sharedMLXToolkitService.start(modelID: mlxModelID) { message in
+                onProgress(
+                    TranscriptionProgress(
+                        phase: "starting_backend",
+                        progress: 0,
+                        message: message,
+                        currentSeconds: 0,
+                        totalSeconds: Double(samples16k.count) / 16_000.0,
+                        etaSeconds: nil
+                    )
+                )
+            }
             let response = try await mlxTranscriber.transcribe(
                 samples16kMono: samples16k,
                 language: transcriptionLanguage,
@@ -3489,7 +3291,7 @@ final class AppModel: ObservableObject {
                 onJobCreated: onMLXJobCreated,
                 onProgress: { progress in
                     onProgress(
-                        FasterWhisperProcessProgress(
+                        TranscriptionProgress(
                             phase: progress.phase,
                             progress: progress.fraction,
                             message: progress.message,
@@ -3507,37 +3309,13 @@ final class AppModel: ObservableObject {
             )
 
         case .fasterWhisperProcess:
-            let modelName = WhisperModelOption.normalizedName(fasterWhisperModelName)
-            let language = transcriptionLanguage
-            let enableDiarization = fasterWhisperDiarizationEnabled
-            let wavData = WAVEncoder.makeWAVData(samples: samples16k, sampleRate: 16_000)
-            let cancellationFlag = FasterWhisperCancellationFlag()
-            let text = try await withTaskCancellationHandler {
-                try await Task.detached(priority: .userInitiated) {
-                    let workDirectory = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("contora-faster-whisper-\(UUID().uuidString)", isDirectory: true)
-                    try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
-                    defer { try? FileManager.default.removeItem(at: workDirectory) }
-
-                    let audioURL = workDirectory.appendingPathComponent("audio.wav")
-                    try wavData.write(to: audioURL, options: .atomic)
-
-                    let service = FasterWhisperProcessTranscriptionService(
-                        modelName: modelName,
-                        language: language,
-                        enableDiarization: enableDiarization
-                    )
-                    return try service.transcribe(
-                        audioFileURL: audioURL,
-                        outputDirectory: workDirectory,
-                        onProgress: onProgress,
-                        isCancelled: { cancellationFlag.isCancelled() }
-                    )
-                }.value
-            } onCancel: {
-                cancellationFlag.cancel()
-            }
-            return TranscriptionBackendOutput(text: text)
+            transcriptionBackend = .mlxOpenAIHTTP
+            saveSharedServerConfig()
+            return try await transcribeWithSelectedBackend(
+                samples16k: samples16k,
+                onMLXJobCreated: onMLXJobCreated,
+                onProgress: onProgress
+            )
         }
     }
 
@@ -3587,8 +3365,12 @@ final class AppModel: ObservableObject {
             isTranscribing = false
             activeTranscriptionAudioSeconds = 0
             activeTranscriptionSessionTitle = ""
+            scheduleSpeechBackendIdleStop()
             return
         }
+
+        speechBackendIdleStopTask?.cancel()
+        speechBackendIdleStopTask = nil
 
         let jobID = transcriptionQueue.removeFirst()
         guard let session = transcriptionJobSessions[jobID] else {
@@ -3677,7 +3459,7 @@ final class AppModel: ObservableObject {
                     },
                     onProgress: { [weak self] progress in
                         Task { @MainActor in
-                            self?.applyFasterWhisperProgress(
+                            self?.applyTranscriptionProgress(
                                 progress,
                                 jobID: jobID,
                                 startedAt: transcribeStartedAt
@@ -3856,8 +3638,8 @@ final class AppModel: ObservableObject {
         update(&transcriptionJobs[index])
     }
 
-    private func applyFasterWhisperProgress(
-        _ progress: FasterWhisperProcessProgress,
+    private func applyTranscriptionProgress(
+        _ progress: TranscriptionProgress,
         jobID: UUID,
         startedAt: Date
     ) {
@@ -4278,16 +4060,6 @@ final class AppModel: ObservableObject {
         return "\(rounded)s"
     }
 
-    private static func formatBytes(_ bytes: Int64) -> String {
-        let units = ["B", "KB", "MB", "GB"]
-        var value = Double(max(0, bytes))
-        var unitIndex = 0
-        while value >= 1024, unitIndex < units.count - 1 {
-            value /= 1024
-            unitIndex += 1
-        }
-        return String(format: "%.1f %@", value, units[unitIndex])
-    }
 }
 
 @MainActor
@@ -4316,8 +4088,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        model.cancelActiveTranscription()
-        model.stopSharedMLXToolkitServer()
+        model.prepareForApplicationTermination()
     }
 
     private func buildStatusItem() {
@@ -5105,11 +4876,12 @@ struct BackendWorkspacePanel: View {
             }
 
             Picker("Engine", selection: backendBinding) {
-                Text("MLX").tag(TranscriptionBackend.mlxOpenAIHTTP)
-                Text("Local Whisper").tag(TranscriptionBackend.fasterWhisperProcess)
+                ForEach(TranscriptionBackend.allCases) { backend in
+                    Text(backend == .mlxOpenAIHTTP ? "Managed MLX" : backend.title).tag(backend)
+                }
             }
             .labelsHidden()
-            .disabled(model.isLocalWhisperBusy || model.isRecording || model.isTranscriptionBusy)
+            .disabled(model.isRecording || model.isTranscriptionBusy)
 
             HStack(spacing: 8) {
                 Button {
@@ -5117,14 +4889,14 @@ struct BackendWorkspacePanel: View {
                 } label: {
                     Label("Check", systemImage: "stethoscope")
                 }
-                .disabled(model.isLocalWhisperBusy)
+                .disabled(model.isRecording || model.isTranscriptionBusy)
             }
 
             switch model.transcriptionBackend {
             case .mlxOpenAIHTTP:
                 mlxControls
             case .fasterWhisperProcess:
-                localWhisperControls
+                mlxControls
             case .whisperHTTP:
                 WorkspaceMetricRow(label: "Endpoint", value: model.transcriptionEndpoint)
             }
@@ -5135,20 +4907,6 @@ struct BackendWorkspacePanel: View {
         Binding(
             get: { model.transcriptionBackend },
             set: { model.selectTranscriptionBackend($0) }
-        )
-    }
-
-    private var modelBinding: Binding<String> {
-        Binding(
-            get: { model.fasterWhisperModelName },
-            set: { model.updateFasterWhisperModelName($0) }
-        )
-    }
-
-    private var diarizationBinding: Binding<Bool> {
-        Binding(
-            get: { model.fasterWhisperDiarizationEnabled },
-            set: { model.updateFasterWhisperDiarization($0) }
         )
     }
 
@@ -5232,13 +4990,6 @@ struct BackendWorkspacePanel: View {
 
             HStack(spacing: 8) {
                 Button {
-                    model.startSharedMLXToolkitServer()
-                } label: {
-                    Label("Start MLX", systemImage: "play.fill")
-                }
-                .disabled(!model.sharedMLXToolkitServiceStatusInstalled || model.isSettingUpMLX)
-
-                Button {
                     model.checkSharedMLXToolkitServer()
                 } label: {
                     Label("Check MLX", systemImage: "stethoscope")
@@ -5250,65 +5001,6 @@ struct BackendWorkspacePanel: View {
                     Label("Log", systemImage: "doc.text.magnifyingglass")
                 }
             }
-        }
-    }
-
-    @ViewBuilder
-    private var localWhisperControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Picker("Model", selection: modelBinding) {
-                    ForEach(WhisperModelOption.fasterWhisperOptions) { option in
-                        Text(option.displayName).tag(option.name)
-                    }
-                }
-                .frame(maxWidth: 150)
-                .disabled(model.isLocalWhisperBusy)
-
-                Toggle("Diarization", isOn: diarizationBinding)
-                    .toggleStyle(.checkbox)
-                    .disabled(model.isLocalWhisperBusy)
-            }
-
-            Button {
-                model.setUpLocalWhisper()
-            } label: {
-                Label(model.localWhisperPrimaryActionTitle, systemImage: "arrow.down.circle")
-            }
-            .disabled(model.isLocalWhisperBusy)
-
-            if model.isLocalWhisperBusy {
-                ProgressView()
-                    .controlSize(.small)
-            }
-
-            WorkspaceMetricRow(label: "Setup", value: model.localWhisperSetupStatus)
-            WorkspaceMetricRow(label: "Runtime", value: model.fasterWhisperRuntimeStatus)
-            WorkspaceMetricRow(label: "Model", value: model.fasterWhisperDownloadStatus)
-            WorkspaceMetricRow(label: "Probe", value: model.backendProbeStatus)
-
-            HStack(spacing: 8) {
-                Button {
-                    model.openFasterWhisperRuntimeFolder()
-                } label: {
-                    Label("Runtime Folder", systemImage: "folder")
-                }
-
-                Button {
-                    model.openFasterWhisperLogsFolder()
-                } label: {
-                    Label("Logs", systemImage: "doc.text.magnifyingglass")
-                }
-
-                Menu {
-                    Button("Repair Runtime") { model.resetLocalWhisperRuntime(preservingModels: true) }
-                    Button("Delete Runtime and Models") { model.resetLocalWhisperRuntime(preservingModels: false) }
-                    Button("Runtime Releases") { model.openFasterWhisperRuntimeReleases() }
-                } label: {
-                    Label("Repair", systemImage: "wrench.and.screwdriver")
-                }
-            }
-            .disabled(model.isLocalWhisperBusy)
         }
     }
 
@@ -5783,9 +5475,7 @@ struct SettingsView: View {
                 statusRow("Backend status", model.backendProbeStatus)
             }
 
-            if model.transcriptionBackend == .fasterWhisperProcess {
-                localWhisperSettings
-            } else if model.transcriptionBackend == .mlxOpenAIHTTP {
+            if model.transcriptionBackend == .mlxOpenAIHTTP || model.transcriptionBackend == .fasterWhisperProcess {
                 mlxSettings
             } else {
                 Section("Whisper HTTP") {
@@ -5796,40 +5486,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-    }
-
-    private var localWhisperSettings: some View {
-        Section("Local Whisper") {
-            Picker("Model", selection: fasterWhisperModelBinding) {
-                ForEach(WhisperModelOption.fasterWhisperOptions) { option in
-                    Text("\(option.displayName) — \(option.detail)").tag(option.name)
-                }
-            }
-            Toggle("Speaker Diarization", isOn: fasterWhisperDiarizationBinding)
-            Text("Diarization identifies speakers, but substantially increases processing time.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            statusRow("Setup", model.localWhisperSetupStatus)
-            statusRow("Runtime", model.fasterWhisperRuntimeStatus)
-            statusRow("Model", model.fasterWhisperDownloadStatus)
-
-            HStack {
-                Button(model.localWhisperPrimaryActionTitle) { model.setUpLocalWhisper() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.isSettingUpLocalWhisper)
-                Button("Check") { model.probeSharedBackend() }
-                Menu("More") {
-                    Button("Open Runtime Folder") { model.openFasterWhisperRuntimeFolder() }
-                    Button("Open Logs Folder") { model.openFasterWhisperLogsFolder() }
-                    Button("Runtime Releases") { model.openFasterWhisperRuntimeReleases() }
-                }
-                if model.isLocalWhisperBusy {
-                    ProgressView().controlSize(.small)
-                }
-            }
-        }
-        .disabled(!model.transcriptionEnabled)
     }
 
     private var mlxSettings: some View {
@@ -5849,10 +5505,6 @@ struct SettingsView: View {
                 Button(model.mlxPrimaryActionTitle) { model.setUpMLX() }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.isMLXBusy)
-                Button("Start") { model.startSharedMLXToolkitServer() }
-                    .disabled(!model.sharedMLXToolkitServiceStatusInstalled || model.isMLXBusy)
-                Button("Stop") { model.stopSharedMLXToolkitServer() }
-                    .disabled(!model.sharedMLXToolkitServiceStatusInstalled)
                 Button("Check") { model.checkSharedMLXToolkitServer() }
                     .disabled(!model.sharedMLXToolkitServiceStatusInstalled)
                 Button("Open Log") { model.openSharedMLXLog() }
@@ -5936,19 +5588,19 @@ struct SettingsView: View {
                     diagnosticPathRow("FFmpeg version", model.diagnostics.ffmpegVersion)
                     statusRow("Shared runtime", model.diagnostics.sharedRuntimeRootStatus)
                     diagnosticPathRow("Runtime root", model.diagnostics.sharedRuntimeRoot)
-                    statusRow("Whisper executable", model.diagnostics.whisperExecutableStatus)
-                    diagnosticPathRow("Whisper path", model.diagnostics.whisperExecutablePath)
-                    statusRow("Models directory", model.diagnostics.modelsDirectoryStatus)
-                    diagnosticPathRow("Models path", model.diagnostics.modelsDirectoryPath)
                     statusRow("Model catalog", model.diagnostics.sharedModelCatalogStatus)
                     diagnosticPathRow("Catalog path", model.diagnostics.sharedModelCatalogPath)
                     diagnosticPathRow("Catalog summary", model.diagnostics.sharedModelCatalogSummary)
                     statusRow("MLX runtime", model.diagnostics.sharedMLXToolkitStatus)
                     diagnosticPathRow("MLX root", model.diagnostics.sharedMLXToolkitRoot)
                     diagnosticPathRow("MLX log", model.diagnostics.sharedMLXLogPath)
+                    statusRow("Legacy runtime", model.legacyRuntimeCleanupStatus)
 
                     HStack {
                         Spacer()
+                        Button("Recheck Legacy Runtime") { model.refreshLegacyRuntimeCleanupStatus() }
+                        Button("Move Legacy Runtime to Trash") { model.requestLegacyRuntimeCleanup() }
+                            .disabled(!model.canCleanLegacyRuntime)
                         Button("Refresh Catalog") { model.refreshSharedModelCatalog() }
                         Button("Refresh Diagnostics") { model.refreshDiagnostics() }
                     }
@@ -5963,20 +5615,6 @@ struct SettingsView: View {
         Binding(
             get: { model.transcriptionBackend },
             set: { model.selectTranscriptionBackend($0) }
-        )
-    }
-
-    private var fasterWhisperModelBinding: Binding<String> {
-        Binding(
-            get: { model.fasterWhisperModelName },
-            set: { model.updateFasterWhisperModelName($0) }
-        )
-    }
-
-    private var fasterWhisperDiarizationBinding: Binding<Bool> {
-        Binding(
-            get: { model.fasterWhisperDiarizationEnabled },
-            set: { model.updateFasterWhisperDiarization($0) }
         )
     }
 
