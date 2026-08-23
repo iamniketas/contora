@@ -69,6 +69,7 @@ class ServerResponseTests(unittest.TestCase):
             server._job_tasks.clear()
             server._job_cancellations.clear()
             server._job_telemetry.clear()
+        server._models.clear()
 
     def configure_roots(self, directory):
         server.RESULTS_ROOT = Path(directory) / "results"
@@ -85,6 +86,28 @@ class ServerResponseTests(unittest.TestCase):
             handle.setframerate(16_000)
             handle.writeframes(b"\x00\x00" * 1_600)
         return output.getvalue()
+
+    def test_model_loader_bridges_mlx_audio_alignment_heads_name(self):
+        private_heads = object()
+        model = type("Model", (), {})()
+        model._alignment_heads = private_heads
+
+        with patch.object(server, "load_model", return_value=model):
+            loaded = server.model_for("test-model")
+
+        self.assertIs(loaded, model)
+        self.assertIs(loaded.alignment_heads, private_heads)
+
+    def test_model_loader_preserves_existing_public_alignment_heads(self):
+        public_heads = object()
+        model = type("Model", (), {})()
+        model.alignment_heads = public_heads
+        model._alignment_heads = object()
+
+        with patch.object(server, "load_model", return_value=model):
+            loaded = server.model_for("test-model")
+
+        self.assertIs(loaded.alignment_heads, public_heads)
 
     def test_health_reports_only_nonterminal_jobs_as_active(self):
         with server._jobs_lock:

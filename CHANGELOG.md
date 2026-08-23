@@ -5,6 +5,12 @@ All notable changes to the Contora project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.9] - 2026-08-23
+
+### macOS
+- **MLX word timestamps restored**: the product server now applies the same narrowly scoped `mlx-audio 0.3.1` alignment-head compatibility alias already validated by the benchmark adapter, fixing `'Model' object has no attribute 'alignment_heads'` after model load.
+- **Compatibility regression coverage**: server tests verify that the missing public field is bridged from `_alignment_heads` without overwriting engines that already provide `alignment_heads`.
+
 ## [0.6.8] - 2026-08-22
 
 ### macOS
