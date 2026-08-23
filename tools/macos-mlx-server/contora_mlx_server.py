@@ -586,9 +586,17 @@ def mlx_progress_callback(callback: Callable[[float], None]):
         whisper_module.tqdm.tqdm = original_tqdm
 
 
+def ensure_word_timestamp_compatibility(model):
+    if not hasattr(model, "alignment_heads") and hasattr(model, "_alignment_heads"):
+        # mlx-audio 0.3.1 initializes the private name, while its timing module
+        # reads the public name when word timestamps are requested.
+        model.alignment_heads = model._alignment_heads
+    return model
+
+
 def model_for(model_name: str):
     if model_name not in _models:
-        _models[model_name] = load_model(model_name)
+        _models[model_name] = ensure_word_timestamp_compatibility(load_model(model_name))
     return _models[model_name]
 
 
