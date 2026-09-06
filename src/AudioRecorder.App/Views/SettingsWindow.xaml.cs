@@ -1129,10 +1129,13 @@ public sealed partial class SettingsWindow : Window
             Windows.UI.Color.FromArgb(255, 60, 160, 80));
     }
 
-    // ─── Integrations (Outline) ───
+    // ─── Integrations ───
 
     private void LoadIntegrationsData()
     {
+        ZoomRecordingsFolderText.Text = _settingsService.LoadZoomRecordingsFolder()
+            ?? ZoomRecordingDiscoveryService.GetDefaultRecordingsFolder();
+
         var url = _settingsService.LoadOutlineBaseUrl() ?? string.Empty;
         var token = _settingsService.LoadOutlineApiToken() ?? string.Empty;
         var savedCollectionId = _settingsService.LoadOutlineDefaultCollectionId();
@@ -1152,6 +1155,25 @@ public sealed partial class SettingsWindow : Window
         }
 
         UpdateOutlineStatusBadge();
+    }
+
+    private async void OnChooseZoomRecordingsFolderClicked(object sender, RoutedEventArgs e)
+    {
+        var picker = new Windows.Storage.Pickers.FolderPicker
+        {
+            SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary
+        };
+        picker.FileTypeFilter.Add("*");
+
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+
+        var folder = await picker.PickSingleFolderAsync();
+        if (folder is null) return;
+
+        _settingsService.SaveZoomRecordingsFolder(folder.Path);
+        ZoomRecordingsFolderText.Text = folder.Path;
+        _onSettingsChanged?.Invoke();
     }
 
     private void OnOutlineSettingChanged(object sender, TextChangedEventArgs e)

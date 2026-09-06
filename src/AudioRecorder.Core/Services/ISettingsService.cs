@@ -10,6 +10,11 @@ public interface ISettingsService
 
     string? LoadOutputFolder();
 
+    /// <summary>Root folder containing Zoom computer recording subfolders.</summary>
+    void SaveZoomRecordingsFolder(string folderPath);
+
+    string? LoadZoomRecordingsFolder();
+
     void SaveTranscriptionMode(string mode);
 
     string LoadTranscriptionMode();

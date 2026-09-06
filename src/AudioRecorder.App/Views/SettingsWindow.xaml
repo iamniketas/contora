@@ -612,6 +612,39 @@
                     <StackPanel x:Name="IntegrationsSection" Spacing="16" Visibility="Collapsed">
                         <TextBlock Text="Integrations" FontSize="24" FontWeight="SemiBold" />
 
+                        <!-- Zoom computer recordings -->
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Padding="16">
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="Zoom recordings" FontSize="16" FontWeight="Medium" />
+                                <TextBlock
+                                    Text="Contora checks this folder when it starts and offers completed meetings that have separate participant audio files. Nothing is transcribed automatically."
+                                    FontSize="12"
+                                    TextWrapping="Wrap"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        x:Name="ZoomRecordingsFolderText"
+                                        Grid.Column="0"
+                                        VerticalAlignment="Center"
+                                        TextTrimming="CharacterEllipsis"
+                                        ToolTipService.ToolTip="{x:Bind ZoomRecordingsFolderText.Text, Mode=OneWay}" />
+                                    <Button
+                                        Grid.Column="1"
+                                        Content="Choose..."
+                                        Click="OnChooseZoomRecordingsFolderClicked" />
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
                         <!-- Outline card -->
                         <Border
                             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"

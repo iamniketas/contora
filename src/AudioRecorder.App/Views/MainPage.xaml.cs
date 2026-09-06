@@ -217,6 +217,7 @@ public sealed partial class MainPage : Page
     private readonly PyannoteCommunityRuntimeInstallerService _pyannoteRuntimeInstallerService;
     private readonly SharedModelConfigService _sharedConfigService;
     private readonly DictatorSharedStoreService _dictatorStoreService;
+    private readonly ZoomRecordingDiscoveryService _zoomDiscoveryService;
     private readonly DispatcherQueue _dispatcherQueue;
     private readonly DispatcherQueueTimer _updateTimer;
     private string? _lastRecordingPath;
@@ -247,6 +248,8 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<string, string> _speakerNameMap = new();
     private DiarizationOptions _diarizationOptions = DiarizationOptions.Automatic;
     private IReadOnlyList<string> _expectedSpeakerNames = [];
+    private IReadOnlyList<ZoomMeetingRecording> _availableZoomRecordings = [];
+    private ZoomMeetingRecording? _activeZoomRecording;
 
     public ObservableCollection<AudioSourceViewModel> OutputSources { get; } = new();
     public ObservableCollection<AudioSourceViewModel> InputSources { get; } = new();
@@ -273,6 +276,7 @@ public sealed partial class MainPage : Page
         _audioCaptureService.DeviceListChanged += OnAudioDeviceListChanged;
 
         _settingsService = new LocalSettingsService();
+        _zoomDiscoveryService = new ZoomRecordingDiscoveryService();
         _transcriptionMode = _settingsService.LoadTranscriptionMode();
         _whisperModel = _settingsService.LoadWhisperModel();
         _deviceMode = _settingsService.LoadDeviceMode();
@@ -330,6 +334,7 @@ public sealed partial class MainPage : Page
     {
         await _sessionStore.InitializeAsync();
         _ = LoadSessionsAsync();
+        _ = ScanForZoomRecordingsAsync();
         await LoadAudioSourcesAsync();
         LoadOutputFolderSetting();
         LoadTranscriptionModeSetting();
@@ -368,9 +373,12 @@ public sealed partial class MainPage : Page
         _transcriptionService.ProgressChanged += OnTranscriptionProgressChanged;
     }
 
-    private ITranscriptionService CreateTranscriptionService(string mode)
+    private ITranscriptionService CreateTranscriptionService(
+        string mode,
+        bool? enableDiarizationOverride = null)
     {
-        bool enableDiarization = !string.Equals(mode, "light", StringComparison.OrdinalIgnoreCase);
+        bool enableDiarization = enableDiarizationOverride
+            ?? !string.Equals(mode, "light", StringComparison.OrdinalIgnoreCase);
         var effectiveDevice = ResolveEffectiveDevice();
 
         if (_settingsService.LoadTranscriptionEngine() != "whisper-net")
@@ -388,7 +396,7 @@ public sealed partial class MainPage : Page
             modelPath: ggmlModelPath ?? GgmlModelPaths.GetGgmlModelPath(GgmlModelPaths.GetGgmlModelsRoot(), _whisperModel),
             enableDiarization: enableDiarization,
             deviceMode: effectiveDevice,
-            diarizationService: CreateDiarizationService());
+            diarizationService: enableDiarization ? CreateDiarizationService() : null);
     }
 
     /// <summary>
@@ -998,6 +1006,7 @@ public sealed partial class MainPage : Page
                     UpdateTranscriptionAvailabilityUi();
                     UpdateDeviceInfoText();
                     _outlineService = CreateOutlineService();
+                    _ = ScanForZoomRecordingsAsync();
                 });
             });
 
@@ -1380,6 +1389,258 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private async Task ScanForZoomRecordingsAsync()
+    {
+        try
+        {
+            var sessions = await _sessionStore.GetAllAsync(limit: 2000);
+            var root = _settingsService.LoadZoomRecordingsFolder();
+            var defaultRoot = ZoomRecordingDiscoveryService.GetDefaultRecordingsFolder();
+            var inferredRoot = InferZoomRootFromExistingSessions(sessions);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                // A previously imported Zoom file is stronger evidence than the default folder:
+                // users frequently move the recording location to another drive.
+                root = inferredRoot ?? (Directory.Exists(defaultRoot) ? defaultRoot : null);
+                if (!string.IsNullOrWhiteSpace(inferredRoot))
+                    _settingsService.SaveZoomRecordingsFolder(inferredRoot);
+            }
+            else if (!string.IsNullOrWhiteSpace(inferredRoot)
+                     && (string.Equals(
+                             Path.GetFullPath(root),
+                             Path.GetFullPath(defaultRoot),
+                             StringComparison.OrdinalIgnoreCase)
+                         || !IsPlausibleZoomRoot(root))
+                     && !string.Equals(
+                         Path.GetFullPath(root),
+                         Path.GetFullPath(inferredRoot),
+                         StringComparison.OrdinalIgnoreCase))
+            {
+                // Migrate an earlier auto-detected default when recent Contora sessions prove
+                // that Zoom now writes to a custom folder.
+                root = inferredRoot;
+                _settingsService.SaveZoomRecordingsFolder(root);
+            }
+
+            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+            {
+                _availableZoomRecordings = [];
+                ZoomRecordingInfoBar.IsOpen = false;
+                return;
+            }
+
+            var importedPaths = sessions
+                .Where(session => session.State is SessionState.Transcribed or SessionState.Exported)
+                .Where(session => !string.IsNullOrWhiteSpace(session.AudioPath))
+                .Select(session => session.AudioPath!);
+            var knownNames = _settingsService.LoadSpeakerProfiles().Select(profile => profile.Name).ToList();
+
+            _availableZoomRecordings = await Task.Run(() => _zoomDiscoveryService.Discover(
+                root,
+                importedPaths,
+                knownNames));
+
+            if (_availableZoomRecordings.Count == 0)
+            {
+                ZoomRecordingInfoBar.IsOpen = false;
+                return;
+            }
+
+            var newest = _availableZoomRecordings[0];
+            ZoomRecordingInfoBar.Message = _availableZoomRecordings.Count == 1
+                ? $"{newest.Title} · {newest.SpeakerTracks.Count} participant audio files"
+                : $"{_availableZoomRecordings.Count} unimported meetings; newest: {newest.Title}";
+            ZoomRecordingInfoBar.IsOpen = true;
+        }
+        catch (Exception ex)
+        {
+            ZoomRecordingInfoBar.IsOpen = false;
+            AudioRecorder.Services.Logging.AppLogger.LogWarning($"Zoom recording scan failed: {ex.Message}");
+        }
+    }
+
+    private static string? InferZoomRootFromExistingSessions(IEnumerable<Core.Models.Session> sessions)
+    {
+        foreach (var session in sessions.OrderByDescending(item => item.RecordedAt))
+        {
+            if (string.IsNullOrWhiteSpace(session.AudioPath) || !File.Exists(session.AudioPath))
+                continue;
+
+            var meetingFolder = Path.GetDirectoryName(session.AudioPath);
+            if (string.IsNullOrWhiteSpace(meetingFolder) || !Directory.Exists(meetingFolder))
+                continue;
+
+            var looksLikeZoom = File.Exists(Path.Combine(meetingFolder, "recording.conf"));
+            if (!looksLikeZoom) continue;
+
+            var parent = Directory.GetParent(meetingFolder)?.FullName;
+            if (!string.IsNullOrWhiteSpace(parent) && Directory.Exists(parent))
+                return parent;
+        }
+
+        return null;
+    }
+
+    private static bool IsPlausibleZoomRoot(string root)
+    {
+        try
+        {
+            if (!Directory.Exists(root)) return false;
+            if (File.Exists(Path.Combine(root, "recording.conf"))) return true;
+            return Directory.EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly)
+                .Take(200)
+                .Any(folder => File.Exists(Path.Combine(folder, "recording.conf")));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async void OnZoomRecordingsClicked(object sender, RoutedEventArgs e)
+    {
+        var root = _settingsService.LoadZoomRecordingsFolder();
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+        {
+            root = await PickZoomRecordingsFolderAsync();
+            if (root is null) return;
+            _settingsService.SaveZoomRecordingsFolder(root);
+        }
+
+        await ScanForZoomRecordingsAsync();
+        if (_availableZoomRecordings.Count > 0)
+        {
+            await ShowZoomRecordingPickerAsync();
+            return;
+        }
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "No new Zoom recordings",
+            Content = $"No completed, unimported meetings with separate participant audio were found in:\n{root}",
+            PrimaryButtonText = "Choose another folder",
+            CloseButtonText = "Close",
+            DefaultButton = ContentDialogButton.Close,
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            var selected = await PickZoomRecordingsFolderAsync();
+            if (selected is null) return;
+            _settingsService.SaveZoomRecordingsFolder(selected);
+            await ScanForZoomRecordingsAsync();
+            if (_availableZoomRecordings.Count > 0)
+                await ShowZoomRecordingPickerAsync();
+        }
+    }
+
+    private async void OnReviewZoomRecordingClicked(object sender, RoutedEventArgs e)
+    {
+        if (_availableZoomRecordings.Count == 0)
+            await ScanForZoomRecordingsAsync();
+        if (_availableZoomRecordings.Count > 0)
+            await ShowZoomRecordingPickerAsync();
+    }
+
+    private async Task<string?> PickZoomRecordingsFolderAsync()
+    {
+        var picker = new Windows.Storage.Pickers.FolderPicker
+        {
+            SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary
+        };
+        picker.FileTypeFilter.Add("*");
+
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(App.MainWindow);
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+        var folder = await picker.PickSingleFolderAsync();
+        return folder?.Path;
+    }
+
+    private async Task ShowZoomRecordingPickerAsync()
+    {
+        var choices = _availableZoomRecordings
+            .Select(recording =>
+                $"{recording.RecordedAt:dd MMM, HH:mm} · {recording.Title} · " +
+                $"{recording.SpeakerTracks.Count} speakers")
+            .ToList();
+        var selector = new ComboBox
+        {
+            ItemsSource = choices,
+            SelectedIndex = 0,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+        var speakers = new TextBlock
+        {
+            Text = string.Join(", ", _availableZoomRecordings[0].SpeakerTracks
+                .Select(track => track.SpeakerName)
+                .Distinct(StringComparer.CurrentCultureIgnoreCase)),
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+        };
+        selector.SelectionChanged += (_, _) =>
+        {
+            if (selector.SelectedIndex < 0 || selector.SelectedIndex >= _availableZoomRecordings.Count) return;
+            speakers.Text = string.Join(", ", _availableZoomRecordings[selector.SelectedIndex].SpeakerTracks
+                .Select(track => track.SpeakerName)
+                .Distinct(StringComparer.CurrentCultureIgnoreCase));
+        };
+
+        var content = new StackPanel { Spacing = 10 };
+        content.Children.Add(selector);
+        content.Children.Add(new TextBlock
+        {
+            Text = "Speaker names found in Zoom files:",
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        });
+        content.Children.Add(speakers);
+        content.Children.Add(new TextBlock
+        {
+            Text = "Contora will transcribe each participant track without diarization and merge it against the mixed recording timeline.",
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+        });
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Import Zoom meeting",
+            Content = content,
+            PrimaryButtonText = "Use recording",
+            CloseButtonText = "Later",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary || selector.SelectedIndex < 0)
+            return;
+
+        await ActivateZoomRecordingAsync(_availableZoomRecordings[selector.SelectedIndex]);
+    }
+
+    private async Task ActivateZoomRecordingAsync(ZoomMeetingRecording recording)
+    {
+        _activeZoomRecording = recording;
+        var sessions = await _sessionStore.GetAllAsync(limit: 2000);
+        _currentSessionId = sessions.FirstOrDefault(session =>
+            !string.IsNullOrWhiteSpace(session.AudioPath)
+            && string.Equals(
+                Path.GetFullPath(session.AudioPath),
+                Path.GetFullPath(recording.MasterAudioPath),
+                StringComparison.OrdinalIgnoreCase))?.Id;
+        _lastRecordingPath = recording.MasterAudioPath;
+        ShowTranscriptionSection();
+        _expectedSpeakerNames = recording.SpeakerTracks
+            .Select(track => track.SpeakerName)
+            .Distinct(StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+        _settingsService.SaveSpeakerProfiles(
+            _settingsService.LoadSpeakerProfiles()
+                .Concat(_expectedSpeakerNames.Select(name => new SpeakerProfile(name))));
+        CurrentFileTextBlock.Text = $"Zoom · {recording.Title} · {_expectedSpeakerNames.Count} speakers";
+        TranscribeButton.Content = "Transcribe Zoom meeting";
+        ZoomRecordingInfoBar.IsOpen = false;
+    }
+
     private async void OnImportClicked(object sender, RoutedEventArgs e)
     {
         var picker = new Windows.Storage.Pickers.FileOpenPicker
@@ -1410,6 +1671,7 @@ public sealed partial class MainPage : Page
             {
                 // Importing a new file — detach from any previously recorded session
                 _currentSessionId = null;
+                _activeZoomRecording = null;
 
                 if (AudioConverter.IsVideoFile(file.Path))
                 {
@@ -1527,7 +1789,18 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        if (_settingsService.LoadTranscriptionEngine() == "whisper-net"
+        var zoomRecording = ResolveZoomRecordingForCurrentAudio();
+        if (zoomRecording is not null)
+        {
+            _activeZoomRecording = zoomRecording;
+            _expectedSpeakerNames = zoomRecording.SpeakerTracks
+                .Select(track => track.SpeakerName)
+                .Distinct(StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+        }
+
+        if (zoomRecording is null
+            && _settingsService.LoadTranscriptionEngine() == "whisper-net"
             && !string.Equals(_transcriptionMode, "light", StringComparison.OrdinalIgnoreCase))
         {
             var setup = await ShowDiarizationSetupDialogAsync();
@@ -1555,7 +1828,10 @@ public sealed partial class MainPage : Page
         // For imported files there is no prior session — create one now before transcription starts.
         // (Recordings create their session on stop, so _currentSessionId is already set in that case.)
         if (_currentSessionId == null)
-            await CreateImportedFileSessionAsync(_lastRecordingPath);
+            await CreateImportedFileSessionAsync(
+                _lastRecordingPath,
+                zoomRecording?.Title,
+                zoomRecording?.RecordedAt);
 
         // Capture current values so a new recording started in parallel doesn't overwrite them
         var audioPath = _lastRecordingPath;
@@ -1572,10 +1848,19 @@ public sealed partial class MainPage : Page
         _transcriptionCts = new CancellationTokenSource();
         _lastTranscriptionAudioDuration = null;
         var transcriptionStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        ITranscriptionService transcriptionServiceForJob = _transcriptionService;
+        if (zoomRecording is not null)
+        {
+            transcriptionServiceForJob = new ZoomMultiTrackTranscriptionService(
+                zoomRecording,
+                () => CreateTranscriptionService(_transcriptionMode, enableDiarizationOverride: false),
+                _transcriptionService.IsWhisperAvailable);
+            transcriptionServiceForJob.ProgressChanged += OnTranscriptionProgressChanged;
+        }
 
         try
         {
-            var result = await _transcriptionService.TranscribeAsync(audioPath, _transcriptionCts.Token);
+            var result = await transcriptionServiceForJob.TranscribeAsync(audioPath, _transcriptionCts.Token);
             transcriptionStopwatch.Stop();
 
             if (result.Success)
@@ -1697,6 +1982,11 @@ public sealed partial class MainPage : Page
         }
         finally
         {
+            if (!ReferenceEquals(transcriptionServiceForJob, _transcriptionService))
+            {
+                transcriptionServiceForJob.ProgressChanged -= OnTranscriptionProgressChanged;
+                (transcriptionServiceForJob as IDisposable)?.Dispose();
+            }
             _isTranscribing = false;
             TranscribeButton.Content = "Transcribe";
             TranscribeButton.IsEnabled = true;
@@ -2007,6 +2297,40 @@ public sealed partial class MainPage : Page
         {
             AudioRecorder.Services.Logging.AppLogger.LogWarning($"Could not persist speaker names: {ex.Message}");
         }
+    }
+
+    private ZoomMeetingRecording? ResolveZoomRecordingForCurrentAudio()
+    {
+        if (_activeZoomRecording is not null
+            && string.Equals(
+                Path.GetFullPath(_activeZoomRecording.MasterAudioPath),
+                Path.GetFullPath(_lastRecordingPath!),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return _activeZoomRecording;
+        }
+
+        var folder = Path.GetDirectoryName(_lastRecordingPath!);
+        if (string.IsNullOrWhiteSpace(folder)) return null;
+        if (string.Equals(
+                new string(Path.GetFileName(folder).Where(char.IsLetterOrDigit).ToArray()),
+                "AudioRecord",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            folder = Directory.GetParent(folder)?.FullName;
+        }
+        if (string.IsNullOrWhiteSpace(folder)) return null;
+
+        var recording = _zoomDiscoveryService.TryOpenMeetingFolder(
+            folder,
+            _settingsService.LoadSpeakerProfiles().Select(profile => profile.Name).ToList());
+        return recording is not null
+               && string.Equals(
+                   Path.GetFullPath(recording.MasterAudioPath),
+                   Path.GetFullPath(_lastRecordingPath!),
+                   StringComparison.OrdinalIgnoreCase)
+            ? recording
+            : null;
     }
 
     private void CommitSpeakerName(TextBox textBox, SpeakerViewModel speaker)
@@ -3156,14 +3480,17 @@ public sealed partial class MainPage : Page
     /// Creates a session record for a file that was imported (not recorded by Contora).
     /// Called at transcription start so the resulting transcript is linked to a real session.
     /// </summary>
-    private async Task CreateImportedFileSessionAsync(string audioPath)
+    private async Task CreateImportedFileSessionAsync(
+        string audioPath,
+        string? title = null,
+        DateTime? recordedAt = null)
     {
         try
         {
             var session = new Session
             {
-                Title = Path.GetFileNameWithoutExtension(audioPath),
-                RecordedAt = DateTime.Now,
+                Title = string.IsNullOrWhiteSpace(title) ? Path.GetFileNameWithoutExtension(audioPath) : title,
+                RecordedAt = recordedAt ?? DateTime.Now,
                 DurationSeconds = 0, // unknown until transcription completes
                 AudioPath = audioPath,
                 State = SessionState.Recorded,

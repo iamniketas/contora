@@ -276,6 +276,36 @@ public class LocalSettingsService : ISettingsService
         }
     }
 
+    public void SaveZoomRecordingsFolder(string folderPath)
+    {
+        try
+        {
+            var settings = LoadSettings();
+            settings.ZoomRecordingsFolder = string.IsNullOrWhiteSpace(folderPath)
+                ? null
+                : Path.GetFullPath(folderPath);
+            SaveSettings(settings);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Failed to save Zoom recordings folder: {ex.Message}");
+        }
+    }
+
+    public string? LoadZoomRecordingsFolder()
+    {
+        try
+        {
+            var path = LoadSettings().ZoomRecordingsFolder;
+            return string.IsNullOrWhiteSpace(path) ? null : path;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Failed to load Zoom recordings folder: {ex.Message}");
+            return null;
+        }
+    }
+
     public void SaveSpeakerProfiles(IEnumerable<AudioRecorder.Core.Models.SpeakerProfile> profiles)
     {
         try
@@ -352,6 +382,7 @@ public class LocalSettingsService : ISettingsService
     {
         public List<string> SelectedSourceIds { get; set; } = new();
         public string? OutputFolder { get; set; }
+        public string? ZoomRecordingsFolder { get; set; }
         public string TranscriptionMode { get; set; } = "quality";
         public string WhisperModel { get; set; } = "large-v2";
         public string DeviceMode { get; set; } = "auto";

@@ -284,11 +284,34 @@
                             Content="Pause"
                             IsEnabled="False" />
                     </Grid>
-<Button
-                        x:Name="ImportButton"
-                        HorizontalAlignment="Stretch"
-                        Click="OnImportClicked"
-                        Content="Import file" />
+<Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Button
+                            x:Name="ImportButton"
+                            Grid.Column="0"
+                            HorizontalAlignment="Stretch"
+                            Click="OnImportClicked"
+                            Content="Import file" />
+                        <Button
+                            x:Name="ZoomRecordingsButton"
+                            Grid.Column="1"
+                            HorizontalAlignment="Stretch"
+                            Click="OnZoomRecordingsClicked"
+                            Content="Zoom meetings" />
+                    </Grid>
+                    <InfoBar
+                        x:Name="ZoomRecordingInfoBar"
+                        IsOpen="False"
+                        IsClosable="True"
+                        Severity="Informational"
+                        Title="New Zoom recording">
+                        <InfoBar.ActionButton>
+                            <Button Content="Review" Click="OnReviewZoomRecordingClicked" />
+                        </InfoBar.ActionButton>
+                    </InfoBar>
 <Border
                         x:Name="TranscriptionControlSection"
                         BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
