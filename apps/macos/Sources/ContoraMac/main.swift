@@ -48,7 +48,7 @@ enum RecordingStoragePolicy: String, CaseIterable, Identifiable, Codable {
 }
 
 @MainActor
-private func openContoraSettingsWindow() {
+func openContoraSettingsWindow() {
     NSApp.activate(ignoringOtherApps: true)
     let didOpen = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
     if !didOpen {
@@ -255,6 +255,10 @@ enum SessionSortMode: String, CaseIterable, Identifiable {
 
 enum SessionStatusFilter: String, CaseIterable, Identifiable {
     case all = "All"
+    case today = "Today"
+    case thisWeek = "This Week"
+    case pinned = "Pinned"
+    case unpublished = "Unpublished"
     case recordedOnly = "Audio Only"
     case transcribed = "Transcribed"
     case failed = "Failed"
@@ -295,6 +299,7 @@ enum SessionLibraryError: LocalizedError {
 
 final class SessionLibraryService {
     private let fileManager = FileManager.default
+    private let sessionManagement = SessionManagementService()
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -336,11 +341,12 @@ final class SessionLibraryService {
             let metadata = loadMetadata(from: metadataURL)
             let resourceValues = try audioURL.resourceValues(forKeys: [.contentModificationDateKey])
             let createdAt = resourceValues.contentModificationDate ?? Date.distantPast
-            let title = baseURL.lastPathComponent
+            let sessionID = baseURL.lastPathComponent
+            let title = sessionManagement.loadTitleOverride(sessionID: sessionID, root: directory) ?? sessionID
             let parsed = segmentParser.parseSpeakersAndSegments(from: transcriptText)
 
             return ContoraSession(
-                id: title,
+                id: sessionID,
                 title: title,
                 createdAt: createdAt,
                 recordingURL: audioURL,
@@ -415,7 +421,7 @@ final class SessionLibraryService {
 
         return ContoraSession(
             id: manifest.sessionID,
-            title: manifest.title,
+            title: sessionManagement.loadTitleOverride(sessionID: manifest.sessionID, root: rootDirectory) ?? manifest.title,
             createdAt: parsedDate,
             recordingURL: recordingURL,
             transcriptURL: transcriptExists,
@@ -1646,12 +1652,22 @@ final class AppModel: ObservableObject {
     @Published var sessionSortMode: SessionSortMode = .newest
     @Published var sessionStatusFilter: SessionStatusFilter = .all
     @Published var sessionLibraryStatus = "Not loaded"
+    @Published var deletedSessions: [DeletedSessionSummary] = []
+    @Published var pinnedSessionIDs: Set<String> = []
     @Published var sessionEditorTranscriptDraft = ""
     @Published var sessionEditorSegments: [EditableSessionSegment] = []
     @Published var sessionEditorSpeakerNames: [String: String] = [:]
     @Published var sessionEditorStatus = "No session selected"
     @Published var sessionEditorHasUnsavedChanges = false
     @Published var lastOutlineExportPath = ""
+    @Published var outlineBaseURL = ""
+    @Published var outlineAPIToken = ""
+    @Published var outlineDefaultCollectionID = ""
+    @Published var outlineCollections: [OutlineCollection] = []
+    @Published var outlineStatus = "Not configured"
+    @Published var isLoadingOutlineCollections = false
+    @Published var isPublishingToOutline = false
+    @Published var outlineDocumentLinks: [String: OutlineDocumentLink] = [:]
     @Published var storageStatus = "WAV only"
     @Published var diagnostics = RuntimeDiagnostics()
     @Published var sharedMLXToolkitActionStatus = "Idle"
@@ -1683,6 +1699,8 @@ final class AppModel: ObservableObject {
     private let sharedModelCatalogStore = SharedModelCatalogStore.shared
     private let appUpdateService = AppUpdateService()
     private let sessionLibrary = SessionLibraryService()
+    private let sessionManagement = SessionManagementService()
+    private let outlineSettingsStore = OutlineSettingsStore()
     private let mlxJobRecoveryStore = try? MLXJobRecoveryStore.live()
     private var recordingTickerTask: Task<Void, Never>?
     private var transcriptionTickerTask: Task<Void, Never>?
@@ -1703,9 +1721,17 @@ final class AppModel: ObservableObject {
     private var pendingMLXRecoveryRecords: [MLXJobRecoveryRecord] = []
 
     private init() {
+        let outlineSettings = outlineSettingsStore.loadSettings()
+        outlineBaseURL = outlineSettings.baseURL
+        outlineAPIToken = outlineSettings.apiToken
+        outlineDefaultCollectionID = outlineSettings.defaultCollectionID
+        outlineDocumentLinks = outlineSettingsStore.loadDocumentLinks()
+        outlineStatus = outlineSettings.canPublish ? "Ready" : "Not configured"
+        pinnedSessionIDs = Set(UserDefaults.standard.stringArray(forKey: "sessions.pinnedIDs") ?? [])
         sharedServerConfigPath = SharedTranscriptionServerConfigStore.shared.configFileURL().path
         loadSharedServerConfig()
         reloadSessions()
+        reloadRecentlyDeleted()
         refreshDiagnostics()
         refreshAudioDeviceContext()
         _ = restorePendingMLXJobIfNeeded()
@@ -1908,6 +1934,14 @@ final class AppModel: ObservableObject {
             switch sessionStatusFilter {
             case .all:
                 matchesStatus = true
+            case .today:
+                matchesStatus = Calendar.current.isDateInToday(session.createdAt)
+            case .thisWeek:
+                matchesStatus = Calendar.current.isDate(session.createdAt, equalTo: Date(), toGranularity: .weekOfYear)
+            case .pinned:
+                matchesStatus = pinnedSessionIDs.contains(session.id)
+            case .unpublished:
+                matchesStatus = session.transcriptURL != nil && outlineDocumentLinks[session.id] == nil
             case .recordedOnly:
                 matchesStatus = session.transcriptURL == nil
             case .transcribed:
@@ -1921,20 +1955,25 @@ final class AppModel: ObservableObject {
 
             return session.title.lowercased().contains(query)
                 || session.transcriptPreview.lowercased().contains(query)
+                || session.segments.contains(where: { $0.text.lowercased().contains(query) })
                 || (session.metadata.mode?.lowercased().contains(query) ?? false)
                 || (session.metadata.endpoint?.lowercased().contains(query) ?? false)
         }
 
+        let sorted: [ContoraSession]
         switch sessionSortMode {
         case .newest:
-            return filtered.sorted { $0.createdAt > $1.createdAt }
+            sorted = filtered.sorted { $0.createdAt > $1.createdAt }
         case .oldest:
-            return filtered.sorted { $0.createdAt < $1.createdAt }
+            sorted = filtered.sorted { $0.createdAt < $1.createdAt }
         case .title:
-            return filtered.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+            sorted = filtered.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         case .duration:
-            return filtered.sorted { ($0.metadata.audioSeconds ?? 0) > ($1.metadata.audioSeconds ?? 0) }
+            sorted = filtered.sorted { ($0.metadata.audioSeconds ?? 0) > ($1.metadata.audioSeconds ?? 0) }
         }
+        let pinned = sorted.filter { pinnedSessionIDs.contains($0.id) }
+        let unpinned = sorted.filter { !pinnedSessionIDs.contains($0.id) }
+        return pinned + unpinned
     }
 
     var recordingsFolderPath: String {
@@ -2346,6 +2385,73 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func reloadRecentlyDeleted() {
+        do {
+            deletedSessions = try sessionManagement.loadRecentlyDeleted()
+        } catch {
+            deletedSessions = []
+            sessionLibraryStatus = "Could not load Recently Deleted: \(error.localizedDescription)"
+        }
+    }
+
+    func renameSession(_ session: ContoraSession, to title: String) {
+        do {
+            try sessionManagement.renameSession(id: session.id, to: title)
+            reloadSessions()
+            selectSession(session.id)
+            sessionEditorStatus = "Renamed"
+        } catch {
+            sessionEditorStatus = "Rename failed: \(error.localizedDescription)"
+        }
+    }
+
+    func moveSessionToRecentlyDeleted(_ session: ContoraSession) {
+        let hasPendingWork = transcriptionJobs.contains {
+            $0.sessionID == session.id && ($0.state == .queued || $0.state == .preparing || $0.state == .transcribing)
+        }
+        guard !hasPendingWork else {
+            sessionEditorStatus = "Stop or remove the transcription job before deleting this session"
+            return
+        }
+
+        do {
+            if selectedSessionID == session.id {
+                stopSegmentPlayback()
+            }
+            try sessionManagement.moveToRecentlyDeleted(sessionID: session.id, title: session.title)
+            reloadSessions()
+            reloadRecentlyDeleted()
+            sessionLibraryStatus = "Moved \(session.title) to Recently Deleted"
+        } catch {
+            sessionEditorStatus = "Delete failed: \(error.localizedDescription)"
+        }
+    }
+
+    func restoreSession(_ deletedSession: DeletedSessionSummary) {
+        do {
+            try sessionManagement.restore(deletedSession)
+            reloadRecentlyDeleted()
+            reloadSessions()
+            selectSession(deletedSession.id)
+            sessionLibraryStatus = "Restored \(deletedSession.title)"
+        } catch {
+            sessionLibraryStatus = "Restore failed: \(error.localizedDescription)"
+        }
+    }
+
+    func isSessionPinned(_ sessionID: String) -> Bool {
+        pinnedSessionIDs.contains(sessionID)
+    }
+
+    func toggleSessionPinned(_ sessionID: String) {
+        if pinnedSessionIDs.contains(sessionID) {
+            pinnedSessionIDs.remove(sessionID)
+        } else {
+            pinnedSessionIDs.insert(sessionID)
+        }
+        UserDefaults.standard.set(Array(pinnedSessionIDs).sorted(), forKey: "sessions.pinnedIDs")
+    }
+
     func selectSession(_ sessionID: String?) {
         selectedSessionID = sessionID
         loadEditorForSelectedSession()
@@ -2653,7 +2759,133 @@ final class AppModel: ObservableObject {
         }
     }
 
+    var outlineSettings: OutlineSettings {
+        OutlineSettings(
+            baseURL: outlineBaseURL,
+            apiToken: outlineAPIToken,
+            defaultCollectionID: outlineDefaultCollectionID
+        )
+    }
+
+    var isOutlineReady: Bool {
+        outlineSettings.canPublish
+    }
+
+    func outlineLink(for sessionID: String) -> OutlineDocumentLink? {
+        outlineDocumentLinks[sessionID]
+    }
+
+    func saveOutlineSettings() {
+        do {
+            try outlineSettingsStore.saveSettings(outlineSettings)
+            outlineStatus = outlineSettings.canPublish ? "Ready" : "Add a URL, token, and collection"
+        } catch {
+            outlineStatus = "Could not save credentials: \(error.localizedDescription)"
+        }
+    }
+
+    func loadOutlineCollections() {
+        guard !isLoadingOutlineCollections else { return }
+        saveOutlineSettings()
+        let settings = outlineSettings
+        guard settings.isConfigured else {
+            outlineStatus = "Add the Outline URL and API token first"
+            return
+        }
+
+        isLoadingOutlineCollections = true
+        outlineStatus = "Loading collections…"
+        Task { [weak self] in
+            do {
+                let collections = try await OutlineService(settings: settings).collections()
+                await MainActor.run {
+                    guard let self else { return }
+                    self.outlineCollections = collections.sorted {
+                        $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                    }
+                    if !collections.contains(where: { $0.id == self.outlineDefaultCollectionID }) {
+                        self.outlineDefaultCollectionID = self.outlineCollections.first?.id ?? ""
+                    }
+                    self.isLoadingOutlineCollections = false
+                    self.outlineStatus = collections.isEmpty ? "No collections found" : "Connected · \(collections.count) collections"
+                    self.saveOutlineSettings()
+                }
+            } catch {
+                await MainActor.run {
+                    self?.isLoadingOutlineCollections = false
+                    self?.outlineStatus = "Connection failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func publishSelectedSessionToOutline() {
+        guard !isPublishingToOutline else { return }
+        guard let session = selectedSession else {
+            sessionEditorStatus = "No session selected"
+            return
+        }
+
+        saveOutlineSettings()
+        let settings = outlineSettings
+        guard settings.canPublish else {
+            outlineStatus = "Configure Outline in Settings → Integrations"
+            sessionEditorStatus = outlineStatus
+            openContoraSettingsWindow()
+            return
+        }
+
+        if sessionEditorHasUnsavedChanges {
+            saveSelectedSessionEdits()
+        }
+        let markdown = buildOptimizedOutlineMarkdown(for: session)
+        guard !markdown.isEmpty else {
+            sessionEditorStatus = "Nothing to publish"
+            return
+        }
+
+        let existingLink = outlineDocumentLinks[session.id]
+        isPublishingToOutline = true
+        sessionEditorStatus = existingLink == nil ? "Publishing to Outline…" : "Updating Outline…"
+        Task { [weak self] in
+            do {
+                let service = OutlineService(settings: settings)
+                let link: OutlineDocumentLink
+                if let existingLink {
+                    link = try await service.updateDocument(id: existingLink.documentID, title: session.title, markdown: markdown)
+                } else {
+                    link = try await service.createDocument(title: session.title, markdown: markdown)
+                }
+                await MainActor.run {
+                    guard let self else { return }
+                    self.outlineDocumentLinks[session.id] = link
+                    self.outlineSettingsStore.saveDocumentLinks(self.outlineDocumentLinks)
+                    self.isPublishingToOutline = false
+                    self.outlineStatus = "Connected"
+                    self.sessionEditorStatus = existingLink == nil ? "Published to Outline" : "Updated in Outline"
+                }
+            } catch {
+                await MainActor.run {
+                    self?.isPublishingToOutline = false
+                    self?.sessionEditorStatus = "Outline failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func openOutlineDocument(for sessionID: String) {
+        guard let urlString = outlineDocumentLinks[sessionID]?.url,
+              let url = URL(string: urlString) else {
+            sessionEditorStatus = "Outline did not return a document URL"
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
     func updateSpeakerName(speakerID: String, newName: String) {
+        if sessionEditorSpeakerNames[speakerID] == newName {
+            return
+        }
         sessionEditorSpeakerNames[speakerID] = newName
         sessionEditorHasUnsavedChanges = true
         sessionEditorStatus = "Unsaved changes"
@@ -2738,6 +2970,9 @@ final class AppModel: ObservableObject {
 
     func updateSegmentText(segmentID: String, newText: String) {
         guard let index = sessionEditorSegments.firstIndex(where: { $0.id == segmentID }) else {
+            return
+        }
+        guard sessionEditorSegments[index].text != newText else {
             return
         }
         sessionEditorSegments[index].text = newText
@@ -4311,27 +4546,7 @@ struct PrimaryWorkspaceView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            CaptureWorkspacePanel(model: model)
-                .frame(width: 290)
-                .frame(maxHeight: .infinity, alignment: .top)
-
-            Divider()
-
-            RecordingWorkspacePanel(model: model)
-                .frame(width: 330)
-                .frame(maxHeight: .infinity, alignment: .top)
-
-            Divider()
-
-            ReviewWorkspacePanel(model: model)
-                .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        }
-        .frame(minWidth: 1120, minHeight: 680, alignment: .top)
-        .onAppear {
-            model.reloadSessions()
-            model.refreshAudioDeviceContext()
-        }
+        ContoraWorkspaceView(model: model)
     }
 }
 
@@ -5331,6 +5546,8 @@ struct SettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
             transcriptionSettings
                 .tabItem { Label("Transcription", systemImage: "waveform") }
+            integrationsSettings
+                .tabItem { Label("Integrations", systemImage: "arrow.triangle.branch") }
             storageSettings
                 .tabItem { Label("Storage", systemImage: "folder") }
             updateSettings
@@ -5422,6 +5639,42 @@ struct SettingsView: View {
             }
         }
         .disabled(!model.transcriptionEnabled)
+    }
+
+    private var integrationsSettings: some View {
+        Form {
+            Section("Outline") {
+                TextField("Workspace URL", text: $model.outlineBaseURL, prompt: Text("https://outline.example.com"))
+                SecureField("API Token", text: $model.outlineAPIToken)
+
+                if model.outlineCollections.isEmpty {
+                    TextField("Collection ID", text: $model.outlineDefaultCollectionID)
+                } else {
+                    Picker("Default Collection", selection: $model.outlineDefaultCollectionID) {
+                        ForEach(model.outlineCollections) { collection in
+                            Text(collection.name).tag(collection.id)
+                        }
+                    }
+                }
+
+                Text("Contora creates a document on first publish and updates the same document on subsequent publishes. The API token is stored in macOS Keychain.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Save") { model.saveOutlineSettings() }
+                    Button("Connect & Load Collections") { model.loadOutlineCollections() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.isLoadingOutlineCollections)
+                    if model.isLoadingOutlineCollections {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+
+                statusRow("Status", model.outlineStatus)
+            }
+        }
+        .formStyle(.grouped)
     }
 
     private var storageSettings: some View {
@@ -5603,6 +5856,19 @@ struct ContoraMacApp: App {
         .defaultSize(width: 760, height: 600)
     }
 }
+
+#if DEBUG
+if CommandLine.arguments.contains("--self-check-session-management") {
+    do {
+        try SessionManagementSelfCheck.run()
+        print("Session management self-check passed")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Session management self-check failed: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+#endif
 
 if SelfUpdateInstaller.handleCommandLineIfNeeded() {
     exit(EXIT_SUCCESS)
