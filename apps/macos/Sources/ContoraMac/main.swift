@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Accelerate
 @preconcurrency import AVFoundation
 import ApplicationServices
 import Combine
@@ -202,6 +203,7 @@ struct ContoraSession: Identifiable, Hashable {
     let segments: [Segment]
     let words: [Word]
     let speakerTurns: [SpeakerTurn]
+    let zoomSource: ZoomSessionSource?
 }
 
 struct EditableSessionSegment: Identifiable, Hashable {
@@ -357,7 +359,8 @@ final class SessionLibraryService {
                 speakers: parsed.speakers,
                 segments: parsed.segments,
                 words: [],
-                speakerTurns: []
+                speakerTurns: [],
+                zoomSource: nil
             )
         }
 
@@ -439,7 +442,21 @@ final class SessionLibraryService {
             speakers: manifestSpeakers ?? parsed.speakers,
             segments: manifestSegments ?? parsed.segments,
             words: manifestWords,
-            speakerTurns: manifestSpeakerTurns
+            speakerTurns: manifestSpeakerTurns,
+            zoomSource: manifest.source.flatMap { source in
+                guard source.type == "zoom-multitrack" else { return nil }
+                return ZoomSessionSource(
+                    recordingID: source.externalID,
+                    folderURL: URL(fileURLWithPath: source.folderPath),
+                    tracks: source.tracks.map {
+                        ZoomSpeakerTrack(
+                            id: $0.id,
+                            participantName: $0.participantName,
+                            audioURL: URL(fileURLWithPath: $0.audioPath)
+                        )
+                    }
+                )
+            }
         )
     }
 
@@ -706,7 +723,11 @@ final class RecordingArchiveService {
         return (SessionIdentity(sessionID: sessionID, title: sessionID, createdAt: createdAt), fileURL)
     }
 
-    func registerImportedMedia(fileURL: URL, sourceMode: String) throws -> (SessionIdentity, URL) {
+    func registerImportedMedia(
+        fileURL: URL,
+        sourceMode: String,
+        audioSeconds: Double = 0
+    ) throws -> (SessionIdentity, URL, Double) {
         let recordingsDirectory = try makeRecordingsDirectory()
         let createdAt = Date()
         let sessionID = "import-\(timestampString())-\(UUID().uuidString.prefix(8))"
@@ -716,12 +737,50 @@ final class RecordingArchiveService {
             sessionID: identity,
             recordingFileURL: fileURL,
             captureSourceMode: sourceMode,
-            audioSeconds: 0,
+            audioSeconds: audioSeconds,
             sampleRate: 0,
             channels: 0,
             manifestBaseURL: recordingsDirectory
         )
-        return (identity, fileURL)
+        return (identity, fileURL, audioSeconds)
+    }
+
+    func registerZoomRecording(_ recording: ZoomRecording) throws -> (SessionIdentity, URL) {
+        guard let primaryAudioURL = recording.primaryAudioURL else {
+            throw AudioImportError.readFailed
+        }
+        let recordingsDirectory = try makeRecordingsDirectory()
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = .current
+        dateFormatter.dateFormat = "yyyyMMdd-HHmmss"
+        let recordingToken = (recording.zoomRecordingID ?? "local")
+            .filter { $0.isLetter || $0.isNumber || $0 == "-" }
+        let sessionID = "zoom-\(dateFormatter.string(from: recording.startedAt))-\(recordingToken.isEmpty ? "local" : recordingToken)"
+        let identity = SessionIdentity(
+            sessionID: sessionID,
+            title: recording.title,
+            createdAt: recording.startedAt
+        )
+        let source = ContoraSessionManifest.Source(
+            type: "zoom-multitrack",
+            externalID: recording.id,
+            folderPath: recording.folderURL.path,
+            tracks: recording.tracks.map {
+                .init(id: $0.id, participantName: $0.participantName, audioPath: $0.audioURL.path)
+            }
+        )
+        _ = try saveSessionManifest(
+            sessionID: identity,
+            recordingFileURL: primaryAudioURL,
+            captureSourceMode: "Zoom Multi-Track",
+            audioSeconds: 0,
+            sampleRate: 0,
+            channels: 0,
+            source: source,
+            manifestBaseURL: recordingsDirectory
+        )
+        return (identity, primaryAudioURL)
     }
 
     func siblingCompressedURL(for recordingFileURL: URL) -> URL {
@@ -741,6 +800,7 @@ final class RecordingArchiveService {
         failureJSON: URL? = nil,
         transcription: ContoraSessionManifest.Transcription? = nil,
         lastFailure: ContoraSessionManifest.Failure? = nil,
+        source: ContoraSessionManifest.Source? = nil,
         manifestBaseURL: URL? = nil
     ) throws -> URL {
         let manifestURL = manifestBaseURL?
@@ -752,7 +812,7 @@ final class RecordingArchiveService {
         let recordingDirectory = recordingFileURL.deletingLastPathComponent().standardizedFileURL
         let isInternalRecording = recordingDirectory == manifestDirectory
         let manifest = ContoraSessionManifest(
-            schemaVersion: transcription?.words == nil ? "1.0" : "2.0",
+            schemaVersion: source == nil ? (transcription?.words == nil ? "1.0" : "2.0") : "3.0",
             sessionID: sessionID.sessionID,
             title: sessionID.title,
             createdAt: formatter.string(from: sessionID.createdAt),
@@ -773,7 +833,8 @@ final class RecordingArchiveService {
                 channels: channels
             ),
             transcription: transcription,
-            lastFailure: lastFailure
+            lastFailure: lastFailure,
+            source: source
         )
         let data = try JSONEncoder.prettyISO8601.encode(manifest)
         try data.write(to: manifestURL, options: .atomic)
@@ -1054,6 +1115,7 @@ final class MLXHTTPTranscriptionService {
         endpointURL: URL,
         modelID: String,
         enableDiarization: Bool,
+        expectedSpeakerCount: Int? = nil,
         onJobCreated: @escaping @Sendable (String) -> Void = { _ in },
         onProgress: @escaping @Sendable (MLXTranscriptionProgress) -> Void = { _ in }
     ) async throws -> MLXTranscriptionResponse {
@@ -1064,13 +1126,16 @@ final class MLXHTTPTranscriptionService {
         let handoff = try await Task.detached(priority: .userInitiated) {
             try MLXAudioHandoff.create(samples16kMono: samples16kMono)
         }.value
-        let requestPayload: [String: Any] = [
+        var requestPayload: [String: Any] = [
             "capability_token": handoff.capabilityToken,
             "model": modelID,
             "language": language,
             "diarize": enableDiarization,
             "chunk_duration": 30.0,
         ]
+        if let expectedSpeakerCount, expectedSpeakerCount > 0 {
+            requestPayload["num_speakers"] = expectedSpeakerCount
+        }
         let requestBody = try JSONSerialization.data(withJSONObject: requestPayload)
         let creationURL = jobsURL.appendingPathComponent("from-file")
         var request = URLRequest(url: creationURL)
@@ -1266,42 +1331,118 @@ final class AudioFileImportService {
     func importAudioFile(from fileURL: URL) throws -> AudioCaptureResult {
         let audioFile = try AVAudioFile(forReading: fileURL)
         let format = audioFile.processingFormat
-        let frameCount = AVAudioFrameCount(audioFile.length)
-
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+        let channels = Int(format.channelCount)
+        guard channels > 0, format.sampleRate > 0, audioFile.length > 0 else {
             throw AudioImportError.readFailed
         }
 
-        try audioFile.read(into: buffer)
-        guard let floatChannelData = buffer.floatChannelData else {
-            throw AudioImportError.unsupportedFormat
-        }
+        let chunkCapacity: AVAudioFrameCount = 32_768
+        let estimatedOutputCount = max(1, Int((Double(audioFile.length) / format.sampleRate) * 16_000))
+        var output: [Float] = []
+        output.reserveCapacity(estimatedOutputCount)
 
-        let channels = Int(buffer.format.channelCount)
-        let frames = Int(buffer.frameLength)
-        guard channels > 0, frames > 0 else {
-            throw AudioImportError.readFailed
-        }
+        let ratio = format.sampleRate / 16_000.0
+        var nextOutputSourcePosition = 0.0
+        var globalFrameStart = 0
+        var previousSample: Float?
+        var nativeSamplesCount = 0
 
-        var mono = [Float](repeating: 0, count: frames)
-        if channels == 1 {
-            let channel = floatChannelData[0]
-            for i in 0..<frames {
-                mono[i] = channel[i]
+        while audioFile.framePosition < audioFile.length {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkCapacity) else {
+                throw AudioImportError.readFailed
             }
-        } else {
-            for frame in 0..<frames {
-                var sum: Float = 0
-                for channel in 0..<channels {
-                    sum += floatChannelData[channel][frame]
+            try audioFile.read(into: buffer, frameCount: chunkCapacity)
+            let frameCount = Int(buffer.frameLength)
+            guard frameCount > 0 else { break }
+            guard let floatChannelData = buffer.floatChannelData else {
+                throw AudioImportError.unsupportedFormat
+            }
+
+            var mono = [Float](repeating: 0, count: frameCount)
+            if channels == 1 {
+                let channel = floatChannelData[0]
+                mono.withUnsafeMutableBufferPointer { destination in
+                    destination.baseAddress?.update(from: channel, count: frameCount)
                 }
-                mono[frame] = sum / Float(channels)
+            } else {
+                mono.withUnsafeMutableBufferPointer { destination in
+                    guard let destinationAddress = destination.baseAddress else { return }
+                    for channel in 0..<channels {
+                        vDSP_vadd(
+                            destinationAddress,
+                            1,
+                            floatChannelData[channel],
+                            1,
+                            destinationAddress,
+                            1,
+                            vDSP_Length(frameCount)
+                        )
+                    }
+                    var scale = 1 / Float(channels)
+                    vDSP_vsmul(
+                        destinationAddress,
+                        1,
+                        &scale,
+                        destinationAddress,
+                        1,
+                        vDSP_Length(frameCount)
+                    )
+                }
             }
+
+            nativeSamplesCount += frameCount
+            if abs(format.sampleRate - 16_000) < 0.01 {
+                output.append(contentsOf: mono)
+            } else {
+                let globalFrameEnd = globalFrameStart + frameCount
+                let exclusiveEnd = Double(globalFrameEnd - 1)
+                if nextOutputSourcePosition < exclusiveEnd {
+                    let outputCount = Int(ceil((exclusiveEnd - nextOutputSourcePosition) / ratio))
+                    let interpolationInput: [Float]
+                    let interpolationBase: Int
+                    if let previousSample {
+                        interpolationInput = [previousSample] + mono
+                        interpolationBase = globalFrameStart - 1
+                    } else {
+                        interpolationInput = mono
+                        interpolationBase = globalFrameStart
+                    }
+                    var positions = [Float](repeating: 0, count: outputCount)
+                    var positionStart = Float(nextOutputSourcePosition - Double(interpolationBase))
+                    var positionStep = Float(ratio)
+                    vDSP_vramp(
+                        &positionStart,
+                        &positionStep,
+                        &positions,
+                        1,
+                        vDSP_Length(outputCount)
+                    )
+                    var resampled = [Float](repeating: 0, count: outputCount)
+                    vDSP_vlint(
+                        interpolationInput,
+                        positions,
+                        1,
+                        &resampled,
+                        1,
+                        vDSP_Length(outputCount),
+                        vDSP_Length(interpolationInput.count)
+                    )
+                    output.append(contentsOf: resampled)
+                    nextOutputSourcePosition += Double(outputCount) * ratio
+                }
+            }
+
+            previousSample = mono.last
+            globalFrameStart += frameCount
         }
 
-        let downsampled = AudioCaptureService.resampleTo16k(samples: mono, nativeSampleRate: format.sampleRate)
-        let duration = Double(downsampled.count) / 16_000.0
-        return AudioCaptureResult(samples16kMono: downsampled, durationSeconds: duration, nativeSamplesCount: mono.count)
+        guard !output.isEmpty else { throw AudioImportError.readFailed }
+        let duration = Double(output.count) / 16_000.0
+        return AudioCaptureResult(
+            samples16kMono: output,
+            durationSeconds: duration,
+            nativeSamplesCount: nativeSamplesCount
+        )
     }
 }
 
@@ -1617,6 +1758,7 @@ final class AppModel: ObservableObject {
     @Published var mlxTranscriptionEndpoint = "http://127.0.0.1:8010/v1/audio/transcriptions"
     @Published var mlxModelID = "mlx-community/whisper-large-v3-turbo-asr-fp16"
     @Published var mlxDiarizationEnabled = false
+    @Published var mlxExpectedSpeakerCount = 0
     @Published var mlxSetupStatus = "Not configured"
     @Published var isSettingUpMLX = false
     @Published var recordingSeconds: Double = 0
@@ -1684,6 +1826,11 @@ final class AppModel: ObservableObject {
     @Published var isCheckingForUpdates = false
     @Published var isDownloadingUpdate = false
     @Published var downloadedUpdatePath = ""
+    @Published var detectedZoomRecordings: [ZoomRecording] = []
+    @Published var zoomWatchEnabled = true
+    @Published var zoomWatchFolderPath = ZoomRecordingDetector.defaultRootURL().path
+    @Published var zoomWatchStatus = "Not scanned"
+    @Published var isImportingZoomRecording = false
 
     let permissions = PermissionState()
 
@@ -1719,6 +1866,7 @@ final class AppModel: ObservableObject {
     private var activeTranscriptionTask: Task<Void, Never>?
     private var speechBackendIdleStopTask: Task<Void, Never>?
     private var pendingMLXRecoveryRecords: [MLXJobRecoveryRecord] = []
+    private var zoomWatchTask: Task<Void, Never>?
 
     private init() {
         let outlineSettings = outlineSettingsStore.loadSettings()
@@ -1728,6 +1876,12 @@ final class AppModel: ObservableObject {
         outlineDocumentLinks = outlineSettingsStore.loadDocumentLinks()
         outlineStatus = outlineSettings.canPublish ? "Ready" : "Not configured"
         pinnedSessionIDs = Set(UserDefaults.standard.stringArray(forKey: "sessions.pinnedIDs") ?? [])
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "zoom.watchEnabled") != nil {
+            zoomWatchEnabled = defaults.bool(forKey: "zoom.watchEnabled")
+        }
+        zoomWatchFolderPath = defaults.string(forKey: "zoom.watchFolderPath")
+            ?? ZoomRecordingDetector.defaultRootURL().path
         sharedServerConfigPath = SharedTranscriptionServerConfigStore.shared.configFileURL().path
         loadSharedServerConfig()
         reloadSessions()
@@ -1735,6 +1889,7 @@ final class AppModel: ObservableObject {
         refreshDiagnostics()
         refreshAudioDeviceContext()
         _ = restorePendingMLXJobIfNeeded()
+        restartZoomWatcher()
         checkForUpdates(silent: true)
     }
 
@@ -1808,24 +1963,26 @@ final class AppModel: ObservableObject {
             createdAt: session.createdAt
         )
         do {
-            _ = try await sharedMLXToolkitService.start(modelID: record.modelID) { [weak self] message in
-                Task { @MainActor in
-                    self?.applyTranscriptionProgress(
-                        TranscriptionProgress(
-                            phase: "starting_backend",
-                            progress: 0,
-                            message: message,
-                            currentSeconds: 0,
-                            totalSeconds: record.audioSeconds,
-                            etaSeconds: nil
-                        ),
-                        jobID: jobID,
-                        startedAt: record.createdAt
-                    )
+            if usesManagedMLXBackend(endpointString: record.endpointURL) {
+                _ = try await sharedMLXToolkitService.start(modelID: record.modelID) { [weak self] message in
+                    Task { @MainActor in
+                        self?.applyTranscriptionProgress(
+                            TranscriptionProgress(
+                                phase: "starting_backend",
+                                progress: 0,
+                                message: message,
+                                currentSeconds: 0,
+                                totalSeconds: record.audioSeconds,
+                                etaSeconds: nil
+                            ),
+                            jobID: jobID,
+                            startedAt: record.createdAt
+                        )
+                    }
                 }
             }
             guard let endpointURL = URL(string: record.endpointURL) else {
-                throw TranscriptionError.serverError(statusCode: 400, message: "Invalid saved MLX endpoint URL")
+                throw TranscriptionError.serverError(statusCode: 400, message: "Invalid saved transcription endpoint URL")
             }
             let response = try await mlxTranscriber.resume(
                 jobID: record.remoteJobID,
@@ -2064,10 +2221,35 @@ final class AppModel: ObservableObject {
             let config = try SharedTranscriptionServerConfigStore.shared.loadOrCreate()
             transcriptionBackend = .mlxOpenAIHTTP
             transcriptionEndpoint = config.whisperTranscribeURL
-            mlxTranscriptionEndpoint = config.mlxTranscribeURL
-            mlxModelID = config.mlxModelID
-            mlxDiarizationEnabled = config.mlxDiarizationEnabled
-            sharedServerConfigStatus = "Loaded (\(config.schemaVersion))"
+            let environment = ProcessInfo.processInfo.environment
+            let endpointOverride = environment["CONTORA_TRANSCRIPTION_JOB_ENDPOINT"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            mlxTranscriptionEndpoint = endpointOverride?.isEmpty == false
+                ? endpointOverride!
+                : config.mlxTranscribeURL
+            if let modelOverride = environment["CONTORA_TRANSCRIPTION_MODEL"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !modelOverride.isEmpty {
+                mlxModelID = modelOverride
+            } else {
+                mlxModelID = config.mlxModelID
+            }
+            if let diarizationOverride = environment["CONTORA_TRANSCRIPTION_DIARIZATION"] {
+                mlxDiarizationEnabled = ["1", "true", "yes", "on"]
+                    .contains(diarizationOverride.lowercased())
+            } else {
+                mlxDiarizationEnabled = config.mlxDiarizationEnabled
+            }
+            if let speakerCountOverride = environment["CONTORA_TRANSCRIPTION_SPEAKER_COUNT"],
+               let count = Int(speakerCountOverride),
+               (1...50).contains(count) {
+                mlxExpectedSpeakerCount = count
+            } else {
+                mlxExpectedSpeakerCount = max(0, min(50, config.mlxExpectedSpeakerCount))
+            }
+            sharedServerConfigStatus = endpointOverride?.isEmpty == false
+                ? "Loaded corporate launch override"
+                : "Loaded (\(config.schemaVersion))"
         } catch {
             sharedServerConfigStatus = "Load failed: \(error.localizedDescription)"
         }
@@ -2081,6 +2263,7 @@ final class AppModel: ObservableObject {
             mlxTranscribeURL: mlxTranscriptionEndpoint,
             mlxModelID: mlxModelID,
             mlxDiarizationEnabled: mlxDiarizationEnabled,
+            mlxExpectedSpeakerCount: mlxExpectedSpeakerCount,
             fasterWhisperModelName: "",
             fasterWhisperDiarizationEnabled: false,
             updatedAt: ISO8601DateFormatter().string(from: Date())
@@ -2370,6 +2553,8 @@ final class AppModel: ObservableObject {
     func reloadSessions() {
         do {
             sessions = try sessionLibrary.loadSessions()
+            let importedZoomIDs = Set(sessions.compactMap { $0.zoomSource?.recordingID })
+            detectedZoomRecordings.removeAll { importedZoomIDs.contains($0.id) }
             if selectedSessionID == nil || !sessions.contains(where: { $0.id == selectedSessionID }) {
                 selectedSessionID = visibleSessions.first?.id ?? sessions.first?.id
             }
@@ -2450,6 +2635,121 @@ final class AppModel: ObservableObject {
             pinnedSessionIDs.insert(sessionID)
         }
         UserDefaults.standard.set(Array(pinnedSessionIDs).sorted(), forKey: "sessions.pinnedIDs")
+    }
+
+    func setZoomWatchEnabled(_ enabled: Bool) {
+        zoomWatchEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "zoom.watchEnabled")
+        restartZoomWatcher()
+    }
+
+    func setZoomWatchFolderPath(_ path: String) {
+        let normalized = NSString(string: path).expandingTildeInPath
+        zoomWatchFolderPath = normalized
+        UserDefaults.standard.set(normalized, forKey: "zoom.watchFolderPath")
+        restartZoomWatcher()
+    }
+
+    func chooseZoomWatchFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Watch Folder"
+        panel.directoryURL = URL(fileURLWithPath: zoomWatchFolderPath, isDirectory: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            setZoomWatchFolderPath(url.path)
+        }
+    }
+
+    func openZoomWatchFolder() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: zoomWatchFolderPath, isDirectory: true))
+    }
+
+    func scanZoomRecordingsNow() {
+        guard zoomWatchEnabled else {
+            zoomWatchStatus = "Watching is off"
+            detectedZoomRecordings = []
+            return
+        }
+        let rootURL = URL(fileURLWithPath: zoomWatchFolderPath, isDirectory: true)
+        zoomWatchStatus = "Scanning…"
+        Task { [weak self] in
+            do {
+                let recordings = try await Task.detached(priority: .utility) {
+                    try ZoomRecordingDetector.scan(rootURL: rootURL)
+                }.value
+                await MainActor.run {
+                    guard let self else { return }
+                    let ignored = Set(UserDefaults.standard.stringArray(forKey: "zoom.ignoredRecordingIDs") ?? [])
+                    let imported = Set(self.sessions.compactMap { $0.zoomSource?.recordingID })
+                    self.detectedZoomRecordings = recordings.filter {
+                        !ignored.contains($0.id) && !imported.contains($0.id)
+                    }
+                    self.zoomWatchStatus = self.detectedZoomRecordings.isEmpty
+                        ? "Watching · no new multi-track recordings"
+                        : "Found \(self.detectedZoomRecordings.count) new recording(s)"
+                }
+            } catch {
+                await MainActor.run {
+                    self?.zoomWatchStatus = "Scan failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func ignoreZoomRecording(_ recording: ZoomRecording) {
+        var ignored = Set(UserDefaults.standard.stringArray(forKey: "zoom.ignoredRecordingIDs") ?? [])
+        ignored.insert(recording.id)
+        UserDefaults.standard.set(Array(ignored).sorted(), forKey: "zoom.ignoredRecordingIDs")
+        detectedZoomRecordings.removeAll { $0.id == recording.id }
+        zoomWatchStatus = "Recording ignored"
+    }
+
+    func importAndTranscribeZoomRecording(_ recording: ZoomRecording) {
+        guard !isImportingZoomRecording else { return }
+        guard !isRecording, !isFinalizingStop else {
+            statusMessage = "Finish the current recording before importing Zoom"
+            return
+        }
+
+        isImportingZoomRecording = true
+        do {
+            let archive = try recordingArchive.registerZoomRecording(recording)
+            reloadSessions()
+            selectedSessionID = archive.0.sessionID
+            loadEditorForSelectedSession()
+            detectedZoomRecordings.removeAll { $0.id == recording.id }
+            isImportingZoomRecording = false
+            guard let session = sessions.first(where: { $0.id == archive.0.sessionID }) else {
+                statusMessage = "Zoom recording imported, but the session could not be loaded"
+                return
+            }
+            statusMessage = "Imported \(recording.title); queued \(recording.tracks.count) speaker tracks"
+            enqueueTranscription(for: session)
+        } catch {
+            isImportingZoomRecording = false
+            statusMessage = "Zoom import failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func restartZoomWatcher() {
+        zoomWatchTask?.cancel()
+        zoomWatchTask = nil
+        guard zoomWatchEnabled else {
+            detectedZoomRecordings = []
+            zoomWatchStatus = "Watching is off"
+            return
+        }
+
+        scanZoomRecordingsNow()
+        zoomWatchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { return }
+                self?.scanZoomRecordingsNow()
+            }
+        }
     }
 
     func selectSession(_ sessionID: String?) {
@@ -2719,6 +3019,7 @@ final class AppModel: ObservableObject {
                         )
                     }
                 ),
+                source: manifestSource(for: session.zoomSource),
                 manifestBaseURL: artifactBaseURL?.deletingLastPathComponent()
             )
             sessionEditorStatus = "Saved"
@@ -3203,7 +3504,7 @@ final class AppModel: ObservableObject {
         do {
             let archive = try await registerImportedMediaInBackground(fileURL: fileURL, sourceMode: "Imported Audio")
             let storedRecordingURL = archive.1
-            lastAudioDurationSeconds = 0
+            lastAudioDurationSeconds = archive.2
             lastCaptureSamples = 0
             lastSavedRecordingPath = storedRecordingURL.path
             currentRecordingFileURL = storedRecordingURL
@@ -3231,7 +3532,7 @@ final class AppModel: ObservableObject {
         do {
             let archive = try await registerImportedMediaInBackground(fileURL: fileURL, sourceMode: "Imported Video")
             let storedRecordingURL = archive.1
-            lastAudioDurationSeconds = 0
+            lastAudioDurationSeconds = archive.2
             lastCaptureSamples = 0
             lastSavedRecordingPath = storedRecordingURL.path
             currentRecordingFileURL = storedRecordingURL
@@ -3410,8 +3711,19 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Contora owns the lifecycle only for the bundled backend on its canonical
+    /// loopback port. Job-compatible sidecars on another port are started and
+    /// secured independently.
+    private func usesManagedMLXBackend(endpointString: String) -> Bool {
+        guard let components = URLComponents(string: endpointString) else { return false }
+        let host = components.host?.lowercased()
+        let isLoopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
+        return isLoopback && (components.port ?? 80) == 8010
+    }
+
     private func transcribeWithSelectedBackend(
         samples16k: [Float],
+        enableDiarization: Bool? = nil,
         onMLXJobCreated: @escaping @Sendable (String) -> Void = { _ in },
         onProgress: @escaping @Sendable (TranscriptionProgress) -> Void = { _ in }
     ) async throws -> TranscriptionBackendOutput {
@@ -3421,19 +3733,22 @@ final class AppModel: ObservableObject {
             saveSharedServerConfig()
             return try await transcribeWithSelectedBackend(
                 samples16k: samples16k,
+                enableDiarization: enableDiarization,
                 onMLXJobCreated: onMLXJobCreated,
                 onProgress: onProgress
             )
 
         case .mlxOpenAIHTTP:
             guard let endpointURL = URL(string: mlxTranscriptionEndpoint) else {
-                throw TranscriptionError.serverError(statusCode: 400, message: "Invalid MLX endpoint URL")
+                throw TranscriptionError.serverError(statusCode: 400, message: "Invalid transcription endpoint URL")
             }
             onProgress(
                 TranscriptionProgress(
                     phase: "starting_backend",
                     progress: 0,
-                    message: "Starting MLX backend",
+                    message: usesManagedMLXBackend(endpointString: mlxTranscriptionEndpoint)
+                        ? "Starting managed MLX backend"
+                        : "Connecting to external transcription backend",
                     currentSeconds: 0,
                     totalSeconds: Double(samples16k.count) / 16_000.0,
                     etaSeconds: nil
@@ -3441,24 +3756,28 @@ final class AppModel: ObservableObject {
             )
             speechBackendIdleStopTask?.cancel()
             speechBackendIdleStopTask = nil
-            _ = try await sharedMLXToolkitService.start(modelID: mlxModelID) { message in
-                onProgress(
-                    TranscriptionProgress(
-                        phase: "starting_backend",
-                        progress: 0,
-                        message: message,
-                        currentSeconds: 0,
-                        totalSeconds: Double(samples16k.count) / 16_000.0,
-                        etaSeconds: nil
+            if usesManagedMLXBackend(endpointString: mlxTranscriptionEndpoint) {
+                _ = try await sharedMLXToolkitService.start(modelID: mlxModelID) { message in
+                    onProgress(
+                        TranscriptionProgress(
+                            phase: "starting_backend",
+                            progress: 0,
+                            message: message,
+                            currentSeconds: 0,
+                            totalSeconds: Double(samples16k.count) / 16_000.0,
+                            etaSeconds: nil
+                        )
                     )
-                )
+                }
             }
+            let shouldDiarize = enableDiarization ?? mlxDiarizationEnabled
             let response = try await mlxTranscriber.transcribe(
                 samples16kMono: samples16k,
                 language: transcriptionLanguage,
                 endpointURL: endpointURL,
                 modelID: mlxModelID,
-                enableDiarization: mlxDiarizationEnabled,
+                enableDiarization: shouldDiarize,
+                expectedSpeakerCount: shouldDiarize && mlxExpectedSpeakerCount > 0 ? mlxExpectedSpeakerCount : nil,
                 onJobCreated: onMLXJobCreated,
                 onProgress: { progress in
                     onProgress(
@@ -3484,6 +3803,7 @@ final class AppModel: ObservableObject {
             saveSharedServerConfig()
             return try await transcribeWithSelectedBackend(
                 samples16k: samples16k,
+                enableDiarization: enableDiarization,
                 onMLXJobCreated: onMLXJobCreated,
                 onProgress: onProgress
             )
@@ -3519,9 +3839,20 @@ final class AppModel: ObservableObject {
         }.value
     }
 
-    private func registerImportedMediaInBackground(fileURL: URL, sourceMode: String) async throws -> (RecordingArchiveService.SessionIdentity, URL) {
+    private func registerImportedMediaInBackground(
+        fileURL: URL,
+        sourceMode: String
+    ) async throws -> (RecordingArchiveService.SessionIdentity, URL, Double) {
         try await Task.detached(priority: .userInitiated) {
-            try RecordingArchiveService().registerImportedMedia(fileURL: fileURL, sourceMode: sourceMode)
+            let asset = AVURLAsset(url: fileURL)
+            let duration = try await asset.load(.duration)
+            let measuredSeconds = duration.seconds
+            let audioSeconds = measuredSeconds.isFinite && measuredSeconds > 0 ? measuredSeconds : 0
+            return try RecordingArchiveService().registerImportedMedia(
+                fileURL: fileURL,
+                sourceMode: sourceMode,
+                audioSeconds: audioSeconds
+            )
         }.value
     }
 
@@ -3578,6 +3909,11 @@ final class AppModel: ObservableObject {
     }
 
     private func executeTranscriptionJob(jobID: UUID, session: ContoraSession) async {
+        if let source = session.zoomSource, source.tracks.count >= 2 {
+            await executeZoomMultiTrackTranscriptionJob(jobID: jobID, session: session, source: source)
+            return
+        }
+
         do {
             let result = try await prepareMediaForTranscriptionInBackground(session: session)
             try Task.checkCancellation()
@@ -3755,6 +4091,141 @@ final class AppModel: ObservableObject {
 
         finishTranscriptionJob(jobID)
     }
+
+    private func executeZoomMultiTrackTranscriptionJob(
+        jobID: UUID,
+        session: ContoraSession,
+        source: ZoomSessionSource
+    ) async {
+        let startedAt = Date()
+        let sessionIdentity = RecordingArchiveService.SessionIdentity(
+            sessionID: session.id,
+            title: session.title,
+            createdAt: session.createdAt
+        )
+        var meetingDuration = 0.0
+        var totalProcessedAudio = 0.0
+        defer { finishTranscriptionJob(jobID) }
+
+        do {
+            isPreparingTranscription = false
+            isTranscribing = true
+            transcriptionElapsedSeconds = 0
+            activeTranscriptionSessionTitle = session.title
+            statusMessage = "Transcribing \(source.tracks.count) Zoom speaker tracks without diarization…"
+            updateTranscriptionJob(jobID) { job in
+                job.state = .transcribing
+                job.progress = 0
+                job.statusText = "Preparing Zoom speaker tracks"
+                job.speedRatio = nil
+            }
+            startTranscriptionTicker(from: startedAt, jobID: jobID, statusText: "Transcribing Zoom tracks")
+
+            var trackResults: [ZoomTrackTranscription] = []
+            for (trackIndex, track) in source.tracks.enumerated() {
+                try Task.checkCancellation()
+                let ordinal = trackIndex + 1
+                statusMessage = "Zoom track \(ordinal)/\(source.tracks.count): \(track.participantName)"
+                updateTranscriptionJob(jobID) { job in
+                    job.statusText = "Decoding \(track.participantName) (\(ordinal)/\(source.tracks.count))"
+                    job.progress = Double(trackIndex) / Double(source.tracks.count)
+                }
+
+                let audio = try await importAudioInBackground(from: track.audioURL)
+                try Task.checkCancellation()
+                meetingDuration = max(meetingDuration, audio.durationSeconds)
+                totalProcessedAudio += audio.durationSeconds
+                activeTranscriptionAudioSeconds = meetingDuration
+                lastAudioDurationSeconds = meetingDuration
+                lastCaptureSamples = audio.samples16kMono.count
+                updateTranscriptionJob(jobID) { job in
+                    job.audioSeconds = meetingDuration
+                }
+
+                let output = try await transcribeWithSelectedBackend(
+                    samples16k: audio.samples16kMono,
+                    enableDiarization: false,
+                    onProgress: { [weak self] progress in
+                        Task { @MainActor in
+                            guard let self, self.activeTranscriptionJobID == jobID else { return }
+                            let localProgress = progress.fraction
+                            let combined = (Double(trackIndex) + localProgress) / Double(source.tracks.count)
+                            self.updateTranscriptionJob(jobID) { job in
+                                job.progress = combined
+                                job.statusText = "\(track.participantName) (\(ordinal)/\(source.tracks.count)) · \(progress.message)"
+                                job.remainingSeconds = nil
+                            }
+                        }
+                    }
+                )
+                trackResults.append(.init(track: track, output: output))
+            }
+
+            try Task.checkCancellation()
+            let merged = ZoomTranscriptMerger.merge(trackResults)
+            lastTranscriptionDurationSeconds = Date().timeIntervalSince(startedAt)
+            lastRealtimeSpeedRatio = lastTranscriptionDurationSeconds > 0
+                ? totalProcessedAudio / lastTranscriptionDurationSeconds
+                : 0
+            lastTranscript = merged.text.isEmpty ? "[Empty transcription]" : merged.text
+            try persistZoomMultiTrackTranscript(
+                merged,
+                session: session,
+                source: source,
+                sessionIdentity: sessionIdentity,
+                audioDurationSeconds: meetingDuration,
+                transcriptionDurationSeconds: lastTranscriptionDurationSeconds
+            )
+            transcriptionTickerTask?.cancel()
+            transcriptionTickerTask = nil
+            isTranscribing = false
+            statusMessage = "Zoom transcription complete · \(source.tracks.count) named speakers"
+            updateTranscriptionJob(jobID) { job in
+                job.state = .completed
+                job.progress = 1
+                job.elapsedSeconds = lastTranscriptionDurationSeconds
+                job.remainingSeconds = 0
+                job.speedRatio = lastRealtimeSpeedRatio
+                job.statusText = "Completed · \(source.tracks.count) Zoom speakers"
+                job.errorMessage = nil
+            }
+        } catch {
+            transcriptionTickerTask?.cancel()
+            transcriptionTickerTask = nil
+            isPreparingTranscription = false
+            isTranscribing = false
+            lastTranscriptionDurationSeconds = Date().timeIntervalSince(startedAt)
+            if isCancellationError(error) || Task.isCancelled {
+                statusMessage = "Zoom transcription stopped"
+                updateTranscriptionJob(jobID) { job in
+                    job.state = .cancelled
+                    job.statusText = "Stopped by user"
+                    job.remainingSeconds = nil
+                    job.errorMessage = nil
+                }
+                return
+            }
+
+            statusMessage = "Zoom transcription failed"
+            persistTranscriptionFailure(
+                error: error,
+                stage: "zoom_multitrack",
+                recoverable: false,
+                session: session,
+                sessionIdentity: sessionIdentity,
+                audioDurationSeconds: meetingDuration
+            )
+            updateTranscriptionJob(jobID) { job in
+                job.state = .failed
+                job.elapsedSeconds = lastTranscriptionDurationSeconds
+                job.remainingSeconds = nil
+                job.progress = nil
+                job.statusText = "Zoom track failed"
+                job.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
 
     private func finishTranscriptionJob(_ jobID: UUID) {
         if activeTranscriptionJobID == jobID {
@@ -3956,6 +4427,79 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func persistZoomMultiTrackTranscript(
+        _ merged: ZoomMergedTranscript,
+        session: ContoraSession,
+        source: ZoomSessionSource,
+        sessionIdentity: RecordingArchiveService.SessionIdentity,
+        audioDurationSeconds: Double,
+        transcriptionDurationSeconds: Double
+    ) throws {
+        do {
+            let artifactBaseURL = artifactBaseURL(for: session.id, recordingURL: session.recordingURL)
+            let txtURL = try recordingArchive.saveTranscriptText(
+                for: session.recordingURL,
+                artifactBaseURL: artifactBaseURL,
+                transcriptText: merged.text
+            )
+            let jsonURL = try recordingArchive.saveTranscriptJSON(
+                for: session.recordingURL,
+                artifactBaseURL: artifactBaseURL,
+                transcriptText: merged.text,
+                mode: "zoom_multitrack_no_diarization",
+                language: transcriptionLanguage,
+                endpoint: activeTranscriptionEndpointString(),
+                audioSeconds: audioDurationSeconds,
+                postStopWaitSeconds: 0,
+                transcriptionSeconds: transcriptionDurationSeconds,
+                success: true,
+                errorMessage: nil,
+                structuredResultData: merged.structuredResultData
+            )
+            _ = try recordingArchive.saveSessionManifest(
+                sessionID: sessionIdentity,
+                recordingFileURL: session.recordingURL,
+                captureSourceMode: "Zoom Multi-Track",
+                audioSeconds: audioDurationSeconds,
+                recordingM4AURL: existingSiblingM4A(for: session.recordingURL),
+                transcriptTXT: txtURL,
+                transcriptJSON: jsonURL,
+                transcription: .init(
+                    status: "completed",
+                    backend: transcriptionBackend.rawValue,
+                    endpoint: activeTranscriptionEndpointString(),
+                    language: transcriptionLanguage,
+                    mode: "zoom_multitrack_no_diarization",
+                    durationSeconds: transcriptionDurationSeconds,
+                    errorMessage: nil,
+                    speakers: merged.speakers,
+                    segments: merged.segments,
+                    words: merged.words.isEmpty ? nil : merged.words,
+                    speakerTurns: merged.speakerTurns
+                ),
+                source: manifestSource(for: source),
+                manifestBaseURL: artifactBaseURL?.deletingLastPathComponent()
+            )
+            lastSavedTranscriptPath = txtURL.path
+            reloadSessions()
+            selectedSessionID = session.id
+            loadEditorForSelectedSession()
+        }
+    }
+
+    private func manifestSource(for source: ZoomSessionSource?) -> ContoraSessionManifest.Source? {
+        guard let source else { return nil }
+        return .init(
+            type: "zoom-multitrack",
+            externalID: source.recordingID,
+            folderPath: source.folderURL.path,
+            tracks: source.tracks.map {
+                .init(id: $0.id, participantName: $0.participantName, audioPath: $0.audioURL.path)
+            }
+        )
+    }
+
+
     private func persistTranscriptionFailure(
         error: Error,
         stage: String,
@@ -4040,6 +4584,7 @@ final class AppModel: ObservableObject {
                 failureJSON: failureURL,
                 transcription: previousTranscription,
                 lastFailure: failure,
+                source: manifestSource(for: session.zoomSource),
                 manifestBaseURL: artifactBaseURL?.deletingLastPathComponent()
             )
             reloadSessions()
@@ -4668,6 +5213,14 @@ struct RecordingWorkspacePanel: View {
                         Label("Import Video", systemImage: "film")
                     }
                     .disabled(model.isRecording || model.isFinalizingStop)
+                }
+
+                if let recording = model.detectedZoomRecordings.first {
+                    ZoomRecordingBanner(
+                        model: model,
+                        recording: recording,
+                        additionalCount: max(0, model.detectedZoomRecordings.count - 1)
+                    )
                 }
 
                 if let selectedSession = model.selectedSession {
@@ -5537,6 +6090,62 @@ struct SessionMetadataView: View {
     }
 }
 
+private struct ZoomRecordingBanner: View {
+    @ObservedObject var model: AppModel
+    let recording: ZoomRecording
+    let additionalCount: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "video.badge.waveform.fill")
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Zoom recording found")
+                        .font(.callout.weight(.semibold))
+                    Text(recording.title)
+                        .font(.caption)
+                        .lineLimit(2)
+                    Text("\(recording.tracks.count) named speaker tracks · diarization not needed")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 8) {
+                Button("Import & Transcribe") {
+                    model.importAndTranscribeZoomRecording(recording)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.isImportingZoomRecording || model.isRecording || model.isFinalizingStop)
+
+                Button("Ignore") {
+                    model.ignoreZoomRecording(recording)
+                }
+                .controlSize(.small)
+
+                if model.isImportingZoomRecording {
+                    ProgressView().controlSize(.small)
+                }
+                Spacer()
+                if additionalCount > 0 {
+                    Text("+\(additionalCount)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .background(.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(.blue.opacity(0.2), lineWidth: 1)
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: AppModel
 
@@ -5550,6 +6159,8 @@ struct SettingsView: View {
                 .tabItem { Label("Integrations", systemImage: "arrow.triangle.branch") }
             storageSettings
                 .tabItem { Label("Storage", systemImage: "folder") }
+            sourcesSettings
+                .tabItem { Label("Sources", systemImage: "tray.and.arrow.down") }
             updateSettings
                 .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
             advancedSettings
@@ -5618,6 +6229,14 @@ struct SettingsView: View {
             TextField("Model ID", text: $model.mlxModelID)
                 .onSubmit { model.updateMLXModelID(model.mlxModelID) }
             Toggle("Speaker Diarization", isOn: mlxDiarizationBinding)
+            Stepper(value: $model.mlxExpectedSpeakerCount, in: 0...20) {
+                LabeledContent(
+                    "Expected speakers",
+                    value: model.mlxExpectedSpeakerCount == 0 ? "Auto" : "\(model.mlxExpectedSpeakerCount)"
+                )
+            }
+            .disabled(!model.mlxDiarizationEnabled)
+            .onChange(of: model.mlxExpectedSpeakerCount) { _, _ in model.saveSharedServerConfig() }
             Text("Keep diarization off when speed matters. The first transcription also downloads and loads the selected model.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -5728,10 +6347,46 @@ struct SettingsView: View {
         .formStyle(.grouped)
     }
 
+    private var sourcesSettings: some View {
+        Form {
+            Section("Zoom Local Recordings") {
+                Toggle(
+                    "Watch for new multi-track recordings",
+                    isOn: Binding(
+                        get: { model.zoomWatchEnabled },
+                        set: { model.setZoomWatchEnabled($0) }
+                    )
+                )
+
+                HStack {
+                    TextField("Zoom recordings folder", text: $model.zoomWatchFolderPath)
+                        .onSubmit { model.setZoomWatchFolderPath(model.zoomWatchFolderPath) }
+                    Button("Choose…") { model.chooseZoomWatchFolder() }
+                    Button("Open") { model.openZoomWatchFolder() }
+                }
+
+                Text("Contora detects Zoom's separate participant tracks, transcribes each track with corporate VK ASR, and merges them by timestamp with diarization disabled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Scan Now") {
+                        model.setZoomWatchFolderPath(model.zoomWatchFolderPath)
+                        model.scanZoomRecordingsNow()
+                    }
+                    Text(model.zoomWatchStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
     private var advancedSettings: some View {
         Form {
             Section("Server Endpoints") {
-                TextField("MLX endpoint URL", text: $model.mlxTranscriptionEndpoint)
+                TextField("Transcription job endpoint URL", text: $model.mlxTranscriptionEndpoint)
                 HStack {
                     Button("Reload Config") { model.loadSharedServerConfig() }
                     Button("Save Config") { model.saveSharedServerConfig() }
@@ -5865,6 +6520,37 @@ if CommandLine.arguments.contains("--self-check-session-management") {
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Session management self-check failed: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+if CommandLine.arguments.contains("--self-check-zoom") {
+    do {
+        let argumentIndex = CommandLine.arguments.firstIndex(of: "--self-check-zoom")
+        let explicitPath = argumentIndex.flatMap { index in
+            CommandLine.arguments.indices.contains(index + 1) ? CommandLine.arguments[index + 1] : nil
+        }
+        let rootURL = explicitPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? ZoomRecordingDetector.defaultRootURL()
+        let recordings = try ZoomRecordingSelfCheck.run(rootURL: rootURL)
+        for recording in recordings {
+            let speakers = recording.tracks.map { "\($0.id)=\($0.participantName)" }.joined(separator: ", ")
+            print("Zoom: \(recording.title) | \(recording.tracks.count) tracks | \(speakers)")
+            let durations = try recording.tracks.map { track in
+                try autoreleasepool {
+                    try AudioFileImportService().importAudioFile(from: track.audioURL).durationSeconds
+                }
+            }
+            guard let shortest = durations.min(), let longest = durations.max(), shortest > 0,
+                  longest - shortest < 1 else {
+                throw AudioImportError.readFailed
+            }
+            print("Audio decode: \(recording.tracks.count) aligned tracks | \(String(format: "%.1f", longest)) seconds")
+        }
+        print("Zoom recording self-check passed (\(recordings.count) multi-track recording(s))")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Zoom recording self-check failed: \(error.localizedDescription)\n", stderr)
         exit(EXIT_FAILURE)
     }
 }

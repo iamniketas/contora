@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contora-vk-asr-server"
+version = "0.1.0"
+description = "Private Contora transcription sidecar for corporate ASR and local diarization"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic>=2.8,<3",
+  "requests>=2.31,<3",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+diarization = ["pyannote.audio>=3.4,<4", "torch>=2.4"]
+dev = ["httpx>=0.27,<1", "pytest>=8,<9"]
+
+[project.scripts]
+contora-vk-asr-server = "contora_vk_server.server:main"
+contora-vk-reprocess = "contora_vk_server.reprocess:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

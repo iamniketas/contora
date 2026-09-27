@@ -197,6 +197,19 @@ struct MLXJobRecoveryStore: Sendable {
 }
 
 struct ContoraSessionManifest: Codable {
+    struct Source: Codable {
+        struct Track: Codable {
+            let id: String
+            let participantName: String
+            let audioPath: String
+        }
+
+        let type: String
+        let externalID: String
+        let folderPath: String
+        let tracks: [Track]
+    }
+
     struct Files: Codable {
         let recordingWAV: String?
         let recordingM4A: String?
@@ -277,6 +290,7 @@ struct ContoraSessionManifest: Codable {
     let capture: Capture
     let transcription: Transcription?
     let lastFailure: Failure?
+    let source: Source?
 }
 
 enum TranscriptionFailureArtifactStore {

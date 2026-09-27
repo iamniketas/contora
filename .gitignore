@@ -127,6 +127,8 @@ tools/*
 !tools/macos-release/**
 !tools/macos-mlx-server/
 !tools/macos-mlx-server/**
+!tools/vk-asr-server/
+!tools/vk-asr-server/**
 !tools/sortformer-server/
 !tools/pyannote-community-server/
 !tools/pyannote-community-server/**
